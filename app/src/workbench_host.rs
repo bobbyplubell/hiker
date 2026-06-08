@@ -106,7 +106,9 @@ pub fn sync_workbench_tabs(&mut self) {
                 // them with a contrasting border.
                 edge_to_edge: matches!(
                     t.kind,
-                    crate::tab::TabKind::Editor { .. } | crate::tab::TabKind::Canvas { .. }
+                    crate::tab::TabKind::Editor { .. }
+                        | crate::tab::TabKind::Canvas { .. }
+                        | crate::tab::TabKind::ChartBuilder { .. }
                 ),
             }
         })
@@ -730,6 +732,7 @@ impl<'a> HikerWbBehavior<'a> {
             TabKind::ZimView { zim_path, article } => {
                 panels::zim::show(ui, app, tab_id, zim_path, article)
             }
+            TabKind::ChartBuilder { source } => panels::charts_tab::show(ui, app, source),
         }
     }
 
@@ -757,6 +760,7 @@ const fn tab_kind_name(kind: &TabKind) -> &'static str {
         TabKind::ClusterReview { .. } => "tab:ClusterReview",
         TabKind::ClusterGraph { .. } => "tab:ClusterGraph",
         TabKind::ZimView { .. } => "tab:ZimView",
+        TabKind::ChartBuilder { .. } => "tab:ChartBuilder",
     }
 }
 

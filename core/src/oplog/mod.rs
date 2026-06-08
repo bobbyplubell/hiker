@@ -843,9 +843,16 @@ impl OpLog {
                 // it, `write_md_file` would suppress the new file and the save
                 // would silently vanish.
                 let resurrecting = state.accepted_tombstone;
-                let spans = match input {
-                    EditInput::Spans(spans) => spans.to_vec(),
-                    EditInput::FullText(new_text) => crate::merge::multi_span_delta(&base, new_text),
+                // For a full-text fold the caller hands us the exact target the
+                // materialized doc must equal; keep it so we can assert the
+                // span round-trip reproduced it (below). A `Spans` (agent
+                // producer) edit has no single target — its anchors are
+                // validated where they're resolved.
+                let (spans, full_text_target) = match input {
+                    EditInput::Spans(spans) => (spans.to_vec(), None),
+                    EditInput::FullText(new_text) => {
+                        (crate::merge::multi_span_delta(&base, new_text), Some(new_text))
+                    }
                 };
                 // A clean doc with no change is a no-op save / self-write echo.
                 // A tombstoned doc must still commit (to clear the tombstone and
@@ -862,6 +869,17 @@ impl OpLog {
                 // high-offset-first (the `apply_spans_str` discipline) so an
                 // earlier edit never shifts a later span's coordinates.
                 state.accepted = overlay::apply_spans_str(&base, &spans);
+                // Invariant guard for every fold-in path: applying the computed
+                // delta must reproduce the intended full text exactly. If it
+                // doesn't (a bug in `multi_span_delta`/`apply_spans_str`, e.g.
+                // the silent char-boundary skip in the latter), refuse to
+                // persist — emitting drifted bytes here is precisely the
+                // op-log-diverges-from-disk class of bug we never want.
+                if let Some(target) = full_text_target
+                    && state.accepted != target
+                {
+                    return Err(Error::FoldRoundTrip { path: doc_id.to_string() });
+                }
                 if resurrecting {
                     state.accepted_tombstone = false;
                 }
@@ -1014,6 +1032,52 @@ fn write_md_file(
         fs::create_dir_all(parent)?;
     }
     store::write_atomic(&abs, materialized.text.as_bytes())
+}
+
+/// How [`OpLog::register_document`](crate::oplog::OpLog) reconciles a
+/// newly-registered document with the `.md` on disk. Lives here beside
+/// [`write_md_file`] / [`verify_md_matches`] (the two disk actions it selects
+/// between) so the lifecycle split file stays a pure `impl OpLog` continuation.
+/// status: op-log-disk-canonical
+#[derive(Clone, Copy)]
+pub(super) enum SeedDisk {
+    /// The file may not exist yet (a genuine create, a sync copy-in) — write
+    /// `accepted` to disk atomically.
+    Write,
+    /// The file already exists on disk with exactly `accepted`'s bytes
+    /// (bootstrap / first-open seed) — verify the hash matches and write
+    /// nothing, so the file's mtime is never churned.
+    VerifyExisting,
+}
+
+/// Seed-time counterpart to [`write_md_file`]: the document is being registered
+/// from a file that ALREADY exists on disk with exactly these bytes, so there
+/// is nothing to write — rewriting it would only churn the file's mtime (and
+/// inode) for no benefit. This was the cause of a whole vault being re-stamped
+/// on its first open: bootstrap seeds every untracked file, and the old create
+/// path wrote each one's own bytes back over itself. Instead of writing, hash
+/// what we *would* write and assert it matches what's on disk; a mismatch means
+/// the seed bytes diverged from the file, so we refuse rather than silently
+/// overwrite. A tombstoned or path-less doc verifies nothing.
+///
+/// status: op-log-disk-canonical
+fn verify_md_matches(
+    oplog_dir: &Path,
+    rel_path: Option<&str>,
+    materialized: &Materialized,
+) -> Result<(), Error> {
+    if materialized.tombstone {
+        return Ok(());
+    }
+    let Some(rel_path) = rel_path else {
+        return Ok(());
+    };
+    let abs = vault_root_of(oplog_dir).join(rel_path);
+    let on_disk = fs::read(&abs)?;
+    if blake3::hash(&on_disk) != blake3::hash(materialized.text.as_bytes()) {
+        return Err(Error::SeedMismatch { path: rel_path.to_string() });
+    }
+    Ok(())
 }
 
 /// Remove the `.md` at `rel_path` under the vault root. A missing file is not

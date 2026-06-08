@@ -45,12 +45,15 @@ RUST_ROOTS = [
     "hiker-canvas/view-core/src",
     # Render engines (the submodule's crates, each at its root)
     "hiker-render/graph/src",
+    "hiker-render/projection/src",
     "hiker-render/mermaid/src",
     "hiker-render/htmlview/src",
     "hiker-render/math/src",
     "hiker-render/wavedrom/src",
     "hiker-render/chart/src",
+    "hiker-render/diagram/src",
     # Widgets + archive reader
     "widgets/graph-widgets/src",
+    "widgets/graph-view/src",
     "zxr/src",
 ]

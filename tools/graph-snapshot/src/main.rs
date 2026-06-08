@@ -354,6 +354,7 @@ impl Args {
             lin_log: self.lin_log,
             outbound_attraction_distribution: self.outbound_attr,
             degree_repulsion: self.degree_repulsion,
+            anchor_stiffness: 0.0,
         };
         let mut rng = Lcg::new(0xBEEF);
         let seed: Vec<Vec2> = (0..g.n)

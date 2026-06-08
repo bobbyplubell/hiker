@@ -1,6 +1,6 @@
 //! Cluster-tree graph view (`cluster-editor-graph-view`). Renders a cluster
 //! tree (radial / vertical / horizontal / force-directed) through the shared
-//! `widgets::graph_view` engine. This panel is the cluster-specific
+//! `hiker_graph_view` engine. This panel is the cluster-specific
 //! [`graph_view::Source`] adapter: it maps `EditableNode` rows to colored,
 //! sized nodes (color-by-policy, blended toward grey by summary staleness,
 //! sized by member count), owns the policy-color legend, and resolves leaf
@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use eframe::egui;
 
 use crate::state::AppState;
-use crate::widgets::graph_view::{
+use hiker_graph_view::graph_view::{
     self, policy_legend, LayoutConfig, NodeDescriptor, NodeShape, Palette, Source, Style,
 };
 use hiker_core::trees::types::{EditableNode, NodeKind, NodePolicy};
@@ -98,7 +98,16 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, tree_id: &str) {
     }
     // Persisted-tree entry point: clickable leaves resolve to vault paths.
     // The persisted tree is static, so a refit on (rare) shape change is fine.
-    show_with_nodes(ui, app, tree_id, &nodes, /*clickable_leaves=*/ true, /*preserve_view=*/ false);
+    // No "Live preview" toggle here — that's a review-tab display control only.
+    show_with_nodes(
+        ui,
+        app,
+        tree_id,
+        &nodes,
+        /*clickable_leaves=*/ true,
+        /*preserve_view=*/ false,
+        /*live_preview=*/ None,
+    );
 }
 
 /// Render the cluster graph from a pre-resolved `EditableNode` slice. Shared
@@ -115,6 +124,11 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, tree_id: &str) {
 /// as the user tweaks knobs updates in place rather than yanking the camera
 /// back to a fit. The very first seed always fits.
 ///
+/// `live_preview`: when `Some`, a "Live preview" checkbox is appended to the
+/// result graph's view/eye menu (a display control), bound to the caller's
+/// flag — toggling it gates debounced live re-clustering. The persisted tab
+/// passes `None`; only the review tab carries the toggle.
+///
 /// status: cluster-review-tab-result-graph-view
 /// status: cluster-review-tab-live-preview
 pub fn show_with_nodes(
@@ -124,6 +138,7 @@ pub fn show_with_nodes(
     nodes: &[EditableNode],
     clickable_leaves: bool,
     preserve_view: bool,
+    live_preview: Option<&mut bool>,
 ) {
     if nodes.is_empty() {
         ui.label(egui::RichText::new("(tree is empty)").color(theme::muted()));
@@ -164,9 +179,20 @@ pub fn show_with_nodes(
     let (mut reset_view, mut relayout) = (false, false);
     if let Some(view) = app.panels.cluster_graph.get_mut(tree_id) {
         ui.horizontal_wrapped(|ui| {
-            relayout = view
-                .engine
-                .view_options_menu(ui, Some(("Leaves", &mut view.show_leaves)));
+            // "Leaves" is the per-tree display toggle; the review tab also
+            // appends "Live preview" (a display control over the clustering
+            // engine's debounced re-run). The clustering ENGINE params live in
+            // the config form, not here.
+            let mut extra_toggles: Vec<(&str, &mut bool)> =
+                vec![("Leaves", &mut view.show_leaves)];
+            if let Some(lp) = live_preview {
+                extra_toggles.push(("Live preview", lp));
+            }
+            relayout = view.engine.view_options_menu(
+                ui,
+                crate::icons::ICONS.image(crate::icons::Icon::Eye),
+                &mut extra_toggles,
+            );
             if ui.small_button("Reset view").clicked() {
                 reset_view = true;
             }
@@ -234,7 +260,12 @@ fn render_canvas(
     } = view;
     let source = ClusterSource::new(nodes, data, vault.as_ref(), *show_leaves, clickable);
     let size = egui::vec2(ui.available_width(), (ui.available_height() - 24.0).max(50.0));
-    ui.allocate_ui(size, |ui| engine.ui(ui, &source)).inner
+    ui.allocate_ui(size, |ui| {
+        engine.ui(ui, &source, |p: &egui::Painter, r: egui::Rect, t: &str, b: &str, a: egui::Pos2| {
+            crate::panels::graph::paint_preview_card(p, r, t, b, a);
+        })
+    })
+    .inner
 }
 
 /// Cheap shape fingerprint over the `(id, parent)` edges. Changes on
@@ -369,6 +400,12 @@ impl Source for ClusterSource<'_> {
 
     fn layout_tree(&self, _kind: LayoutKind) -> LayoutTree {
         LayoutTree::from_parents(&self.data.parent_of)
+    }
+
+    fn node_key(&self, index: usize) -> Option<String> {
+        // A cluster/leaf id is the stable identity across re-clustering; a node
+        // whose id changes is simply treated as new and settles in fresh.
+        self.data.ids.get(index).cloned()
     }
 
     fn preview_for(&self, index: usize) -> Option<(String, String)> {

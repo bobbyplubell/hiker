@@ -1,7 +1,7 @@
 //! Vault-wide note-link graph panel. Directed graph (one node per .md,
 //! one edge per resolved `[[wikilink]]`). The pan/zoom, layout, view-options
 //! menu, and the node/edge/label/hover/preview rendering all live in the
-//! shared `widgets::graph_view` engine; this panel is the vault-specific
+//! shared `hiker_graph_view` engine; this panel is the vault-specific
 //! [`graph_view::Source`] adapter plus the vault walk that builds the graph
 //! and the tab-linking (FOLLOW / DRIVE) wiring.
 //!
@@ -18,7 +18,7 @@ use petgraph::graph::{DiGraph, NodeIndex};
 
 use crate::editor_pane;
 use crate::state::AppState;
-use crate::widgets::graph_view::{
+use hiker_graph_view::graph_view::{
     self, LayoutConfig, NodeDescriptor, NodeShape, Palette, Source, Style,
 };
 use hiker_core::vault::Vault;
@@ -79,9 +79,11 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, tab_id: crate::tab::TabId) {
             reset_view = true;
         }
         if let Some(vg) = app.panels.graph.as_mut() {
-            relayout = vg
-                .engine
-                .view_options_menu(ui, Some(("Orphans", &mut vg.show_orphans)));
+            relayout = vg.engine.view_options_menu(
+                ui,
+                crate::icons::ICONS.image(crate::icons::Icon::Eye),
+                &mut [("Orphans", &mut vg.show_orphans)],
+            );
             let status = match vg.engine.worker.as_ref() {
                 Some(w) if w.is_running() => format!("· layout {} iters", w.iters_done()),
                 _ => String::new(),
@@ -186,7 +188,9 @@ fn render_canvas(
         show_orphans,
     } = vg;
     let source = VaultSource::new(data, vault.as_ref(), active_path, *show_orphans);
-    engine.ui(ui, &source)
+    engine.ui(ui, &source, |p: &egui::Painter, r: egui::Rect, t: &str, b: &str, a: egui::Pos2| {
+        paint_preview_card(p, r, t, b, a);
+    })
 }
 
 /// Vault adapter from `VaultData` to the shared graph engine.
@@ -290,6 +294,12 @@ impl Source for VaultSource<'_> {
             LayoutKind::Radial => bfs_tree(n, self.edges, root),
             _ => dfs_tree(n, self.edges, root),
         }
+    }
+
+    fn node_key(&self, index: usize) -> Option<String> {
+        // The note's rel-path is stable across vault rebuilds, so it carries
+        // each node's layout position through a re-walk.
+        self.graph.node_weight(NodeIndex::new(index)).map(|n| n.path.clone())
     }
 
     fn preview_for(&self, index: usize) -> Option<(String, String)> {

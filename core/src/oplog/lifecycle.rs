@@ -11,7 +11,7 @@ use super::error::Error;
 use super::meta::{self, HistoryRow};
 use super::shapes::{Author, OpKind};
 use super::store::{FrameMeta, FrameSpec};
-use super::{content_hash, now_ms, write_md_file, DocState, OpLog};
+use super::{content_hash, now_ms, verify_md_matches, write_md_file, DocState, OpLog, SeedDisk};
 
 impl OpLog {
     /// Register a brand-new document seeded with `initial_text`. Under
@@ -32,6 +32,41 @@ impl OpLog {
         _kind: &str,
         initial_text: &str,
         author: &Author,
+    ) -> Result<String, Error> {
+        self.register_document(path, initial_text, author, SeedDisk::Write)
+    }
+
+    /// Register a document for a file that ALREADY exists on disk holding
+    /// exactly `initial_text` — the bootstrap / first-open seed path. Identical
+    /// to [`create_document`](Self::create_document) except it does **not**
+    /// rewrite the `.md`: writing a file's own bytes back over itself gains
+    /// nothing and churns its mtime (re-stamping the whole vault on first open).
+    /// Instead it hashes the bytes it would have written and verifies they match
+    /// the file on disk, erroring (`Error::SeedMismatch`) on any drift rather
+    /// than silently overwriting.
+    ///
+    /// status: op-log-disk-canonical
+    pub fn seed_document(
+        &self,
+        path: &str,
+        _kind: &str,
+        initial_text: &str,
+        author: &Author,
+    ) -> Result<String, Error> {
+        self.register_document(path, initial_text, author, SeedDisk::VerifyExisting)
+    }
+
+    /// Shared body of [`create_document`](Self::create_document) and
+    /// [`seed_document`](Self::seed_document): seed `accepted = initial_text`,
+    /// append the first `.ops` keyframe (+ its `op_history` index row), insert
+    /// the doc-cache entry, and reconcile the on-disk `.md` per `disk` — all
+    /// under one lock hold.
+    fn register_document(
+        &self,
+        path: &str,
+        initial_text: &str,
+        author: &Author,
+        disk: SeedDisk,
     ) -> Result<String, Error> {
         let doc_id = path.to_string();
         let now = now_ms();
@@ -99,8 +134,16 @@ impl OpLog {
                     deltas_since_keyframe: 0,
                 },
             );
-            // The on-disk `.md` equals `accepted` by construction.
-            write_md_file(&self.oplog_dir, Some(path), &materialized)
+            // The on-disk `.md` equals `accepted` by construction. The create
+            // path writes it (the file may not exist yet); the seed path's file
+            // is already on disk with these exact bytes, so it verifies-and-
+            // skips rather than rewriting — no mtime churn.
+            match disk {
+                SeedDisk::Write => write_md_file(&self.oplog_dir, Some(path), &materialized),
+                SeedDisk::VerifyExisting => {
+                    verify_md_matches(&self.oplog_dir, Some(path), &materialized)
+                }
+            }
         })?;
         Ok(doc_id)
     }

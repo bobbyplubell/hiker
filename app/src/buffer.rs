@@ -272,6 +272,16 @@ pub struct DecorationCache {
     /// Natively-painted pipe-table widgets (`widget-table-render`); fingerprinted
     /// on the shared `render_fp` like `math_widget` / `mermaid_widget`.
     pub table_widget: Option<CachedDeco>,
+    /// Tinted-source fallback for ```` ```chart ```` blocks (`widget-chart-render`),
+    /// the chart counterpart to `mermaid` / `wavedrom`.
+    pub chart: Option<CachedDeco>,
+    /// Rendered chart widgets (`widget-chart-render`); separate from the
+    /// tinted-source `chart` slot so the layers cache independently.
+    pub chart_widget: Option<CachedDeco>,
+    /// Squiggles under broken ```` ```mermaid ```` / ```` ```wavedrom ```` fence
+    /// bodies (`diagram-editor-diagnostics`). Cached on (doc id, viewport) since
+    /// it scans viewport-scoped diagram spans and re-checks their source.
+    pub diagram_diagnostics: Option<CachedDeco>,
     pub index_diff: Option<CachedDeco>,
     pub active_line: Option<CachedDeco>,
     pub occurrence: Option<CachedDeco>,
@@ -303,7 +313,7 @@ impl DecorationCache {
 /// (unprefixed, to match every existing `app.session.buffers.get(path)`
 /// site); the read-only preview sources prefix to avoid colliding with a
 /// vault file whose name happens to look like an id.
-pub fn buffer_key_for_source(source: &crate::tab::BufferSource) -> String {
+pub(crate) fn buffer_key_for_source(source: &crate::tab::BufferSource) -> String {
     use crate::tab::BufferSource;
     match source {
         BufferSource::Vault { path } => path.clone(),

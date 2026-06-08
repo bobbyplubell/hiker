@@ -396,6 +396,9 @@ pub struct PanelStates {
     /// View-as toggle, dirty / reload tracking). Keyed by tab id.
     /// status: canvas-tab
     pub canvases: HashMap<TabId, crate::panels::canvas::Pane>,
+    /// Per-CSV-tab chart-builder state (builder model + camera + preview view +
+    /// theme choice). Keyed by vault path (one builder per CSV). status: chart-csv-tab
+    pub chart_builders: HashMap<String, crate::panels::charts_tab::Pane>,
     pub graph: Option<crate::panels::graph::VaultPanel>,
     pub cluster_graph: HashMap<String, crate::panels::cluster_graph::ClusterView>,
     pub home: crate::panels::home::State,

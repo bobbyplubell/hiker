@@ -9,7 +9,6 @@
 //! drive through a `graph_view::Source` adapter. This module stays the
 //! lowest layer: the pan/zoom transform a `graph_view::State` embeds.
 
-use eframe::egui;
 
 /// Persistent pan/zoom state. Both consumers store an instance per
 /// canvas (the vault graph holds it on `State`; the cluster graph
@@ -42,14 +41,20 @@ impl View {
     /// Apply drag-to-pan + scroll-to-zoom (anchored on the cursor when
     /// possible). Mirrors the inline blocks the two panels had before
     /// extraction.
+    ///
+    /// `allow_pan` gates only the drag-to-pan block; scroll-to-zoom always
+    /// runs. The Poincaré view turns affine pan off (`allow_pan = false`) so
+    /// primary-drag drives a Möbius recentre instead, while scroll still zooms
+    /// the disk.
     pub fn handle_input(
         &mut self,
         ui: &egui::Ui,
         response: &egui::Response,
         rect: egui::Rect,
         zoom_bounds: ZoomBounds,
+        allow_pan: bool,
     ) {
-        if response.dragged_by(egui::PointerButton::Primary) {
+        if allow_pan && response.dragged_by(egui::PointerButton::Primary) {
             self.pan += response.drag_delta() / self.zoom;
         }
         if response.hovered() {
@@ -81,6 +86,14 @@ impl View {
         let pan = self.pan;
         let zoom = self.zoom;
         move |w: egui::Vec2| center + (w + pan) * zoom
+    }
+
+    /// Invert the affine `screen_mapper`: recover the lensed-world point that
+    /// maps to `screen`. The exact inverse of `center + (w + pan) * zoom`, used
+    /// by the Poincaré Möbius recentre to read drag endpoints back into disk
+    /// space.
+    pub fn screen_to_affine(self, rect: egui::Rect, screen: egui::Pos2) -> egui::Vec2 {
+        (screen - rect.center()) / self.zoom - self.pan
     }
 
     /// Set pan/zoom so the bounding box of `positions` fits inside

@@ -192,17 +192,9 @@ impl Default for OpLogConfig {
     }
 }
 
-const fn default_metadata_retention_days() -> u32 {
-    365
-}
-
-const fn default_rejected_retention_days() -> u32 {
-    14
-}
-
-const fn default_compact_threshold() -> f32 {
-    4.0
-}
+const fn default_metadata_retention_days() -> u32 { 365 }
+const fn default_rejected_retention_days() -> u32 { 14 }
+const fn default_compact_threshold() -> f32 { 4.0 }
 
 /// `[sync]` section. Per-vault multi-device sync policy for the op log.
 /// See `docs/sync.md` §`[sync]` config section.
@@ -798,6 +790,10 @@ pub struct McpToolsConfig {
     #[serde(default = "yes")] pub get_open_notes_enabled: bool,
     /// status: mcp-tool-get-selection
     #[serde(default = "yes")] pub get_selection_enabled: bool,
+    /// status: diagram-agent-check
+    /// Stateless syntax-check of a diagram source (mermaid / wavedrom /
+    /// latex). Read-only — no vault access.
+    #[serde(default = "yes")] pub check_diagram_enabled: bool,
     // Writes (also gated by `writes_enabled` master flag):
     #[serde(default = "yes")] pub write_note_enabled: bool,
     #[serde(default = "yes")] pub edit_note_enabled: bool,
@@ -859,6 +855,7 @@ impl McpToolsConfig {
             "get_active_note" => self.get_active_note_enabled,
             "get_open_notes" => self.get_open_notes_enabled,
             "get_selection" => self.get_selection_enabled,
+            "check_diagram" => self.check_diagram_enabled,
             "write_note" => self.write_note_enabled,
             "edit_note" => self.edit_note_enabled,
             "set_frontmatter" => self.set_frontmatter_enabled,
@@ -898,6 +895,7 @@ impl Default for McpToolsConfig {
             get_active_note_enabled: true,
             get_open_notes_enabled: true,
             get_selection_enabled: true,
+            check_diagram_enabled: true,
             write_note_enabled: true,
             edit_note_enabled: true,
             set_frontmatter_enabled: true,

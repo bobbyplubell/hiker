@@ -49,7 +49,7 @@ use hiker_htmlview::{HtmlView, ResourceProvider, Theme as HtmlTheme};
 use canvas_view::content::{CardView, NodeContentRenderer};
 
 use crate::buffer::DecorationCache;
-use crate::panels::buffer::decorations::{rebuild_editor_decorations, DecoRebuildCtx};
+use crate::panels::buffer::decorations::{rebuild_editor_layers, DecoRebuildCtx};
 use crate::tab::TabId;
 
 // Heavyweight per-node render state lives here, keyed by `(tab, node id)`, so
@@ -441,7 +441,7 @@ fn paint_editor(ui: &mut egui::Ui, pane: &mut EditorPane, plan: &NodePlan<'_>, i
     let mut deco_ctx =
         card_decoration_ctx(&mut pane.decoration_cache, &theme, &body_text, markdown, font_px, dpr);
     let mut rebuild = |state: &EditorState, view: &mut ViewState| {
-        rebuild_editor_decorations(state, view, &mut deco_ctx);
+        rebuild_editor_layers(state, view, &mut deco_ctx);
     };
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner));
     child.set_clip_rect(inner.intersect(ui.clip_rect()));
@@ -509,6 +509,9 @@ fn card_decoration_ctx<'a>(
         // Canvas node previews don't carry a vault-scoped disk cache — they
         // render through the in-memory caches only. status: widget-render-disk-cache
         diagram_cache: None,
+        // Embedded preview: inline-CSV charts render; external `data:` charts
+        // fall back to source (no note-bound resolver here). status: widget-chart-render
+        chart_resolver: None,
     }
 }
 

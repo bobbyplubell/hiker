@@ -46,6 +46,24 @@ pub enum Error {
     },
     #[error("schema version mismatch: db is v{found}, binary expects v{expected}")]
     VersionMismatch { found: i32, expected: i32 },
+    /// A seed-from-disk registration (`OpLog::seed_document`, the
+    /// bootstrap/first-open path) found the file's on-disk bytes differ from
+    /// the bytes being seeded. The seed path verifies instead of rewriting
+    /// (`op-log-disk-canonical`), so rather than silently clobber the file —
+    /// and churn its mtime — we surface the drift. Carries the vault-relative
+    /// path. By construction (the seed text IS the bytes just read off disk)
+    /// this only fires on a genuine race or bug.
+    #[error("seed content for {path} does not match the file on disk")]
+    SeedMismatch { path: String },
+    /// Folding a full-text edit into the op-log produced a materialized result
+    /// that does NOT equal the intended target text — i.e. the span delta
+    /// (`multi_span_delta`) + splice (`apply_spans_str`) round-trip diverged.
+    /// This is the invariant guarding every fold-in path (user save, disk
+    /// reconcile, git-sync, remote sync): a divergence means the op-log would
+    /// silently disagree with what we meant to write, so we refuse to persist
+    /// rather than emit drifted bytes. Carries the vault-relative path.
+    #[error("fold round-trip diverged for {path}: spliced result != target text")]
+    FoldRoundTrip { path: String },
     #[error("connection mutex poisoned")]
     Poisoned,
 }

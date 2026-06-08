@@ -111,6 +111,21 @@ impl CanvasView {
             self.finish_connect(canvas, &from_node, from_side, &target, out);
             return;
         }
+        // Navigate-only under a projection lens (`proj-poincare-mode`): a click
+        // never starts an edge connect or asks the host for inline-edit — it only
+        // selects (for navigation). Off = full editing.
+        if self.camera.lens_active() {
+            interaction::click_select(&mut self.selection, &target, shift);
+            // Under Poincaré, clicking a card flies the disk so that card glides
+            // to the centre. [proj-poincare-nav]
+            if self.camera.projection().kind == hiker_projection::ProjectionKind::Poincare
+                && let Target::Node(id) = &target
+                && let Some(node) = canvas.nodes.iter().find(|n| &n.id == id)
+            {
+                self.start_flyto(node);
+            }
+            return;
+        }
         if let Target::SideHandle { node, side } = target {
             self.interaction = Interaction::Connecting { from_node: node, from_side: side };
             return;
@@ -176,6 +191,24 @@ impl CanvasView {
             self.interaction = Interaction::Pan;
             return;
         }
+        // Navigate-only under a projection lens (`proj-poincare-mode`): editing in
+        // warped space (drag-move, resize, edge-draw) isn't supported in v1, so
+        // when a projection mode is active a left-press on a node only navigates —
+        // it pans the canvas instead of starting an edit gesture. Pan + zoom are
+        // handled above / elsewhere and stay live; Off = full editing.
+        //
+        // Under Poincaré specifically, ANY background/card drag drives the
+        // hyperbolic drag-to-recentre (`on_drag` turns a `Pan` gesture into a
+        // Möbius recentre), so an empty-canvas press also begins a `Pan` rather
+        // than a marquee — the whole disk is the navigation surface.
+        // [proj-poincare-nav]
+        if self.camera.lens_active() {
+            let poincare = self.camera.projection().kind == hiker_projection::ProjectionKind::Poincare;
+            if poincare || !matches!(target, Target::Empty) {
+                self.interaction = Interaction::Pan;
+                return;
+            }
+        }
         match target {
             Target::ResizeHandle(handle) => self.begin_resize(canvas, handle),
             Target::SideHandle { node, side } => {
@@ -239,7 +272,15 @@ impl CanvasView {
     fn on_drag(&mut self, canvas: &mut Canvas, viewport: Rect, p: Pos2, delta: Vec2, out: &mut CanvasResponse) {
         match std::mem::replace(&mut self.interaction, Interaction::Idle) {
             Interaction::Pan => {
-                self.camera.pan_by_screen(delta);
+                // Under Poincaré a background/card drag recentres the disk
+                // hyperbolically (the grabbed point follows the cursor) rather
+                // than affine-panning; every other mode pans affinely.
+                // [proj-poincare-nav]
+                if self.camera.projection().kind == hiker_projection::ProjectionKind::Poincare {
+                    self.drag_recenter(viewport, p, delta);
+                } else {
+                    self.camera.pan_by_screen(delta);
+                }
                 self.interaction = Interaction::Pan;
             }
             Interaction::MoveSelection { accum, ids } => self.drag_move(canvas, accum, ids, delta, out),
@@ -249,6 +290,22 @@ impl CanvasView {
             }
             other => self.interaction = other,
         }
+    }
+
+    /// Hyperbolic drag-to-recentre (Poincaré only): the disk point grabbed under
+    /// the cursor follows it. Maps the previous + current pointer positions into
+    /// post-nav disk space (via [`Camera::disk_under_screen`]), then left-composes
+    /// the Möbius transform that carries `p_prev → p_cur` onto the camera's `nav`,
+    /// so the grabbed point tracks the cursor. A manual drag cancels any in-flight
+    /// fly-to. [proj-poincare-nav]
+    fn drag_recenter(&mut self, viewport: Rect, cur: Pos2, delta: Vec2) {
+        let prev = cur - delta;
+        let p_prev = self.camera.disk_under_screen(viewport, prev);
+        let p_cur = self.camera.disk_under_screen(viewport, cur);
+        let recentre = hiker_projection::Mobius::from_point_pair(p_prev, p_cur);
+        let nav = hiker_projection::Mobius::compose(recentre, self.camera.nav());
+        self.camera.set_nav(nav);
+        self.cancel_flyto();
     }
 
     fn drag_move(&mut self, canvas: &mut Canvas, accum: Point, ids: Vec<String>, delta: Vec2, out: &mut CanvasResponse) {

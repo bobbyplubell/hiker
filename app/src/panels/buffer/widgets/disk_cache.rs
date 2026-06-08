@@ -39,6 +39,7 @@ pub enum Domain {
     Math,
     Mermaid,
     WaveDrom,
+    Chart,
 }
 
 impl Domain {
@@ -47,6 +48,7 @@ impl Domain {
             Domain::Math => "math",
             Domain::Mermaid => "mermaid",
             Domain::WaveDrom => "wavedrom",
+            Domain::Chart => "chart",
         }
     }
 }

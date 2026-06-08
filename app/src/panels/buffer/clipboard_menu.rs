@@ -35,10 +35,29 @@ fn build_clipboard_menu() -> egui_workbench::menu::Menu<ClipboardVerb> {
         .action("Select All", ClipboardVerb::SelectAll)
 }
 
-/// Attach the clipboard context menu to the editor's text-area response.
-pub fn attach(editor_resp: &egui::Response) {
+/// Attach the editor's right-click context menu: the clipboard verbs, plus —
+/// when the right-click landed on an inline ```` ```chart ```` widget
+/// (`chart_target` is `Some`) — an "Open in chart editor" item at the top. The
+/// chosen chart target is written to `chart_open` for the caller to act on once
+/// the editor's buffer borrow has ended (opening the builder needs `&mut app`).
+/// A left click on a chart reveals its source instead (handled upstream).
+/// status: ctxmenu-editor-clipboard, chart-open-in-builder
+pub fn attach(
+    editor_resp: &egui::Response,
+    chart_target: Option<&super::widgets::chart::EditTarget>,
+    chart_open: &mut Option<super::widgets::chart::EditTarget>,
+) {
     let mut chosen = None;
-    editor_resp.context_menu(|ui| chosen = egui_workbench::menu::show(ui, build_clipboard_menu()));
+    editor_resp.context_menu(|ui| {
+        if let Some(target) = chart_target {
+            if ui.button("Open in chart editor").clicked() {
+                *chart_open = Some(target.clone());
+                ui.close();
+            }
+            ui.separator();
+        }
+        chosen = egui_workbench::menu::show(ui, build_clipboard_menu());
+    });
     let Some(verb) = chosen else { return };
     // Each verb reuses the editor's existing input path: focus the editor so
     // the injected event reaches it, then dispatch the same viewport command /

@@ -177,9 +177,42 @@ async fn server_lists_expected_tools() {
         "board_rename_column",
         "board_reorder_column",
         "board_delete_column",
+        "check_diagram",
     ] {
         assert!(tools.contains(&expected.to_string()), "missing {expected} in {tools:?}");
     }
+    shutdown(b).await;
+}
+
+/// `check_diagram` is a stateless syntax check: a valid mermaid block returns
+/// `ok:true` with no diagnostics; a broken one returns `ok:false` with at least
+/// one error diagnostic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn check_diagram_reports_syntax() {
+    let b = boot(McpConfig::default()).await;
+
+    let ok = call_tool(
+        &b,
+        "check_diagram",
+        serde_json::json!({"lang": "mermaid", "src": "graph TD\nA-->B"}),
+    )
+    .await;
+    let ok = structured(&ok);
+    assert_eq!(ok["ok"], serde_json::json!(true), "valid diagram is ok");
+    assert_eq!(ok["diagnostics"].as_array().unwrap().len(), 0);
+
+    let bad = call_tool(
+        &b,
+        "check_diagram",
+        serde_json::json!({"lang": "mermaid", "src": "pie title\n: notanumber"}),
+    )
+    .await;
+    let bad = structured(&bad);
+    assert_eq!(bad["ok"], serde_json::json!(false), "broken diagram is not ok");
+    let diags = bad["diagnostics"].as_array().unwrap();
+    assert!(!diags.is_empty(), "broken diagram yields diagnostics");
+    assert_eq!(diags[0]["severity"], serde_json::json!("error"));
+
     shutdown(b).await;
 }
 

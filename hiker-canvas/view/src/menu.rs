@@ -51,6 +51,8 @@ pub enum EmptyMenuAction {
     InsertFromVault,
     /// Arm the next drag to draw a group rectangle.
     AddGroup,
+    /// Tidy the board with a dagre auto-arrange (hierarchical ranked layout).
+    AutoArrange,
     /// Fit the camera to the canvas content.
     FitToContent,
 }

@@ -58,6 +58,7 @@ fn build_empty_menu() -> Menu<EmptyMenuAction> {
         .action("Insert from vault…", EmptyMenuAction::InsertFromVault)
         .action("Add group", EmptyMenuAction::AddGroup)
         .section()
+        .action("Auto-arrange", EmptyMenuAction::AutoArrange)
         .action("Fit to content", EmptyMenuAction::FitToContent)
 }
 
@@ -144,7 +145,8 @@ mod tests {
         );
         assert_eq!(action_of(&sections[0][4], "Add group"), EmptyMenuAction::AddGroup);
         assert_eq!(sections[0].len(), 5);
-        assert_eq!(action_of(&sections[1][0], "Fit to content"), EmptyMenuAction::FitToContent);
-        assert_eq!(sections[1].len(), 1);
+        assert_eq!(action_of(&sections[1][0], "Auto-arrange"), EmptyMenuAction::AutoArrange);
+        assert_eq!(action_of(&sections[1][1], "Fit to content"), EmptyMenuAction::FitToContent);
+        assert_eq!(sections[1].len(), 2);
     }
 }

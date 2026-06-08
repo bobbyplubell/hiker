@@ -44,6 +44,7 @@ use crate::tab::TabId;
 pub mod content;
 pub mod edit;
 pub mod menu;
+pub mod overview;
 pub(crate) mod render;
 pub mod thumbnail;
 
@@ -116,6 +117,38 @@ pub struct Pane {
     /// (and cleared) by `apply_pending_focus`, the same posture as `fit_pending`.
     /// status: canvas-appears-in
     focus_note_pending: Option<String>,
+    /// The Poincaré OVERVIEW graph-view state: a simplified graph of the canvas
+    /// (each card → a coloured node at its canvas position, canvas edges → graph
+    /// edges) rendered as a locked Poincaré disk. Drives the corner minimap and
+    /// the expand swap; navigating it + swapping back re-centers the canvas on the
+    /// focused node. View state only — never serialized. status: canvas-minimap
+    overview: hiker_graph_view::graph_view::State,
+    /// Whether the corner overview is shown. status: canvas-minimap
+    overview_enabled: bool,
+    /// Which pane corner the overview occupies. status: canvas-minimap
+    overview_corner: overview_layout::Corner,
+    /// Overview side as a fraction of the shorter viewport dimension
+    /// (`0.12..=0.5`). status: canvas-minimap
+    overview_size: f32,
+    /// The swap state: when `true` the overview promotes to fill the pane (the
+    /// canvas demotes); a swap back re-centers the canvas on the overview's
+    /// current focus. status: canvas-minimap
+    overview_expanded: bool,
+}
+
+/// Panel-owned overview placement config (the panel composes the corner inset
+/// itself rather than depending on canvas-view's old minimap fields). status: canvas-minimap
+pub mod overview_layout {
+    /// Which pane corner the overview is anchored to.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub enum Corner {
+        TopLeft,
+        TopRight,
+        BottomLeft,
+        /// The default — bottom-right, out of the toolbar's way.
+        #[default]
+        BottomRight,
+    }
 }
 
 impl Default for Pane {
@@ -133,8 +166,33 @@ impl Default for Pane {
             view_restored: false,
             followed: None,
             focus_note_pending: None,
+            overview: new_overview_state(),
+            overview_enabled: false,
+            overview_corner: overview_layout::Corner::default(),
+            overview_size: 0.26,
+            overview_expanded: false,
         }
     }
+}
+
+/// A fresh overview graph-view state configured for the canvas minimap: the
+/// locked Poincaré projection over a flat (one-color-fallback) style. The dot
+/// colors come per-node from the [`overview::CanvasGraphSource`], not the style,
+/// and positions are set directly each frame (never force-laid-out). status: canvas-minimap
+fn new_overview_state() -> hiker_graph_view::graph_view::State {
+    use hiker_graph::LayoutKind;
+    use hiker_graph_view::graph_view::{State, Style};
+    use hiker_projection::ProjectionKind;
+    let mut state = State::new(Style::flat(), LayoutKind::ForceDirected);
+    state.projection.kind = ProjectionKind::Poincare;
+    state.projection.strength = 1.0;
+    // The disk is locked to the pane — no view framing to do; never reset `nav`.
+    state.needs_fit = false;
+    // A minimap reads as bare dots — labels off so a large canvas's hundreds of
+    // titles never overlap into a text hairball in the corner.
+    state.toggles.show_labels = false;
+    state.toggles.show_preview = false;
+    state
 }
 
 /// Find-or-focus a canvas tab for `path`, opening one if none exists, and

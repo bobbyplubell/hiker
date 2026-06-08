@@ -30,6 +30,10 @@ serde_json.workspace = true
 zstd.workspace = true
 hiker-llm.workspace = true
 hiker-canvas.workspace = true
+hiker-diagram.workspace = true
+hiker-mermaid.workspace = true
+hiker-wavedrom.workspace = true
+hiker-math.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 similar.workspace = true
@@ -45,4 +49,8 @@ tempfile = "3"
 # wat: compile WebAssembly-text fixtures to bytes in-process so the plugin
 # host tests need no external wasm toolchain.
 wat = "1"
+# proptest: fuzz the span-delta round-trip (the fold-in correctness invariant
+# `apply_spans_str(base, multi_span_delta(base, target)) == target`) over
+# arbitrary unicode, not just hand-picked example shapes.
+proptest.workspace = true
 tokio = { version = "1", features = ["rt", "sync", "macros", "time", "fs", "rt-multi-thread"] }

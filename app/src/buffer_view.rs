@@ -23,7 +23,7 @@ use editor_egui::widget::PaintCache;
 use editor_egui::widget::Widget as EditorWidget;
 use editor_view::viewport::ViewState;
 
-use crate::panels::buffer::decorations::{rebuild_editor_decorations, DecoRebuildCtx};
+use crate::panels::buffer::decorations::{rebuild_editor_layers, DecoRebuildCtx};
 use crate::panels::buffer::editor_binding;
 use crate::state::AppState;
 
@@ -290,9 +290,12 @@ fn render_widget(ui: &mut egui::Ui, ctx: RenderCtx<'_>) -> egui::Response {
         diff: None,
         resolve_title: Some(resolve_title),
         diagram_cache,
+        // Embedded buffer view: inline-CSV charts render; external `data:`
+        // charts fall back to source (no note-bound resolver). status: widget-chart-render
+        chart_resolver: None,
     };
     let mut rebuild = |editor: &editor_core::state::Editor, view: &mut ViewState| {
-        rebuild_editor_decorations(editor, view, &mut deco_ctx);
+        rebuild_editor_layers(editor, view, &mut deco_ctx);
     };
     let mut widget = EditorWidget::new(editor, view)
         .with_paint_cache(paint_cache)

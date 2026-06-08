@@ -1,0 +1,26 @@
+[package]
+name = "profile-buffer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "profile-buffer"
+path = "src/main.rs"
+
+[dependencies]
+# The real app crate, consumed as a library so the profiler can drive the
+# genuine `panels::buffer::decorations::rebuild_editor_decorations` path
+# (DecorationCache, DiagramCacheCtx, the diagram-widget layers) rather than a
+# reimplementation.
+hiker-app = { path = "../../app" }
+editor-core = { path = "../../editor/editor-core" }
+editor-view = { path = "../../editor/editor-view" }
+editor-egui = { path = "../../editor/editor-egui" }
+editor-md = { path = "../../editor/editor-md" }
+egui.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

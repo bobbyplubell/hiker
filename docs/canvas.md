@@ -91,6 +91,14 @@ Driven by the adapter, applied through `hiker-canvas`'s edit ops, committed by t
 - **Undo/redo.** An in-session stack of inverse edit ops (Ctrl/Cmd-Z / -Shift-Z). Distinct from op-log history: undo operates on the in-memory model before Save; once committed, op-log version history (`op-log-history-materialization`) is the durable record. [canvas-undo-redo]
 
 
+## Auto-arrange
+
+A toolbar / context-menu **Auto-arrange** ("Tidy") verb lays the canvas out hierarchically using the same dagre (layered/Sugiyama) engine the graph view uses (`hiker-graph::LayeredEngine`).
+
+- **Pure, egui-free, op-log-routed.** `tidy::auto_arrange(&Canvas, ArrangeOpts) -> Vec<EditOp>` (`hiker-canvas/core/src/tidy.rs`) maps the canvas onto the layered engine and returns one `SetNodeRect` edit op per node that actually shifts, so the moves drive through the same op-log / undo pipeline as any other edit. Rank direction (top-down / bottom-up / left-right / right-left) and rank/node separation are options. The result is translated so its bounding-box center lands on the original content's center, keeping the board roughly where the user was looking. [canvas-auto-arrange]
+- **Groups become dagre clusters.** A `Group` maps to a dagre cluster: leaf membership is geometric (a leaf belongs to the smallest-area group whose bounds contain its center; a group inside a larger group nests as that group's dagre parent), fed in as `node_parents`. Each group frame is resized to the engine-computed cluster rectangle so it wraps its members after the arrange. [canvas-auto-arrange-groups]
+
+
 ## Node content engines
 
 Node *frames* are the adapter's job; node *contents* reuse hiker's existing renderers, wired by the app so the adapter stays free of the heavy engine deps. [canvas-node-content-trait]
@@ -125,6 +133,7 @@ The seam keeps the swappability the project favors: a different content engine f
 - **Drag-to-add from the file tree.** Dropping a file row (or a multi-selection) onto the canvas creates pointer file nodes at the drop point — the same gesture as a board's `board-dnd` file drop, riding the uniform vault-path drag payload (`trails-dnd-ingestion`) once it lands. The file-tree drag / multi-select plan (`files.md`, `note-multi-select` / `drag-and-drop-move`) records that canvas must accept this drop; the **Insert from vault** picker and the **Add to canvas** verb cover insertion until then. [canvas-dnd-add]
 - **Navigate to a node.** A `NavTarget` that focuses a specific node id (Back/Forward into a canvas location, deep-linking a node), extending `nav-stack` beyond file granularity. [canvas-node-nav-target]
 - **Minimap / overview.** A corner minimap of the whole canvas for orientation on large boards, reusing the texture-backed minimap renderer. [canvas-minimap]
+- **Routed edges after auto-arrange.** Optional orthogonal edge routing, reusing the layered engine's poly-line routes (`graph-routed-edges`) so an auto-arranged canvas can draw its connectors along the computed ranks rather than as direct curves. [canvas-routed-edges]
 - **Hyperbolic / fisheye projection modes.** The board adopts the shared `Projection` seam (`projection.md`) for an optional fisheye lens and a navigate-only Poincaré disk mode, selectable from the View menu (`canvas-view-toggle`) and off by default. A lens over the Euclidean `x/y` only — the `.canvas` format, canonical-JSON op-log binding, and sync are untouched. The Poincaré minimap (`proj-minimap`) is the hyperbolic sibling of the affine `canvas-minimap` above. [proj-canvas-mode]
 - **MCP canvas tools.** A read + curate surface (`canvas_get` / `canvas_list` plus node/edge write verbs gated by `agent-write-review-mode`) so attached agents can read a canvas as context and reorganize it, the symmetric surface to `board-mcp-tools`. [canvas-mcp-tools]
 

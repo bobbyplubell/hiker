@@ -5,6 +5,7 @@
 //! side-table query/status states. The working-layer + scenario tests live in
 //! the [`working_layer`] submodule; `user_ctx` below is shared with it.
 
+mod disk_canonical;
 mod sync;
 mod working_layer;
 

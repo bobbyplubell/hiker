@@ -35,7 +35,7 @@ use hiker_canvas::ops::EditOp;
 
 use crate::buffer::DecorationCache;
 use crate::buffer_view::{EmbeddedView, EmbedOpts};
-use crate::panels::buffer::decorations::{rebuild_editor_decorations, DecoRebuildCtx};
+use crate::panels::buffer::decorations::{rebuild_editor_layers, DecoRebuildCtx};
 use crate::state::AppState;
 use crate::tab::TabId;
 
@@ -297,9 +297,12 @@ fn render_text_widget(
         // Canvas node editing renders through the in-memory caches only.
         // status: widget-render-disk-cache
         diagram_cache: None,
+        // No note-bound resolver here: inline-CSV charts render; external
+        // `data:` charts fall back to source. status: widget-chart-render
+        chart_resolver: None,
     };
     let mut rebuild = |state: &EditorState, view: &mut ViewState| {
-        rebuild_editor_decorations(state, view, &mut deco_ctx);
+        rebuild_editor_layers(state, view, &mut deco_ctx);
     };
     let response = EditorWidget::new(&mut edit.editor, &mut edit.view)
         .with_paint_cache(&mut edit.paint)

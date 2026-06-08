@@ -12,9 +12,9 @@ use super::App;
 use crate::handler::params::{
     audit_err, audit_status, ApplyTag, BoardAddCard, BoardAddColumn, BoardAddTextCard, BoardCreate,
     BoardDeleteColumn, BoardGet, BoardMoveCard, BoardRemoveCard, BoardRenameColumn,
-    BoardReorderColumn, BoardSetCardText, BoardsList, EditNote, GetActiveNote, GetNote,
-    GetOpenNotes, GetSelection, RelatedNotes, SearchNotes, SetFrontmatter, TaskCheckout, TaskFail,
-    TaskHeartbeat, TaskList, TaskSubmit, WriteNote,
+    BoardReorderColumn, BoardSetCardText, BoardsList, CheckDiagram, EditNote, GetActiveNote,
+    GetNote, GetOpenNotes, GetSelection, RelatedNotes, SearchNotes, SetFrontmatter, TaskCheckout,
+    TaskFail, TaskHeartbeat, TaskList, TaskSubmit, WriteNote,
 };
 
 // ---------- tool router ----------
@@ -38,6 +38,28 @@ impl App {
         let outcome = self.run_search(&p).await;
         self.state.audit.record(
             "search_notes",
+            &serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
+            audit_status(&outcome),
+            audit_err(&outcome),
+        );
+        outcome
+    }
+
+    /// Syntax-check a diagram before writing it into a note.
+    ///
+    /// status: diagram-agent-check
+    #[tool(
+        name = "check_diagram",
+        description = "Validate diagram syntax (mermaid/wavedrom/latex) and return diagnostics before writing it into a note."
+    )]
+    pub async fn check_diagram(
+        &self,
+        params: Parameters<CheckDiagram>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let Parameters(p) = params;
+        let outcome = self.run_check_diagram(&p);
+        self.state.audit.record(
+            "check_diagram",
             &serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
             audit_status(&outcome),
             audit_err(&outcome),

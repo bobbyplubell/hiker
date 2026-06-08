@@ -102,8 +102,100 @@ fn view_menu(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId) {
                 }
                 ui.close();
             }
+            ui.separator();
+            projection_menu(ui, app, tab_id);
+            ui.separator();
+            minimap_menu(ui, app, tab_id);
         }
     });
+}
+
+/// The "Overview" section of the canvas View menu: the corner overview toggle
+/// plus its corner / size controls. The overview is a `hiker-graph-view` Poincaré
+/// disk of the canvas's cards (a SIMPLIFIED graph — coloured dots + edges), not a
+/// second camera over the board; clicking a dot moves the canvas to that card and
+/// clicking empty overview space swaps it full-pane. status: canvas-minimap
+fn minimap_menu(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId) {
+    use crate::panels::canvas::overview_layout::Corner;
+    let Some(pane) = app.panels.canvases.get_mut(&tab_id) else {
+        return;
+    };
+    ui.label(
+        egui::RichText::new("Overview")
+            .small()
+            .color(hiker_theme::muted()),
+    );
+    ui.checkbox(&mut pane.overview_enabled, "Show overview");
+    if !pane.overview_enabled {
+        return;
+    }
+    // Corner placement.
+    ui.horizontal(|ui| {
+        ui.selectable_value(&mut pane.overview_corner, Corner::TopLeft, "\u{2196}")
+            .on_hover_text("Top-left");
+        ui.selectable_value(&mut pane.overview_corner, Corner::TopRight, "\u{2197}")
+            .on_hover_text("Top-right");
+        ui.selectable_value(&mut pane.overview_corner, Corner::BottomLeft, "\u{2199}")
+            .on_hover_text("Bottom-left");
+        ui.selectable_value(&mut pane.overview_corner, Corner::BottomRight, "\u{2198}")
+            .on_hover_text("Bottom-right");
+    });
+    ui.add(egui::Slider::new(&mut pane.overview_size, 0.12..=0.5).text("Size"));
+}
+
+/// The "Projection" section of the canvas View menu: an Off / Fisheye / Poincaré
+/// selector plus (when non-Off) the lens sliders — Strength, Size falloff, and the
+/// per-card scale clamp min/max. Wires straight to the canvas widget's camera lens
+/// (`proj-canvas-mode`) and the card-scale clamp (`proj-cfg-card-scale-clamp`).
+/// Selecting a non-Off mode makes the canvas navigate-only (drag-move / resize /
+/// edge-create are gated out in the widget); Off restores full editing.
+/// status: proj-canvas-mode, proj-cfg-card-scale-clamp
+fn projection_menu(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId) {
+    use hiker_projection::ProjectionKind;
+    let Some(pane) = app.panels.canvases.get_mut(&tab_id) else {
+        return;
+    };
+    ui.label(
+        egui::RichText::new("Projection")
+            .small()
+            .color(hiker_theme::muted()),
+    );
+    let current = pane.view_widget.projection().kind;
+    for (kind, label) in [
+        (ProjectionKind::Affine, "Off"),
+        (ProjectionKind::Fisheye, "Fisheye"),
+        (ProjectionKind::Poincare, "Poincar\u{e9}"),
+    ] {
+        let mut selected = current == kind;
+        if ui.checkbox(&mut selected, label).clicked() && selected {
+            pane.view_widget.projection_mut().kind = kind;
+        }
+    }
+    if pane.view_widget.projection().kind == ProjectionKind::Affine {
+        return;
+    }
+    // Lens shape sliders. [proj-cfg-strength, proj-cfg-size-falloff]
+    {
+        let cfg = pane.view_widget.projection_mut();
+        ui.add(egui::Slider::new(&mut cfg.strength, 0.1..=3.0).text("Strength"));
+        ui.add(egui::Slider::new(&mut cfg.size_falloff, 0.0..=1.0).text("Size falloff"));
+    }
+    // Per-card scale clamp. [proj-cfg-card-scale-clamp]
+    ui.label(
+        egui::RichText::new("Card scale")
+            .small()
+            .color(hiker_theme::muted()),
+    );
+    let clamp = pane.view_widget.card_scale_clamp_mut();
+    ui.add(egui::Slider::new(&mut clamp.min, 0.05..=1.0).text("Min"));
+    ui.add(egui::Slider::new(&mut clamp.max, 0.5..=3.0).text("Max"));
+    // Neighbor-gap fill: how aggressively a card grows to fill the screen gap to
+    // its nearest neighbour under the lens. [proj-card-fill]
+    ui.add(egui::Slider::new(&mut clamp.fill, 0.4..=1.2).text("Fill"));
+    // Poincaré-only: the unit-disk boundary circle toggle. [proj-canvas-mode]
+    if pane.view_widget.projection().kind == ProjectionKind::Poincare {
+        ui.checkbox(pane.view_widget.show_boundary_mut(), "Boundary circle");
+    }
 }
 
 /// Small "Link" control in the canvas header: opens a popup to wire this
@@ -535,6 +627,12 @@ pub fn canvas_body(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId, path: &
         .view_widget
         .show(ui, &mut taken.canvas, &mut content, &mut menus);
 
+    // The Poincaré OVERVIEW (corner minimap + expand swap): a simplified graph of
+    // the canvas. Rendered after the canvas paints so it sits on top; clicking a
+    // dot or swapping back re-centers the canvas camera on the focused card.
+    // status: canvas-minimap
+    render_overview(ui, &mut taken, viewport);
+
     if !resp.committed.is_empty() {
         persist_canvas(app, path, &taken.canvas, &mut taken.last_parsed_text);
     }
@@ -613,6 +711,133 @@ pub fn canvas_body(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId, path: &
     if let Some((node, edit_rect)) = edit {
         render_edit_overlay(ui, app, tab_id, path, &node, edit_rect);
     }
+}
+
+/// Render the Poincaré overview (corner minimap, or full-pane when expanded) and
+/// wire the camera sync. A no-op when disabled+collapsed or the canvas has no
+/// non-group cards. The overview is a `hiker-graph-view` instance over a
+/// [`super::overview::CanvasGraphSource`] (coloured dots + edges, in-viewport
+/// cards highlighted). A clicked dot re-centers the canvas on that card; an
+/// empty-area click toggles the expand swap, and collapsing re-centers the canvas
+/// on the overview's current focus. status: canvas-minimap
+fn render_overview(ui: &mut egui::Ui, taken: &mut TakenDoc, viewport: egui::Rect) {
+    if !taken.overview_enabled && !taken.overview_expanded {
+        return;
+    }
+    let model = super::overview::Model::build(&taken.canvas, &ui.visuals().clone());
+    if model.node_count() == 0 {
+        return;
+    }
+    // The overview reads the canvas's ACTUAL layout: assign the card centers
+    // directly (never `recompute_layout`), so the disk projects the real positions.
+    taken.overview.positions = model.positions();
+    let viewport_world = camera_viewport_world(taken, viewport);
+    let source = super::overview::CanvasGraphSource::new(&model, viewport_world, &ui.visuals().clone());
+
+    let area = if taken.overview_expanded {
+        viewport
+    } else {
+        overview_corner_rect(taken.overview_corner, taken.overview_size, viewport)
+    };
+    if area.width() < 2.0 || area.height() < 2.0 {
+        return;
+    }
+    // The corner overview reads as a CIRCLE floating over the canvas — the
+    // graph-view pane fills transparent (so there's no opaque square) and the app
+    // paints a round inset bg, leaving the area's corners transparent. The
+    // full-pane (expanded) overview is opaque and covers the canvas directly.
+    // status: canvas-minimap
+    taken.overview.style.background = if taken.overview_expanded {
+        None
+    } else {
+        Some(egui::Color32::TRANSPARENT)
+    };
+    if !taken.overview_expanded {
+        let r = 0.5 * area.size().min_elem();
+        ui.painter().with_clip_rect(area).circle_filled(
+            area.center(),
+            r,
+            ui.visuals().extreme_bg_color.gamma_multiply(0.9),
+        );
+    }
+    let clicked = render_overview_disk(ui, taken, &source, area);
+
+    // Click a dot → select that card AND bring it into view on the canvas. A dot
+    // click is handled by the graph view (returned here), so the empty-area swap
+    // is skipped that frame. status: canvas-minimap
+    if let Some(card_id) = clicked {
+        taken.view_widget.focus_node(viewport, &taken.canvas, &card_id);
+        return;
+    }
+
+    // Click empty overview space → toggle the expand swap. When collapsing,
+    // re-center the canvas on the overview's current focus.
+    handle_overview_swap(ui, taken, area, viewport);
+}
+
+/// Drive the graph-view over the corner/full `area` via a child `Ui`, returning a
+/// clicked card id. The graph view's locked Poincaré renders a centered disk of
+/// dots regardless of the area, so the overview stays self-framed.
+fn render_overview_disk(
+    ui: &mut egui::Ui,
+    taken: &mut TakenDoc,
+    source: &super::overview::CanvasGraphSource,
+    area: egui::Rect,
+) -> Option<String> {
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area).layout(*ui.layout()));
+    taken.overview.ui(&mut child, source, |_, _, _, _, _| {})
+}
+
+/// Toggle the expand swap when the user clicks the OVERVIEW area off any dot, and
+/// re-center the canvas on the focused card when collapsing. The graph-view's own
+/// `ui` already consumed dot clicks (returned above); this catches the remaining
+/// empty-area click. status: canvas-minimap
+fn handle_overview_swap(ui: &egui::Ui, taken: &mut TakenDoc, area: egui::Rect, viewport: egui::Rect) {
+    let resp = ui.interact(area, ui.id().with("canvas-overview-swap"), egui::Sense::click());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if !resp.clicked() {
+        return;
+    }
+    let collapsing = taken.overview_expanded;
+    taken.overview_expanded = !taken.overview_expanded;
+    if collapsing {
+        // Re-center the canvas on the card the overview is currently focused on
+        // (nearest the disk center under its accumulated navigation).
+        let cfg = taken.overview.projection;
+        let nav = taken.overview.nav;
+        let model = super::overview::Model::build(&taken.canvas, &ui.visuals().clone());
+        if let Some(id) = model.focused_card(cfg, nav).map(ToString::to_string) {
+            taken.view_widget.focus_node(viewport, &taken.canvas, &id);
+        }
+    }
+}
+
+/// The canvas viewport as a WORLD-space rect, via the camera's screen↔world map —
+/// the region the overview highlights as "where you are". status: canvas-minimap
+fn camera_viewport_world(taken: &TakenDoc, viewport: egui::Rect) -> hiker_canvas::geometry::Rect {
+    let cam = taken.view_widget.camera();
+    let a = cam.screen_to_world(viewport, viewport.min);
+    let b = cam.screen_to_world(viewport, viewport.max);
+    let (x0, x1) = (a.x.min(b.x), a.x.max(b.x));
+    let (y0, y1) = (a.y.min(b.y), a.y.max(b.y));
+    hiker_canvas::geometry::Rect::new(x0, y0, x1 - x0, y1 - y0)
+}
+
+/// The corner inset rect for the overview: a fraction of the shorter viewport
+/// dimension (clamped), inset ~8px from the chosen corner. status: canvas-minimap
+fn overview_corner_rect(corner: super::overview_layout::Corner, size: f32, viewport: egui::Rect) -> egui::Rect {
+    use super::overview_layout::Corner;
+    const MARGIN: f32 = 8.0;
+    let side = viewport.width().min(viewport.height()) * size.clamp(0.12, 0.5);
+    let (min_x, min_y) = match corner {
+        Corner::TopLeft => (viewport.left() + MARGIN, viewport.top() + MARGIN),
+        Corner::TopRight => (viewport.right() - MARGIN - side, viewport.top() + MARGIN),
+        Corner::BottomLeft => (viewport.left() + MARGIN, viewport.bottom() - MARGIN - side),
+        Corner::BottomRight => (viewport.right() - MARGIN - side, viewport.bottom() - MARGIN - side),
+    };
+    egui::Rect::from_min_size(egui::pos2(min_x, min_y), egui::Vec2::splat(side))
 }
 
 /// Dispatch a double-click: a full-detail File / Text card enters inline-edit
@@ -875,6 +1100,15 @@ struct TakenDoc {
     view_widget: canvas_view::widget::CanvasView,
     last_parsed_text: String,
     fit_pending: bool,
+    /// The Poincaré overview graph-view state, carried out alongside the widget so
+    /// the panel can render the corner overview / expand-swap and sync the camera
+    /// in the same borrow window. status: canvas-minimap
+    overview: hiker_graph_view::graph_view::State,
+    /// Overview placement + swap config, carried by value for the frame.
+    overview_enabled: bool,
+    overview_corner: super::overview_layout::Corner,
+    overview_size: f32,
+    overview_expanded: bool,
 }
 
 /// Move the parsed document + widget out of the pane for the frame.
@@ -886,6 +1120,11 @@ fn take_pane_doc(app: &mut AppState, tab_id: TabId) -> Option<TakenDoc> {
         view_widget: std::mem::take(&mut pane.view_widget),
         last_parsed_text: std::mem::take(&mut pane.last_parsed_text),
         fit_pending: std::mem::replace(&mut pane.fit_pending, false),
+        overview: std::mem::replace(&mut pane.overview, super::new_overview_state()),
+        overview_enabled: pane.overview_enabled,
+        overview_corner: pane.overview_corner,
+        overview_size: pane.overview_size,
+        overview_expanded: pane.overview_expanded,
     })
 }
 
@@ -896,6 +1135,8 @@ fn put_pane_doc(app: &mut AppState, tab_id: TabId, taken: TakenDoc) {
     pane.view_widget = taken.view_widget;
     pane.last_parsed_text = taken.last_parsed_text;
     pane.fit_pending = taken.fit_pending;
+    pane.overview = taken.overview;
+    pane.overview_expanded = taken.overview_expanded;
 }
 
 /// Forward binding: re-serialize the live canvas to canonical JSON and mirror

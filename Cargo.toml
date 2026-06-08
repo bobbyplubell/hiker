@@ -20,10 +20,12 @@ members = [
     "tools/diff-overlay-snapshot",
     "tools/graph-snapshot",
     "tools/minimap-render",
+    "tools/profile-buffer",
     "tools/profile-canvas",
     "tools/profile-indexer",
     "tools/profile-scroll",
     "widgets/graph-widgets",
+    "widgets/graph-view",
 ]
 # `hiker-crawler` is the JS-capable companion app (docs/hiker-crawler.md),
 # excluded because its optional CEF engine links a C++ Chromium FFI binding
@@ -36,8 +38,11 @@ members = [
 # as members would clash with their nested `[workspace]` (multiple-workspace-
 # roots error). `hiker-render` supplies the egui-agnostic graph layout
 # (`hiker-graph`, wrapped by `widgets/graph-widgets`) and the from-scratch
-# HTML/CSS renderer (`hiker-htmlview`, used by the ZIM viewer).
-exclude = ["hiker-crawler", "editor", "egui-workbench", "hiker-render"]
+# HTML/CSS renderer (`hiker-htmlview`, used by the ZIM viewer). `hiker-charts`
+# is the grammar-of-graphics chart engine submodule (its own workspace root +
+# nested `[patch.crates-io]` winit fork); consumed here as path deps via
+# `[workspace.dependencies]` (hiker-charts-core/-plotters/-gui).
+exclude = ["hiker-crawler", "editor", "egui-workbench", "hiker-render", "hiker-charts"]
 
 [workspace.package]
 version = "0.0.0"
@@ -47,6 +52,14 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 hiker-core = { path = "core" }
+# Grammar-of-graphics chart engine (the `hiker-charts` submodule). Three
+# egui-/eframe-free crates: `-core` (spec + CSV typing + resolve + the
+# `DataResolver` host seam), `-plotters` (the only plotters consumer; SVG-string
+# out), `-gui` (a pure-egui builder panel). The app rasterizes the plotters SVG
+# to RGBA via the same resvg path the diagram widgets use. status: chart-render
+hiker-charts-core = { path = "hiker-charts/core" }
+hiker-charts-plotters = { path = "hiker-charts/backend-plotters" }
+hiker-charts-gui = { path = "hiker-charts/gui" }
 # Git transport backend (git.md). `git2`/libgit2 is confined to this crate
 # (git-backend-trait); consumers see only its plain-Rust `GitBackend` surface.
 hiker-git = { path = "hiker-git" }
@@ -141,7 +154,25 @@ egui_workbench = { path = "egui-workbench" }
 # (`hiker-graph`); `widgets/graph-widgets` is the thin egui adapter the app +
 # graph-snapshot consume (it converts at the `egui::Vec2` boundary).
 hiker-graph = { path = "hiker-render/graph" }
+# Egui-free hyperbolic/fisheye projection math kernel (sibling of hiker-graph in
+# the render submodule); the graph/canvas view layers consume its Möbius +
+# geodesic + lens primitives.
+hiker-projection = { path = "hiker-render/projection" }
+# Shared render→SVG / syntax-check (`check()`) trait across the diagram engines
+# (mermaid / wavedrom / math), in the render submodule. egui-free, no graphics
+# deps — the editor/agent seam for syntax-checking diagrams.
+hiker-diagram = { path = "hiker-render/diagram" }
+# The per-engine `DiagramRenderer` impls (marker types `Mermaid` / `WaveDrom` /
+# `Math`) behind the `hiker-diagram` `check()` seam. `hiker-core` dispatches to
+# these from `diagram::check_diagram`.
+hiker-mermaid = { path = "hiker-render/mermaid" }
+hiker-wavedrom = { path = "hiker-render/wavedrom" }
+hiker-math = { path = "hiker-render/math" }
 graph-widgets = { path = "widgets/graph-widgets" }
+# Shared graph-view render engine (force/tree layout, view-options menu,
+# node/edge/label/hover/preview paint loop) extracted from the app; consumed
+# by hiker-app's two graph panels and the graph-snapshot tool.
+hiker-graph-view = { path = "widgets/graph-view" }
 # Thin egui shell over the egui-free `canvas-view-core`: the painter + widget +
 # pointer plumbing + the `NodeContentRenderer` content seam. Stays free of
 # content-engine deps — the app injects those through the trait.

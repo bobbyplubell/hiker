@@ -24,6 +24,8 @@ use hiker_canvas::ops::EditOp;
 
 use std::collections::HashMap;
 
+use hiker_projection::{clamp_inside_disk, Complex, Mobius, DEFAULT_BOUNDARY_RADIUS};
+
 use canvas_view_core::camera::Camera;
 use canvas_view_core::edges::anchor_pos;
 use canvas_view_core::handles::Handle;
@@ -37,6 +39,35 @@ use crate::paint;
 
 /// Spacing of the optional background grid, in canvas units.
 const GRID_STEP: f32 = 40.0;
+
+/// Default click fly-to glide duration, in seconds. [proj-poincare-nav]
+const FLYTO_DURATION: f32 = 0.5;
+
+/// A Poincaré click fly-to in progress: the disk centre glides from
+/// `start_center` to `target_center` (both pre-nav disk points) over `dur`
+/// seconds, easing out. Each frame rebuilds the camera's `nav` as the pure
+/// recentre that maps the eased point to the disk origin, so the clicked card
+/// glides to the centre while the board recentres hyperbolically around it.
+/// [proj-poincare-nav]
+#[derive(Debug, Clone, Copy)]
+struct FlyTo {
+    start_center: Complex,
+    target_center: Complex,
+    t: f32,
+    dur: f32,
+}
+
+/// `1 − (1 − t)³` — decelerating ease for the fly-to glide. [proj-poincare-nav]
+fn ease_out_cubic(t: f32) -> f32 {
+    let u = 1.0 - t;
+    1.0 - u * u * u
+}
+
+/// Linear interpolation on the complex plane (component-wise on re/im).
+/// [proj-poincare-nav]
+fn lerp_complex(a: Complex, b: Complex, t: f32) -> Complex {
+    Complex::new(a.re + (b.re - a.re) * t, a.im + (b.im - a.im) * t)
+}
 
 /// What one frame of the canvas view produced. The host persists `committed`
 /// through the op-log binding; the ops are already applied to the live `Canvas`.
@@ -142,6 +173,10 @@ pub struct CanvasView {
     /// stop, so we remember the last source to keep pan-vs-zoom stable across that
     /// tail rather than flipping mid-gesture. status: canvas-scroll-mode
     last_scroll_was_line: bool,
+    /// An in-flight Poincaré click fly-to, if any: animates the camera's `nav` so
+    /// a clicked card glides to the disk centre. Cleared on completion, a manual
+    /// drag-recentre, or a fit/reset. View state only. [proj-poincare-nav]
+    flyto: Option<FlyTo>,
 }
 
 impl CanvasView {
@@ -161,6 +196,32 @@ impl CanvasView {
     #[must_use]
     pub const fn camera(&self) -> &Camera {
         &self.camera
+    }
+
+    /// The camera's active projection config (read-only) so the host view menu
+    /// can reflect the current kind / strength / size-falloff. [proj-canvas-mode]
+    #[must_use]
+    pub const fn projection(&self) -> hiker_projection::ProjectionConfig {
+        self.camera.projection()
+    }
+
+    /// Mutable access to the camera's projection config for the host's view-menu
+    /// sliders (kind / strength / size-falloff). [proj-cfg-strength,
+    /// proj-cfg-size-falloff]
+    pub const fn projection_mut(&mut self) -> &mut hiker_projection::ProjectionConfig {
+        self.camera.projection_mut()
+    }
+
+    /// Mutable access to the per-card scale clamp for the view-menu min/max
+    /// sliders. [proj-cfg-card-scale-clamp]
+    pub const fn card_scale_clamp_mut(&mut self) -> &mut canvas_view_core::camera::CardScaleClamp {
+        self.camera.card_scale_clamp_mut()
+    }
+
+    /// Mutable access to the Poincaré boundary-circle toggle for the view-menu
+    /// checkbox (Poincaré only). [proj-canvas-mode]
+    pub const fn show_boundary_mut(&mut self) -> &mut bool {
+        self.camera.show_boundary_mut()
     }
 
     /// The current selection (read-only).
@@ -262,11 +323,46 @@ impl CanvasView {
         paint::is_tiny(self.node_screen_rect(viewport, node))
     }
 
-    /// Frame all content (zoom-to-fit) within `viewport`.
+    /// Force a Poincaré navigation recentre directly — for headless snapshot /
+    /// demo filmstrips that need to capture intermediate fly-to frames without
+    /// driving the animation over real time. `e` is the eased glide fraction in
+    /// `[0, 1]`; the disk centre lerps from the disk origin to `target` (a card's
+    /// pre-nav disk point, e.g. from [`Camera::disk_point`]). Not part of the
+    /// interactive flow. [proj-poincare-nav]
+    #[doc(hidden)]
+    pub fn set_nav_flyto_for_demo(&mut self, target: Complex, e: f32) {
+        let c = clamp_inside_disk(
+            lerp_complex(Complex::ORIGIN, target, e.clamp(0.0, 1.0)),
+            DEFAULT_BOUNDARY_RADIUS,
+        );
+        self.camera.set_nav(Mobius::from_point_pair(c, Complex::ORIGIN));
+    }
+
+    /// The pre-nav disk point of a world card center — for the demo filmstrip to
+    /// pick a peripheral card's fly-to target. [proj-poincare-nav]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn disk_point_for_demo(&self, center: Point) -> Complex {
+        self.camera.disk_point(center)
+    }
+
+    /// Refresh the lens framing from a canvas without painting — for the demo
+    /// filmstrip to resolve a card's disk point before rendering. [proj-poincare-nav]
+    #[doc(hidden)]
+    pub fn update_lens_for_demo(&mut self, canvas: &Canvas) {
+        self.camera.update_lens(content_bounds(canvas));
+    }
+
+    /// Frame all content (zoom-to-fit) within `viewport`. Also recentres the
+    /// Poincaré disk: a fit/reset drops any accumulated hyperbolic navigation
+    /// (drag-recentre / fly-to) so the disk re-centres on the content.
+    /// [proj-poincare-nav]
     pub fn fit(&mut self, viewport: Rect, canvas: &Canvas) {
         if let Some(b) = content_bounds(canvas) {
             self.camera.zoom_to_fit(viewport, b, 0.08);
         }
+        self.camera.reset_nav();
+        self.flyto = None;
     }
 
     /// Single-select the node `id` and center the camera on it (keeping the
@@ -286,6 +382,15 @@ impl CanvasView {
         );
         self.camera.center_on_point(viewport, center);
         true
+    }
+
+    /// Center the camera on a canvas-space point `p` within `viewport`, keeping
+    /// the current zoom — a thin accessor over [`Camera::center_on_point`]. The
+    /// host's overview minimap calls this with a focused card's center so
+    /// navigating the overview (and swapping back) re-aims the canvas viewport.
+    /// status: canvas-minimap
+    pub fn center_camera_on(&mut self, viewport: Rect, p: Point) {
+        self.camera.center_on_point(viewport, p);
     }
 
     /// Mint a fresh, canvas-unique node/edge id.
@@ -338,6 +443,51 @@ impl CanvasView {
         self.selection.nodes.insert(id);
     }
 
+    /// Begin a Poincaré click fly-to toward `node`: glide the disk centre from the
+    /// currently-centred pre-nav point to the node's pre-nav disk point, so the
+    /// card glides to the disk centre and the board recentres around it. Overwrites
+    /// any accumulated drag-recentre — the glide ends cleanly centred on the card.
+    /// [proj-poincare-nav]
+    fn start_flyto(&mut self, node: &Node) {
+        let center = Point::new(
+            node.x as f64 + node.width as f64 / 2.0,
+            node.y as f64 + node.height as f64 / 2.0,
+        );
+        // The card's resting (pre-nav) disk point is where the glide ends; the
+        // start is the point the current nav has at the disk centre.
+        let target_center = self.camera.disk_point(center);
+        let start_center = self.camera.nav().invert().apply(Complex::ORIGIN);
+        self.flyto = Some(FlyTo { start_center, target_center, t: 0.0, dur: FLYTO_DURATION });
+    }
+
+    /// Advance an in-flight fly-to by one frame, rebuilding the camera's `nav` as
+    /// the pure recentre that maps the eased disk point to the origin. Requests a
+    /// repaint while animating; clears the fly-to once `t` reaches 1.
+    /// [proj-poincare-nav]
+    fn advance_flyto(&mut self, ui: &egui::Ui) {
+        let Some(mut fly) = self.flyto else { return };
+        let dt = ui.input(|i| i.stable_dt);
+        fly.t += dt / fly.dur;
+        let e = ease_out_cubic(fly.t.min(1.0));
+        let c = clamp_inside_disk(
+            lerp_complex(fly.start_center, fly.target_center, e),
+            DEFAULT_BOUNDARY_RADIUS,
+        );
+        self.camera.set_nav(Mobius::from_point_pair(c, Complex::ORIGIN));
+        if fly.t >= 1.0 {
+            self.flyto = None;
+        } else {
+            self.flyto = Some(fly);
+            ui.ctx().request_repaint();
+        }
+    }
+
+    /// Cancel any in-flight fly-to (a manual drag-recentre takes over).
+    /// [proj-poincare-nav]
+    const fn cancel_flyto(&mut self) {
+        self.flyto = None;
+    }
+
     /// Run one frame: paint the canvas, handle input, and report committed ops.
     ///
     /// The viewport is the space *below* the host's header (the available rect),
@@ -385,6 +535,10 @@ impl CanvasView {
         self.handle_tool_keys(ui);
         self.handle_middle_pan(ui, viewport);
         self.handle_pointer(ui, canvas, viewport, &response, &mut out);
+        // Advance any in-flight Poincaré click fly-to (a no-op otherwise), driving
+        // the camera's `nav` toward the clicked card and requesting repaints until
+        // the glide finishes. [proj-poincare-nav]
+        self.advance_flyto(ui);
         self.apply_pan_cursor(ui, viewport, &response);
 
         self.paint_overlays(ui, viewport, canvas, &hover);
@@ -420,6 +574,40 @@ impl CanvasView {
     /// toward the cursor.
     /// status: canvas-card-scroll, canvas-card-zoom, canvas-pan-zoom, canvas-lod-placeholder
     fn handle_zoom(&mut self, ui: &egui::Ui, viewport: Rect, canvas: &Canvas) {
+        // Under Poincaré the disk is LOCKED to the viewport centre. Affine pan
+        // stays OFF (zoom-to-cursor would mutate `pan` and drift the fixed disk —
+        // the viewport-lock bug); instead the wheel scales the disk RADIUS about
+        // the centre, so it zooms without drifting. Möbius drag-recentre +
+        // click-fly-to remain the navigation. [proj-poincare-nav, proj-canvas-mode]
+        if self.camera.projection().kind == hiker_projection::ProjectionKind::Poincare {
+            let (scroll, cursor) = ui.input(|i| (i.smooth_scroll_delta.y, i.pointer.hover_pos()));
+            if scroll != 0.0
+                && let Some(cursor) = cursor.filter(|p| viewport.contains(*p))
+            {
+                // Over a readable (non-group, non-LOD) card → scroll its content,
+                // so a zoomed-in note can be read; otherwise scale the locked disk
+                // radius about its centre (zoom without drift).
+                let world = self.camera.screen_to_world(viewport, cursor);
+                let on_card = hiker_canvas::geometry::hit_test(canvas, world).is_some_and(|idx| {
+                    let node = &canvas.nodes[idx];
+                    let is_group = matches!(node.kind, hiker_canvas::model::NodeKind::Group { .. });
+                    let screen =
+                        self.camera.world_rect_to_screen(viewport, hiker_canvas::geometry::node_bounds(node));
+                    if !is_group && !crate::paint::is_tiny(screen) {
+                        let entry = self.card_views.entry(node.id.clone()).or_default();
+                        entry.scroll_y = (entry.scroll_y - scroll).max(0.0);
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if !on_card {
+                    self.camera.zoom_poincare(scroll);
+                }
+                ui.ctx().request_repaint();
+            }
+            return;
+        }
         // Keyboard zoom: plain `+`/`=` in, `-` out, `0` fit-to-content. No
         // modifier, so it never fights egui's built-in Cmd/Ctrl+/- whole-UI zoom
         // — and it's the ergonomic way to zoom in scroll-to-pan mode where a
@@ -658,6 +846,11 @@ impl CanvasView {
     /// Each card renders per its [`CardView`] (zoom + scroll); the effective
     /// (clamped) scroll the body settled on is stored back as the card's state.
     fn paint_scene(&mut self, ui: &mut egui::Ui, viewport: Rect, canvas: &Canvas, content: &mut dyn NodeContentRenderer, header_hover: Option<&str>) {
+        // Refresh the projection lens framing once per frame from the canvas
+        // content bounds (focus = bounds center, scale = half the diagonal),
+        // before any paint or hit-test reads the lens. A no-op for the Off lens
+        // and for an empty canvas. [proj-canvas-mode]
+        self.camera.update_lens(content_bounds(canvas));
         let dark = ui.visuals().dark_mode;
         let visuals = ui.visuals().clone();
         let bg = ui.painter().with_clip_rect(viewport);
@@ -666,10 +859,16 @@ impl CanvasView {
         }
         paint::group_backgrounds(&bg, viewport, &self.camera, canvas, &visuals, header_hover);
         paint::edges(&bg, viewport, &self.camera, canvas, &visuals, &|id| self.selection.has_edge(id));
+        paint::poincare_boundary(&bg, viewport, &self.camera, &visuals);
         let camera = self.camera;
-        for node in &canvas.nodes {
+        // Pre-pass: under a lens, size each card to fill the gap to its nearest
+        // on-screen neighbour so sparse regions of the disk fill out instead of
+        // floating tiny cards. `None` per node with the lens Off (affine sizing).
+        // [proj-card-fill]
+        let fills = paint::lens_fill_scales(&camera, viewport, canvas);
+        for (node, fill) in canvas.nodes.iter().zip(fills) {
             let view = self.card_view(&node.id);
-            let effective_scroll = paint::node_card(ui, viewport, &camera, node, content, view);
+            let effective_scroll = paint::node_card_filled(ui, viewport, &camera, node, content, view, fill);
             if (effective_scroll - view.scroll_y).abs() > f32::EPSILON {
                 self.card_views.entry(node.id.clone()).or_default().scroll_y = effective_scroll;
             }
@@ -924,16 +1123,36 @@ impl CanvasView {
     /// Text and group create immediately (queued for the next `show`); link /
     /// vault-insert need host-side UI, so they're reported as requests in
     /// [`CanvasResponse`]. status: canvas-node-create, canvas-context-menu, ctxmenu-canvas
-    fn apply_empty_menu(&mut self, action: menu::EmptyMenuAction, viewport: Rect, canvas: &Canvas, out: &mut CanvasResponse) {
-        use crate::menu::EmptyMenuAction::{AddGroup, AddLink, AddText, FitToContent, InsertFromVault, NewNote};
+    fn apply_empty_menu(&mut self, action: menu::EmptyMenuAction, viewport: Rect, canvas: &mut Canvas, out: &mut CanvasResponse) {
+        use crate::menu::EmptyMenuAction::{
+            AddGroup, AddLink, AddText, AutoArrange, FitToContent, InsertFromVault, NewNote,
+        };
         match action {
             AddText => self.create_centered(CreateKind::Text),
             NewNote => out.request_new_note = true,
             AddLink => out.request_link_prompt = true,
             InsertFromVault => out.request_insert_picker = true,
             AddGroup => self.arm_group_draw(),
+            AutoArrange => self.auto_arrange(canvas, out),
             FitToContent => self.fit(viewport, canvas),
         }
+    }
+
+    /// Tidy the whole board with a dagre auto-arrange: compute the pure
+    /// `SetNodeRect` ops in the core, apply each to the live canvas, and record
+    /// them on the undo stack / report them (so the op-log captures the tidy and
+    /// a single undo reverts the move). status: canvas-auto-arrange
+    fn auto_arrange(&mut self, canvas: &mut Canvas, out: &mut CanvasResponse) {
+        use hiker_canvas::tidy::{auto_arrange, ArrangeOpts};
+        let ops = auto_arrange(canvas, ArrangeOpts::default());
+        if ops.is_empty() {
+            return;
+        }
+        let pre = canvas.clone();
+        for op in &ops {
+            op.apply(canvas);
+        }
+        self.commit_each(&pre, ops, out);
     }
 }
 

@@ -19,3 +19,8 @@ path = "src/lib.rs"
 [dependencies]
 emath = { workspace = true }
 hiker-canvas = { workspace = true }
+# The egui-free projection math kernel (hyperbolic/fisheye lens): `forward` /
+# `inverse` / `magnification` over `Complex`, parameterised by `ProjectionConfig`.
+# The lens MATH lives here in the egui-free camera; egui paint stays in
+# `canvas-view`. See docs/projection.md.
+hiker-projection = { workspace = true }

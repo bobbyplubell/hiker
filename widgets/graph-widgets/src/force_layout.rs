@@ -35,6 +35,25 @@ impl LayoutWorker {
         }
     }
 
+    /// Spawn the worker like [`spawn`](Self::spawn), but with **anchor
+    /// springs**: `anchors[i] == Some(p)` tethers node `i` toward `p` (in the
+    /// same world space as `initial`); `None` lets it settle freely. The
+    /// `egui::Vec2` inputs are converted at the boundary and delegated to
+    /// [`hiker_graph::LayoutWorker::spawn_anchored`]. Anchors are honoured only
+    /// when `params.anchor_stiffness > 0.0`.
+    pub fn spawn_anchored(
+        initial: Vec<Vec2>,
+        edges: Vec<(u32, u32)>,
+        params: LayoutParams,
+        anchors: Vec<Option<Vec2>>,
+    ) -> Self {
+        let initial = initial.into_iter().map(to_hiker).collect();
+        let anchors = anchors.into_iter().map(|a| a.map(to_hiker)).collect();
+        Self {
+            inner: hiker_graph::LayoutWorker::spawn_anchored(initial, edges, params, anchors),
+        }
+    }
+
     /// Copy the worker's current positions into `out` (cleared, then refilled
     /// in node-index order).
     pub fn snapshot_into(&self, out: &mut Vec<Vec2>) {

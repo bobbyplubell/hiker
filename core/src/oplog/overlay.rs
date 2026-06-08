@@ -86,3 +86,35 @@ pub(super) fn fold_session_text(
     }
     text
 }
+
+#[cfg(test)]
+mod round_trip_tests {
+    use proptest::prelude::*;
+
+    /// Strings over a small alphabet so two independently-generated values
+    /// share substructure — exercising real, non-trivial diffs and the
+    /// char-boundary skip path, not just full replacements of unrelated text.
+    /// The alphabet spans 1-, 2-, 3- and 4-byte UTF-8 (`a`, `é`, `→`, `😀`) to
+    /// stress char-boundary handling.
+    fn smallish() -> impl Strategy<Value = String> {
+        prop::collection::vec(
+            prop::sample::select(vec!['a', 'b', 'c', ' ', '\n', 'é', '→', '😀']),
+            0..40,
+        )
+        .prop_map(|cs| cs.into_iter().collect())
+    }
+
+    proptest! {
+        /// The fold-in invariant every user/external/remote edit relies on:
+        /// the minimal span delta `base`→`target` spliced back through the
+        /// PRODUCTION [`super::apply_spans_str`] (defensive char-boundary skip
+        /// and all) must reproduce `target` byte-for-byte. A counterexample
+        /// here is the op-log-diverges-from-disk bug at its source — and is now
+        /// also caught at runtime by `commit_text_edit`'s `FoldRoundTrip` guard.
+        #[test]
+        fn span_delta_round_trips(base in smallish(), target in smallish()) {
+            let spans = crate::merge::multi_span_delta(&base, &target);
+            prop_assert_eq!(super::apply_spans_str(&base, &spans), target);
+        }
+    }
+}

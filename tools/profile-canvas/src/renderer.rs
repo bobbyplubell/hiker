@@ -3,12 +3,15 @@
 //!
 //! Each non-group node is rendered by reproducing the app's real markdown cost:
 //! a read-only `editor-egui` widget over the node's text, with the live-preview
-//! markdown decoration layers rebuilt every frame through the widget's
-//! decoration hook (the per-frame churn that dominates at zoom-to-fit). The
-//! heavyweight editor state (rope, galley caches, paint cache) is cached per
-//! node id behind a content fingerprint, exactly like the app's `PANES` store,
-//! so steady-state frames hit the cache and only pay the decoration rebuild +
-//! layout/paint — the realistic steady state.
+//! markdown decoration layers cached per content fingerprint — the markdown
+//! parse runs once when a pane is built, NOT every frame. This mirrors the app's
+//! per-card `decoration_cache` (`app::panels::canvas::content::EditorPane`):
+//! a steady-state frame reinstalls the cached layers (a cheap clone, the app's
+//! cache-HIT path) and pays only the editor's layout + paint, never a re-parse.
+//! The heavyweight editor state (rope, galley caches, paint cache) is likewise
+//! cached per node id behind the same fingerprint, exactly like the app's
+//! `PANES` store, so the per-frame cost the profiler reports is the realistic
+//! steady state — layout + paint of every visible full-detail card.
 //!
 //! Every `render` call accumulates its wall time into a per-frame counter the
 //! harness reads and resets, so the profiler can report the content-render
@@ -22,9 +25,9 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use editor_core::state::Editor as EditorState;
-use editor_core::theme::{dark_default, Theme as EditorTheme};
+use editor_core::theme::dark_default;
 use editor_egui::widget::{PaintCache, Widget as EditorWidget};
-use editor_view::viewport::ViewState;
+use editor_view::viewport::{DecorationLayers, ViewState};
 use hiker_canvas::model::{Node, NodeKind};
 
 use canvas_view::content::{CardView, NodeContentRenderer};
@@ -38,6 +41,11 @@ struct NodePane {
     editor: EditorState,
     view: ViewState,
     paint: PaintCache,
+    /// The live-preview markdown decoration layers, parsed ONCE when the pane is
+    /// built. Reinstalled (cloned) into `view.decorations` each frame — the
+    /// app's `decoration_cache` cache-HIT path — so a steady-state frame never
+    /// re-parses markdown. Empty for non-markdown bodies.
+    decorations: DecorationLayers,
 }
 
 /// The realistic content engine: a per-node editor cache plus content-time
@@ -137,59 +145,65 @@ impl ProfRenderer {
         let entry = self
             .panes
             .entry(node.id.clone())
-            .or_insert_with(|| build_pane(&text));
+            .or_insert_with(|| build_pane(&text, markdown));
         if entry.fingerprint != fingerprint {
-            *entry = build_pane(&text);
+            *entry = build_pane(&text, markdown);
             entry.fingerprint = fingerprint;
         }
-        paint_editor(ui, entry, inner, view, markdown)
+        paint_editor(ui, entry, inner, view)
     }
 }
 
-/// Build a fresh read-only editor pane over `text` (fingerprint set by caller).
-fn build_pane(text: &str) -> NodePane {
+/// Build a fresh read-only editor pane over `text` (fingerprint set by caller),
+/// parsing its markdown decoration layers ONCE here — the cost an app card pays
+/// only on a fingerprint change, not every frame.
+fn build_pane(text: &str, markdown: bool) -> NodePane {
     let mut view = ViewState { read_only: true, hide_gutter: true, font_size: 14.0, ..Default::default() };
     view.wrap_map.set_enabled(true);
+    let editor = EditorState::new(text);
+    let decorations = build_decorations(&editor, markdown);
     NodePane {
         fingerprint: String::new(),
-        editor: EditorState::new(text),
+        editor,
         view,
         paint: PaintCache::default(),
+        decorations,
     }
 }
 
-/// Host the read-only editor widget for a node body inside `inner`, rebuilding
-/// its markdown decoration layers each frame (the real per-frame cost). Mirrors
-/// `content::paint_editor` + `rebuild_markdown_decorations`.
-fn paint_editor(ui: &mut egui::Ui, pane: &mut NodePane, inner: egui::Rect, view: CardView, markdown: bool) -> f32 {
-    let theme: EditorTheme = dark_default();
+/// Parse the live-preview markdown decoration layers (styling + callouts +
+/// footnotes), exactly the focused subset the app's canvas content engine uses.
+/// Plain-text bodies get no layers. Run ONCE per pane (per content fingerprint),
+/// mirroring the app's `decoration_cache` — never per frame.
+fn build_decorations(state: &EditorState, markdown: bool) -> DecorationLayers {
+    let mut layers = DecorationLayers::default();
+    if !markdown {
+        return layers;
+    }
+    let theme = dark_default();
+    let t = Some(&theme);
+    layers.push(editor_md::styling::markdown_decorations(state, t));
+    layers.push(editor_md::admonitions::callout_decorations(state, t, None));
+    layers.push(editor_md::notes::footnote_decorations(state, t, None));
+    layers
+}
+
+/// Host the read-only editor widget for a node body inside `inner`. Reinstalls
+/// the pane's cached decoration layers (the app's per-frame cache-HIT clone) and
+/// runs the editor's layout + paint — no per-frame markdown re-parse. Mirrors
+/// `content::paint_editor` in its steady (decorations-cached) state.
+fn paint_editor(ui: &mut egui::Ui, pane: &mut NodePane, inner: egui::Rect, view: CardView) -> f32 {
     pane.view.font_size = (14.0 * view.zoom).clamp(6.0, 48.0);
     pane.view.scroll_y = view.scroll_y.clamp(0.0, max_scroll(pane, inner));
-    let mut rebuild = |state: &EditorState, view: &mut ViewState| {
-        rebuild_decorations(state, view, &theme, markdown);
-    };
+    // Reinstall the once-parsed layers, the cheap clone the app pays each frame.
+    pane.view.decorations = pane.decorations.clone();
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner));
     child.set_clip_rect(inner.intersect(ui.clip_rect()));
     EditorWidget::new(&mut pane.editor, &mut pane.view)
         .with_paint_cache(&mut pane.paint)
-        .with_decoration_rebuild(&mut rebuild)
         .show(&mut child);
     pane.view.scroll_y = pane.view.scroll_y.min(max_scroll(pane, inner));
     pane.view.scroll_y
-}
-
-/// Rebuild the live-preview markdown decoration layers (styling + callouts +
-/// footnotes), exactly the focused subset the app's canvas content engine uses.
-/// Plain-text bodies get no layers.
-fn rebuild_decorations(state: &EditorState, view: &mut ViewState, theme: &EditorTheme, markdown: bool) {
-    view.decorations.clear();
-    if !markdown {
-        return;
-    }
-    let t = Some(theme);
-    view.decorations.push(editor_md::styling::markdown_decorations(state, t));
-    view.decorations.push(editor_md::admonitions::callout_decorations(state, t, None));
-    view.decorations.push(editor_md::notes::footnote_decorations(state, t, None));
 }
 
 /// The maximum vertical scroll for an editor body (content height minus the

@@ -18,6 +18,13 @@ use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
+use hiker_charts_core::backend::{Backend as ChartBackend, Size as ChartSize};
+use hiker_charts_core::block::parse_block as parse_chart_block;
+use hiker_charts_core::data::Table as ChartTable;
+use hiker_charts_core::diag::Diagnostic as ChartDiagnostic;
+use hiker_charts_core::resolve::resolve as resolve_chart;
+use hiker_charts_core::theme::{Color as ChartColor, Theme as ChartTheme};
+use hiker_charts_plotters::PlottersSvg;
 use hiker_math::{MathOptions, MathRender, MathStyle, render_latex_with_preamble};
 use hiker_mermaid::{
     HitRegion, MermaidOptions, render as render_mermaid_svg, render_with_regions,
@@ -170,7 +177,7 @@ pub fn render_math(
         width_px: _,
         height_px: _,
         baseline_px,
-    } = render_latex_with_preamble(src, preamble, &opts)?;
+    } = render_latex_with_preamble(src, preamble, &opts).ok()?;
 
     let (rgba, width, height) = rasterize_svg(svg.as_bytes(), dpr)?;
 
@@ -285,6 +292,130 @@ pub fn render_wavedrom(
     }
     mem_cache().lock().unwrap().put_widget(Domain::WaveDrom, &out);
     Some(out)
+}
+
+/// Render a `hiker-charts` block body to RGBA pixels at `size * dpr` physical
+/// size. A chart is a block widget like display math / mermaid (no baseline, no
+/// interaction regions).
+///
+/// `inner` is the fence body: a YAML [`ChartSpec`](hiker_charts_core::dsl::ChartSpec)
+/// config, optionally followed by a `---` line and inline CSV. `data_csv` is the
+/// host-resolved external CSV for a block that references `data:` instead of
+/// carrying its data inline (`None` for a self-contained block — the inline CSV
+/// is used). `theme`/`size` are the chart theme + canvas size.
+///
+/// Returns `Err(message)` on a malformed config, unresolved/invalid data, a
+/// resolve diagnostic, or a render/raster failure — the caller falls back to the
+/// tinted source so the user can fix the block (`widget-render-error-fallback`).
+///
+/// The mem + disk render cache (`Domain::Chart`) is keyed on the FULL content
+/// hash — config body **plus the resolved data** plus theme/size/dpr — because
+/// plotters' SVG isn't byte-stable, so a hit must restore the exact inputs'
+/// pixels rather than trust the output. Distinct from [`chart_widget_id`], the
+/// data-free id the editor's texture cache + click-to-edit map key on.
+/// status: widget-chart-render
+pub fn render_chart(
+    inner: &str,
+    data_csv: Option<&str>,
+    theme: &ChartTheme,
+    size: ChartSize,
+    dpr: f32,
+    cache: Option<&DiagramCacheCtx>,
+) -> Result<RenderedWidget, String> {
+    let content_hash = hash_chart(inner, data_csv, theme, size, dpr);
+    if let Some(hit) = mem_cache().lock().unwrap().get_widget(Domain::Chart, content_hash) {
+        return Ok(hit);
+    }
+    if let Some(hit) = cache.and_then(|c| c.load(Domain::Chart, content_hash)) {
+        mem_cache().lock().unwrap().put_widget(Domain::Chart, &hit);
+        return Ok(hit);
+    }
+
+    let parsed = parse_chart_block(inner).map_err(chart_diags_to_string)?;
+    let table = match parsed.table {
+        Some(t) => t,
+        None => {
+            let csv = data_csv.ok_or_else(|| {
+                parsed.spec.data.as_deref().map_or_else(
+                    || "chart block has no data (add a `---` line + CSV, or a `data:` reference)".to_string(),
+                    |d| format!("chart data not found: {d}"),
+                )
+            })?;
+            ChartTable::from_csv(csv.as_bytes()).map_err(|e| format!("data csv: {e}"))?
+        }
+    };
+    let chart = resolve_chart(&parsed.spec, &table).map_err(chart_diags_to_string)?;
+    let output =
+        PlottersSvg.render(&chart, theme, size).map_err(|e| format!("chart render: {e:?}"))?;
+    let (rgba, width, height) =
+        rasterize_svg(output.svg.as_bytes(), dpr).ok_or("chart rasterize failed")?;
+    let rendered = RenderedWidget { rgba, width, height, baseline: None, content_hash };
+    if let Some(c) = cache {
+        c.store(Domain::Chart, &rendered);
+    }
+    mem_cache().lock().unwrap().put_widget(Domain::Chart, &rendered);
+    Ok(rendered)
+}
+
+/// The data-free id the editor's texture cache and the click-to-edit map key on:
+/// a hash of (config body + theme + size + dpr), **excluding** the resolved
+/// external data. Computable raster-free (no file read), so the per-frame
+/// edit-target map can derive it without resolving `data:` references. Two
+/// distinct chart blocks always differ in `inner` (an inline block carries its
+/// data verbatim; an external block carries its `data:` path), so this is unique
+/// per block; and it changes whenever a decoration-layer-tracked input (the doc
+/// text, theme, dpr) changes — exactly when the pixels can change — so the
+/// texture cache stays correct. status: widget-chart-render
+#[must_use]
+pub fn chart_widget_id(inner: &str, theme: &ChartTheme, size: ChartSize, dpr: f32) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    "chart-id".hash(&mut h);
+    inner.hash(&mut h);
+    hash_chart_theme(theme, &mut h);
+    size.hash(&mut h);
+    dpr.to_bits().hash(&mut h);
+    h.finish()
+}
+
+/// Join chart [`ChartDiagnostic`]s into one `; `-separated message.
+fn chart_diags_to_string(diags: Vec<ChartDiagnostic>) -> String {
+    diags.into_iter().map(|d| d.message).collect::<Vec<_>>().join("; ")
+}
+
+/// Feed a chart theme's colors into a hasher (the `Color` type carries no
+/// `Hash`), folding background/foreground/gridline and every series color.
+fn hash_chart_theme(t: &ChartTheme, h: &mut std::collections::hash_map::DefaultHasher) {
+    let mut color = |c: ChartColor| {
+        c.r.hash(h);
+        c.g.hash(h);
+        c.b.hash(h);
+        c.a.hash(h);
+    };
+    color(t.background);
+    color(t.foreground);
+    color(t.gridline);
+    for &c in &t.series {
+        color(c);
+    }
+}
+
+/// The full render-cache hash for a chart: config body, resolved data, theme,
+/// size, and dpr — every input that affects the pixels.
+fn hash_chart(
+    inner: &str,
+    data_csv: Option<&str>,
+    theme: &ChartTheme,
+    size: ChartSize,
+    dpr: f32,
+) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    "chart".hash(&mut h);
+    inner.hash(&mut h);
+    data_csv.hash(&mut h);
+    hash_chart_theme(theme, &mut h);
+    size.hash(&mut h);
+    dpr.to_bits().hash(&mut h);
+    h.finish()
 }
 
 /// A clickable / hoverable sub-region of a rendered mermaid diagram, in

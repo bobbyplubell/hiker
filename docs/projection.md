@@ -29,6 +29,7 @@ A `Projection` impl that applies a radial focus+context distortion around a focu
 
 - **Distortion.** A radially-symmetric remap of distance-from-focus — a Poincaré-style `r' = tanh(k·r)` or a graphical (Sarkar–Brown) fisheye — applied after the affine map, around a focus that defaults to the viewport center and follows the cursor / selection. [proj-fisheye]
 - **Objects scale, never shear.** Nodes scale by `proj-magnification`; canvas cards stay flat axis-aligned rects placed at their projected center with a per-card uniform scale (egui can't bend a glyph — the same compromise the reference app makes; it reads fine because the map is locally conformal). [proj-card-scale]
+- **Cards fill the space.** Under a lens a card sizes to the on-screen distance to its nearest neighbour (`gap · fill`, `fill ≈ 0.9`, clamped) rather than to the affine card size — so sparse regions of the disk fill out (no tiny floaters) while dense regions stay compact. A `Fill` slider tunes how aggressively. [proj-card-fill]
 - **Periphery degrades for free.** Far objects shrink below the existing LOD threshold and become the dot placeholders (`proj-lod-ladder`); edges already sample and curve, so they distort with no extra work.
 
 
@@ -72,6 +73,7 @@ Every projection feature is opt-in and trivially reversible from the surface's e
 | **Focus source** | cursor-follow / locked-center / follow-selection — what point the lens centers on | [proj-cfg-focus-mode] |
 | **Size falloff** | how strongly node/card size tracks magnification toward the rim (0 = uniform size, 1 = full `(1−|z|²)` conformal) | [proj-cfg-size-falloff] |
 | **Card scale clamp** | min/max per-card scale so rim cards stay clickable and center cards don't explode (canvas; `proj-card-scale`) | [proj-cfg-card-scale-clamp] |
+| **Card fill** | how aggressively a card grows to fill the screen gap to its nearest neighbour under the lens (canvas; `proj-card-fill`) | [proj-card-fill] |
 | **Geodesic edges** | on/off + segment count — straight chords vs smoothly-sampled arcs (`proj-geodesic-edges`) | [proj-cfg-geodesic] |
 | **Boundary fade** | boundary-circle on/off + fade start radius + fade strength (`proj-boundary`) | [proj-cfg-boundary-fade] |
 | **LOD thresholds** | the magnification cutoffs for full → dot → edge-marker (`proj-lod-ladder`) | [proj-cfg-lod-thresholds] |

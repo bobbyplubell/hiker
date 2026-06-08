@@ -3,8 +3,6 @@
 //! shells land here as features get ported.
 
 pub mod autocomplete_picker;
-pub mod force_graph;
-pub mod graph_view;
 pub mod modal;
 pub mod preview;
 pub mod profiler_overlay;

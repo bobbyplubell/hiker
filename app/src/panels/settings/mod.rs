@@ -420,6 +420,7 @@ fn mcp_section(&mut self) {
                 bool_row(ui, app, st, "search_notes", "mcp.tools.search_notes_enabled", t.search_notes_enabled);
                 bool_row(ui, app, st, "get_note", "mcp.tools.get_note_enabled", t.get_note_enabled);
                 bool_row(ui, app, st, "related_notes", "mcp.tools.related_notes_enabled", t.related_notes_enabled);
+                bool_row(ui, app, st, "check_diagram", "mcp.tools.check_diagram_enabled", t.check_diagram_enabled);
                 bool_row(ui, app, st, "write_note", "mcp.tools.write_note_enabled", t.write_note_enabled);
                 bool_row(ui, app, st, "edit_note", "mcp.tools.edit_note_enabled", t.edit_note_enabled);
                 bool_row(ui, app, st, "set_frontmatter", "mcp.tools.set_frontmatter_enabled", t.set_frontmatter_enabled);

@@ -208,6 +208,42 @@ pub enum TabKind {
     /// in-archive link navigates within this same tab. Per-archive, keyed
     /// by path (like Board). status: zim-view
     ZimView { zim_path: String, article: Option<String> },
+    /// Chart builder: the `hiker-charts` builder + live preview. Two sources
+    /// (see [`ChartSource`]): a `.csv` opened directly (Export copies a ```chart
+    /// block) or an inline ```chart block opened from a note for edit (Save
+    /// splices the regenerated block back). See `panels::charts_tab`.
+    /// status: chart-csv-tab, chart-open-in-builder
+    ChartBuilder { source: ChartSource },
+}
+
+/// What a [`TabKind::ChartBuilder`] tab is editing. status: chart-csv-tab
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChartSource {
+    /// A `.csv` opened directly from the vault. Export → clipboard.
+    Csv { path: String },
+    /// An inline ```` ```chart ```` block opened from a note for editing. `key`
+    /// (the block's open-time byte offset, as a string) disambiguates multiple
+    /// charts in one note so each gets its own builder pane. Save splices the
+    /// regenerated block back into the note. status: chart-open-in-builder
+    NoteBlock { note: String, key: String },
+}
+
+impl ChartSource {
+    /// Stable per-source key for the builder-pane map + tab identity.
+    pub fn pane_key(&self) -> String {
+        match self {
+            ChartSource::Csv { path } => format!("csv:{path}"),
+            ChartSource::NoteBlock { note, key } => format!("note:{note}#{key}"),
+        }
+    }
+
+    /// The vault path the source is about (the CSV, or the host note).
+    pub fn host_path(&self) -> &str {
+        match self {
+            ChartSource::Csv { path } => path,
+            ChartSource::NoteBlock { note, .. } => note,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -328,6 +364,7 @@ impl TabKind {
             TabKind::ZimView { zim_path, .. } => {
                 format!("ZIM · {}", path_basename(zim_path))
             }
+            TabKind::ChartBuilder { source } => format!("Chart · {}", path_basename(source.host_path())),
         }
     }
 
@@ -367,6 +404,9 @@ impl TabKind {
             // Offline encyclopedia archive — the compass "go read out
             // there, but cached" reads closest in the icon set.
             TabKind::ZimView { .. } => icons::ICONS.image(crate::icons::Icon::Compass),
+            // A chart of plotted data reads closest to the spatial-graph glyph
+            // in the icon set (same choice as Canvas).
+            TabKind::ChartBuilder { .. } => icons::ICONS.image(crate::icons::Icon::Graph),
         }
     }
 }
@@ -427,6 +467,13 @@ impl Tab {
             TabKind::ZimView { zim_path, article: None } => {
                 (format!("zim:{zim_path}"), "zim".into())
             }
+            // A CSV chart-builder tab is per-CSV: persist the path so it reopens
+            // in the builder on restore (the "chart:" prefix disambiguates from a
+            // plain buffer tab). A note-block builder is ephemeral (its source is
+            // a transient byte offset) — it isn't persisted. status: chart-csv-tab
+            TabKind::ChartBuilder { source: ChartSource::Csv { path } } => {
+                (format!("chart:{path}"), "chart".into())
+            }
             TabKind::PatchReview => (":patch_review".into(), "patch_review".into()),
             TabKind::IndexerDetail => (":indexer".into(), "indexer".into()),
             TabKind::Sync => (":sync".into(), "sync".into()),
@@ -447,6 +494,9 @@ impl Tab {
             // A canvas tab is about its `.canvas` vault path, so tab-switch nav
             // and dirty-marker lookups resolve it. status: canvas-nav-stack
             TabKind::Canvas { path } => Some(path.as_str()),
+            // A chart-builder tab is about its host vault path (the CSV, or the
+            // note an inline block lives in). status: chart-csv-tab
+            TabKind::ChartBuilder { source } => Some(source.host_path()),
             _ => None,
         }
     }

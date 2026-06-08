@@ -12,6 +12,7 @@
 //! (queue lease/result/failure/heartbeat/list).
 
 mod boards;
+mod diagram;
 mod notes;
 mod tasks;
 mod ui_context;
@@ -24,9 +25,9 @@ use super::App;
 use crate::handler::params::{
     audit_err, audit_status, hiker_err, ApplyTag, BoardAddCard, BoardAddColumn, BoardAddTextCard,
     BoardCreate, BoardDeleteColumn, BoardGet, BoardMoveCard, BoardRemoveCard, BoardRenameColumn,
-    BoardReorderColumn, BoardSetCardText, BoardsList, EditNote, GetActiveNote, GetNote,
-    GetOpenNotes, GetSelection, RelatedNotes, SearchNotes, SetFrontmatter, TaskCheckout, TaskFail,
-    TaskHeartbeat, TaskList, TaskSubmit, WriteNote,
+    BoardReorderColumn, BoardSetCardText, BoardsList, CheckDiagram, EditNote, GetActiveNote,
+    GetNote, GetOpenNotes, GetSelection, RelatedNotes, SearchNotes, SetFrontmatter, TaskCheckout,
+    TaskFail, TaskHeartbeat, TaskList, TaskSubmit, WriteNote,
 };
 
 impl App {
@@ -134,6 +135,18 @@ impl App {
                 let r = self.find_related(&p).await;
                 self.state.audit.record(
                     "related_notes",
+                    &raw_value,
+                    audit_status(&r),
+                    audit_err(&r),
+                );
+                r
+            }
+            "check_diagram" => {
+                let p: CheckDiagram = serde_json::from_value(raw_value.clone())
+                    .map_err(|e| format!("invalid check_diagram args: {e}"))?;
+                let r = self.run_check_diagram(&p);
+                self.state.audit.record(
+                    "check_diagram",
                     &raw_value,
                     audit_status(&r),
                     audit_err(&r),

@@ -15,6 +15,7 @@ pub mod canvas;
 pub mod chunker;
 pub mod cluster;
 pub mod config;
+pub mod diagrams;
 pub mod embed;
 pub mod errors;
 pub mod extract;

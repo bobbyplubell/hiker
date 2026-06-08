@@ -11,8 +11,11 @@ use egui::{Color32, CornerRadius, FontId, Pos2, Rect, Stroke, StrokeKind, Vec2, 
 use hiker_canvas::color::Color;
 use hiker_canvas::geometry::{node_bounds, Point};
 use hiker_canvas::model::{Canvas, Edge, Node, NodeKind, Side};
+use hiker_projection::{
+    clamp_inside_disk, geodesic_circle, Complex, ProjectionKind, DEFAULT_BOUNDARY_RADIUS,
+};
 
-use canvas_view_core::camera::Camera;
+use canvas_view_core::camera::{Camera, CardScaleClamp};
 use canvas_view_core::edges::{anchor_pos, arrowhead, build_geometry, resolve_sides, EdgeGeometry};
 use canvas_view_core::handles::{grown_about_center, handle_rects, Handle, ALL_HANDLES, HANDLE_SIZE, HOVER_GROW};
 use canvas_view_core::interaction::{connector_handle_center, GROUP_HEADER_H};
@@ -31,9 +34,49 @@ const CARD_PAD: f32 = 8.0;
 /// stays above the threshold and keeps full content.
 const LOD_MIN_PX: f32 = 150.0;
 
+/// Below this lens magnification, a card under an active projection collapses to
+/// the LOD placeholder regardless of its on-screen size — the magnification half
+/// of the LOD ladder (`proj-lod-ladder`). Peripheral cards (low magnification)
+/// become dots; central cards (magnification near 1) keep full content. Only
+/// consulted when the lens is active, so the affine canvas is unaffected.
+const LOD_MAG_THRESHOLD: f32 = 0.4;
+
+/// The deepest LOD tier (`proj-lod-ladder`): below this on-screen size a card is
+/// too small to read even a title, so it collapses to a BARE DOT — no frame, no
+/// text — and a few hundred such cards read as a clean colored constellation
+/// instead of a hairball of overlapping frames + titles ("text soup at scale").
+/// Smaller than [`LOD_MIN_PX`] (the title-placeholder tier) so a mid-zoom card
+/// still gets its title before disappearing to a point. The height bound is
+/// looser (cards are wider than tall), mirroring [`is_tiny`].
+const BARE_DOT_PX: f32 = 36.0;
+
+/// Below this lens magnification a card under an active projection collapses all
+/// the way to a bare dot regardless of its on-screen size — the dot half of the
+/// magnification ladder, deeper than [`LOD_MAG_THRESHOLD`]. Only consulted when
+/// the lens is active, so the affine canvas is unaffected.
+const BARE_DOT_MAG: f32 = 0.2;
+
+/// Whether `screen` is too small to read even a title — the bare-dot tier. A card
+/// narrower than [`BARE_DOT_PX`] *or* shorter than `BARE_DOT_PX * 0.64` collapses
+/// to a single colored dot. Pure (no painter), so it is unit-testable.
+fn is_bare_dot(screen: Rect) -> bool {
+    screen.width() < BARE_DOT_PX || screen.height() < BARE_DOT_PX * 0.64
+}
+
 /// Whether a screen rect intersects the viewport (viewport culling).
 fn visible(viewport: Rect, r: Rect) -> bool {
     viewport.intersects(r)
+}
+
+/// Multiply a colour's alpha by `factor` (clamped to `[0, 1]`). A `factor` of
+/// `1.0` returns the colour untouched, so the Off/Fisheye path (where the rim
+/// fade is always `1.0`) is byte-identical. Drives the Poincaré rim fade.
+fn fade(color: Color32, factor: f32) -> Color32 {
+    if factor >= 1.0 {
+        return color;
+    }
+    let a = (f32::from(color.a()) * factor.clamp(0.0, 1.0)).round() as u8;
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), a)
 }
 
 /// Whether `screen` is too small to render readable content: a card narrower
@@ -214,10 +257,35 @@ pub fn node_card(
     content: &mut dyn NodeContentRenderer,
     view: CardView,
 ) -> f32 {
+    node_card_filled(ui, viewport, camera, node, content, view, None)
+}
+
+/// As [`node_card`], but with an optional neighbor-gap fill scale (from
+/// [`fill_scales`]) replacing the card's lens magnification sizing — the
+/// "auto-expand to fill the space" path the scene pre-pass drives under a lens.
+/// `None` keeps the historical magnification sizing. [proj-card-fill]
+pub fn node_card_filled(
+    ui: &mut egui::Ui,
+    viewport: Rect,
+    camera: &Camera,
+    node: &Node,
+    content: &mut dyn NodeContentRenderer,
+    view: CardView,
+    fill_scale: Option<f32>,
+) -> f32 {
     if matches!(node.kind, NodeKind::Group { .. }) {
         return view.scroll_y;
     }
-    let screen = camera.world_rect_to_screen(viewport, node_bounds(node));
+    // Card-scale compromise (`proj-card-scale`): under a projection lens a card
+    // MUST stay an axis-aligned rect (egui can't shear a glyph), so we don't map
+    // both corners (that would distort). Instead map the card's world CENTER
+    // through the lens-composed `world_to_screen`, then build the screen rect from
+    // the card's base (affine-only) screen size times a clamped magnification
+    // factor, centered on the projected center. Under Off the lens is the
+    // identity, `card_scale == 1.0`, and center-mapping == corner-mapping, so this
+    // is byte-identical to the historical affine path.
+    let bounds = node_bounds(node);
+    let screen = projected_card_rect(camera, viewport, bounds, fill_scale);
     if !visible(viewport, screen) {
         return view.scroll_y;
     }
@@ -225,12 +293,30 @@ pub fn node_card(
     let resolved = resolve_node(node.color.as_ref(), &visuals);
     let radius = card_radius(camera);
     let painter = ui.painter().with_clip_rect(viewport);
-    painter.rect_filled(screen, radius, resolved.fill);
-    painter.rect_stroke(screen, radius, Stroke::new(1.5, resolved.stroke), StrokeKind::Inside);
-    // status: canvas-lod-placeholder
-    // When the card is too small to read, skip the (expensive) content engine
-    // and paint a title-block placeholder, echoing the incoming scroll.
-    if is_tiny(screen) {
+    // Poincaré rim fade: peripheral cards recede toward the disk boundary, so
+    // their fill + border fade by the local magnification. `1.0` (no fade) under
+    // Off/Fisheye, keeping those modes byte-identical. [proj-canvas-mode]
+    let alpha = camera.rim_alpha_at(bounds.center());
+    let mag = camera.magnification_at(bounds.center());
+    // status: canvas-lod-placeholder, proj-lod-ladder
+    // LOD ladder, decided BEFORE any frame is drawn so the deepest tier paints
+    // nothing but a point:
+    //   1. Bare dot — too small to read even a title (or, under a lens, below
+    //      BARE_DOT_MAG magnification): paint ONLY a small filled circle in the
+    //      vivid stroke colour, NO frame / title / content. At hundreds of cards
+    //      this is what turns the soup into a clean colored constellation.
+    //   2. Title placeholder — readable enough for a title but not its body
+    //      (is_tiny, or below LOD_MAG_THRESHOLD under a lens): frame + cheap
+    //      title-block skeleton.
+    //   3. Full card — frame + the real content engine.
+    if is_bare_dot(screen) || (camera.lens_active() && mag < BARE_DOT_MAG) {
+        let r = (screen.size().min_elem() * 0.5).clamp(1.5, 4.0);
+        painter.circle_filled(screen.center(), r, fade(resolved.stroke, alpha));
+        return view.scroll_y;
+    }
+    painter.rect_filled(screen, radius, fade(resolved.fill, alpha));
+    painter.rect_stroke(screen, radius, Stroke::new(1.5, fade(resolved.stroke, alpha)), StrokeKind::Inside);
+    if is_tiny(screen) || (camera.lens_active() && mag < LOD_MAG_THRESHOLD) {
         let pad = (CARD_PAD * camera.scale()).max(2.0);
         paint_lod_placeholder(&painter, screen.shrink(pad), lod_title(node), &visuals);
         return view.scroll_y;
@@ -316,6 +402,21 @@ pub fn selection_outline(painter: &egui::Painter, screen: Rect, camera: &Camera,
     painter.rect_stroke(screen.expand(2.0), radius, Stroke::new(2.0, accent), StrokeKind::Outside);
 }
 
+/// Stroke the Poincaré unit-disk boundary ring at the pane-LOCKED disk frame —
+/// centre = viewport centre, radius = `poincare_disk_frame`'s radius — in a muted
+/// divider colour. The frame is independent of `pan`/`scale`, so the ring stays
+/// fixed to the pane (it IS the viewport edge of the disk) instead of drifting
+/// with the affine view. A no-op unless the lens is the Poincaré kind AND the
+/// boundary toggle is on — so Off/Fisheye never draw it. [proj-canvas-mode]
+pub fn poincare_boundary(painter: &egui::Painter, viewport: Rect, camera: &Camera, visuals: &Visuals) {
+    if camera.projection().kind != ProjectionKind::Poincare || !camera.show_boundary() {
+        return;
+    }
+    let (center, radius) = camera.poincare_disk_frame(viewport);
+    let color = visuals.weak_text_color();
+    painter.circle_stroke(center, radius, Stroke::new(1.0, color));
+}
+
 /// Paint all visible edges. Dangling edges (an endpoint that resolves to no live
 /// node) are skipped here; the host surfaces them as broken references.
 pub fn edges(
@@ -343,33 +444,184 @@ fn one_edge(
     let Some(from) = canvas.nodes.iter().find(|n| n.id == edge.from_node) else { return };
     let Some(to) = canvas.nodes.iter().find(|n| n.id == edge.to_node) else { return };
     let (from_side, to_side) = resolve_sides(edge, from, to);
-    let start = world_anchor(camera, viewport, anchor_pos(from, from_side));
-    let end = world_anchor(camera, viewport, anchor_pos(to, to_side));
+    let from_anchor = anchor_pos(from, from_side);
+    let to_anchor = anchor_pos(to, to_side);
+    let start = world_anchor(camera, viewport, from_anchor);
+    let end = world_anchor(camera, viewport, to_anchor);
     let bbox = Rect::from_two_pos(start, end).expand(40.0);
     if !visible(viewport, bbox) {
         return;
     }
-    let handle = (start - end).length().clamp(40.0, 320.0) * 0.4;
-    let geo = build_geometry(start, end, from_side, to_side, handle);
-    let color = if selected {
+    let base_color = if selected {
         visuals.selection.stroke.color
     } else {
         resolve_edge(edge.color.as_ref(), visuals)
     };
     let width = if selected { 2.5 } else { 1.5 };
-    let curve = CubicBezierShape::from_points_stroke(
-        [geo.start, geo.ctrl_a, geo.ctrl_b, geo.end],
-        false,
-        Color32::TRANSPARENT,
-        Stroke::new(width, color),
-    );
-    painter.add(curve);
-    edge_caps(painter, edge, &geo, color, camera.scale());
+
+    // Off / Affine: unchanged cubic-Bézier connector (no projection sampling, no
+    // rim fade) — byte-identical to the historical path. [proj-canvas-mode]
+    if !camera.lens_active() {
+        let handle = (start - end).length().clamp(40.0, 320.0) * 0.4;
+        let geo = build_geometry(start, end, from_side, to_side, handle);
+        let curve = CubicBezierShape::from_points_stroke(
+            [geo.start, geo.ctrl_a, geo.ctrl_b, geo.end],
+            false,
+            Color32::TRANSPARENT,
+            Stroke::new(width, base_color),
+        );
+        painter.add(curve);
+        edge_caps(painter, edge, &geo, base_color, camera.scale());
+        if let Some(label) = &edge.label {
+            let mid = bezier_midpoint(geo.start, geo.ctrl_a, geo.ctrl_b, geo.end);
+            let size = (11.0 * camera.scale()).clamp(8.0, 16.0);
+            painter.text(mid, egui::Align2::CENTER_CENTER, label, FontId::proportional(size), base_color);
+        }
+        return;
+    }
+
+    // Lensed: build a screen polyline that follows the projection.
+    // - Poincaré: the geodesic between the two disk points, mapped back to
+    //   lensed-world then through the AFFINE-only screen map (no second lens
+    //   pass) so the curvature is exact — mirroring graph-view's `draw_edges`.
+    // - Fisheye (and any non-Affine fallback): the straight world chord
+    //   subdivided, each sample pushed through the full lens-composed map so the
+    //   edge follows the bulge.
+    let alpha = camera
+        .rim_alpha_at(anchor_world(from_anchor))
+        .min(camera.rim_alpha_at(anchor_world(to_anchor)));
+    let color = fade(base_color, alpha);
+    let pts = projected_edge_points(camera, viewport, from_anchor, to_anchor);
+    painter.add(egui::Shape::line(pts.clone(), Stroke::new(width, color)));
+    // Arrowheads at the projected ends, oriented along the first/last segment.
+    projected_edge_caps(painter, edge, &pts, color, camera.scale());
     if let Some(label) = &edge.label {
-        let mid = bezier_midpoint(geo.start, geo.ctrl_a, geo.ctrl_b, geo.end);
+        let mid = polyline_midpoint(&pts);
         let size = (11.0 * camera.scale()).clamp(8.0, 16.0);
         painter.text(mid, egui::Align2::CENTER_CENTER, label, FontId::proportional(size), color);
     }
+}
+
+/// Sample the projected edge between two world anchors into a screen polyline.
+/// Poincaré samples the geodesic in disk space and maps each point back through
+/// the affine-only screen map (avoiding double-lensing); every other active lens
+/// (Fisheye) subdivides the world chord and pushes each sample through the full
+/// lens-composed `world_to_screen`. Always returns at least the two endpoints.
+fn projected_edge_points(camera: &Camera, viewport: Rect, from: Pos2, to: Pos2) -> Vec<Pos2> {
+    let cfg = camera.projection();
+    let segments = cfg.geodesic_segments.max(1);
+    let a = anchor_world(from);
+    let b = anchor_world(to);
+    match cfg.kind {
+        ProjectionKind::Poincare => {
+            // The disk is LOCKED to the viewport: sample the geodesic in unit-disk
+            // space, then map each sample straight onto the pane-fixed disk frame
+            // (centre + z·radius) — NOT through the affine view, which the disk no
+            // longer rides. Mirrors the graph view's `disk_to_screen`. The disk
+            // points are clamped strictly inside the boundary so near/over-rim
+            // anchors don't yield a degenerate arc, and the segment count adapts
+            // to the arc's angular span so sharply-curved (high-strength) edges
+            // get enough samples to read smooth instead of faceted. [proj-card-fill]
+            let lens = camera.lens();
+            let za = clamp_inside_disk(lens.disk_point(a), DEFAULT_BOUNDARY_RADIUS);
+            let zb = clamp_inside_disk(lens.disk_point(b), DEFAULT_BOUNDARY_RADIUS);
+            let effective = adaptive_segments(za, zb, segments);
+            let (center, radius) = camera.poincare_disk_frame(viewport);
+            hiker_projection::sample_geodesic(za, zb, effective)
+                .into_iter()
+                .map(|z| center + Vec2::new(z.re, z.im) * radius)
+                .collect()
+        }
+        // Fisheye / any non-Affine fallback: subdivide the world chord and lens
+        // each sample so the edge tracks the bulge.
+        _ => (0..=segments)
+            .map(|i| {
+                let t = f64::from(i) / f64::from(segments);
+                let p = Point::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
+                camera.world_to_screen(viewport, p)
+            })
+            .collect(),
+    }
+}
+
+/// Reference angular span (radians) that earns the base segment count. A
+/// geodesic arc spanning this much angle is sampled at `base`; sharper arcs scale
+/// up linearly toward [`MAX_GEODESIC_SEGMENTS`]. [proj-card-fill]
+const REF_GEODESIC_ANGLE: f32 = 0.5;
+/// Upper bound on the adaptive geodesic segment count, so a near-rim arc can't
+/// explode the polyline. [proj-card-fill]
+const MAX_GEODESIC_SEGMENTS: u32 = 64;
+
+/// Segment count for a Poincaré geodesic between two (in-disk) points, adapted to
+/// the arc's angular span: a straight diameter (no geodesic circle) keeps the
+/// `base`; a curved arc gets `base · span / REF_ANGLE`, ceilinged and clamped to
+/// `[base, MAX]`. Sharper arcs (the high-strength, near-rim case) get more
+/// samples so they read smooth instead of faceted. Pure — unit-tested without
+/// egui. [proj-card-fill]
+fn adaptive_segments(za: Complex, zb: Complex, base: u32) -> u32 {
+    let base = base.max(1);
+    let Some(circle) = geodesic_circle(za, zb) else {
+        return base;
+    };
+    let span = (za - circle.center).arg() - (zb - circle.center).arg();
+    let span = wrap_angle(span).abs();
+    let scaled = (base as f32 * span / REF_GEODESIC_ANGLE).ceil();
+    (scaled as u32).clamp(base, MAX_GEODESIC_SEGMENTS)
+}
+
+/// Wrap an angle into `(-π, π]` so the span of the minor arc is measured (the
+/// same arc `sample_geodesic` walks).
+fn wrap_angle(angle: f32) -> f32 {
+    use std::f32::consts::PI;
+    let mut value = angle;
+    while value <= -PI {
+        value += 2.0 * PI;
+    }
+    while value > PI {
+        value -= 2.0 * PI;
+    }
+    value
+}
+
+/// Arrowheads for a projected (polyline) edge: drawn at whichever ends carry an
+/// `arrow` cap, oriented along the polyline's final / first segment. Mirrors
+/// [`edge_caps`] but reads the direction from the polyline instead of the Bézier
+/// control points.
+fn projected_edge_caps(painter: &egui::Painter, edge: &Edge, pts: &[Pos2], color: Color32, scale: f32) {
+    use hiker_canvas::model::EndCap;
+    let (Some(&first), Some(&last)) = (pts.first(), pts.last()) else { return };
+    let (len, half_w) = arrowhead_size(scale);
+    if matches!(edge.to_end, None | Some(EndCap::Arrow)) {
+        let prev = pts.iter().rev().nth(1).copied().unwrap_or(first);
+        let tri = arrowhead(last, last - prev, len, half_w);
+        painter.add(egui::Shape::convex_polygon(tri.to_vec(), color, Stroke::NONE));
+    }
+    if matches!(edge.from_end, Some(EndCap::Arrow)) {
+        let next = pts.get(1).copied().unwrap_or(last);
+        let tri = arrowhead(first, first - next, len, half_w);
+        painter.add(egui::Shape::convex_polygon(tri.to_vec(), color, Stroke::NONE));
+    }
+}
+
+/// The midpoint of a screen polyline — the sample nearest the half-arc-length
+/// point, for label placement. Falls back to the geometric mean of the endpoints
+/// for a degenerate (zero/one-point) polyline.
+fn polyline_midpoint(pts: &[Pos2]) -> Pos2 {
+    if pts.len() < 2 {
+        return pts.first().copied().unwrap_or(Pos2::ZERO);
+    }
+    let total: f32 = pts.windows(2).map(|w| (w[1] - w[0]).length()).sum();
+    let half = total * 0.5;
+    let mut acc = 0.0;
+    for w in pts.windows(2) {
+        let seg = (w[1] - w[0]).length();
+        if acc + seg >= half {
+            let t = if seg > f32::EPSILON { (half - acc) / seg } else { 0.0 };
+            return w[0].lerp(w[1], t);
+        }
+        acc += seg;
+    }
+    pts[pts.len() / 2]
 }
 
 /// Paint arrowheads at whichever ends carry an `arrow` cap (`to_end` defaults to
@@ -414,11 +666,112 @@ fn bezier_midpoint(p0: Pos2, p1: Pos2, p2: Pos2, p3: Pos2) -> Pos2 {
 }
 
 fn world_anchor(camera: &Camera, viewport: Rect, p: Pos2) -> Pos2 {
-    camera.world_to_screen(viewport, Point::new(f64::from(p.x), f64::from(p.y)))
+    camera.world_to_screen(viewport, anchor_world(p))
+}
+
+/// The world-space [`Point`] for a world anchor expressed as a [`Pos2`].
+fn anchor_world(p: Pos2) -> Point {
+    Point::new(f64::from(p.x), f64::from(p.y))
 }
 
 fn card_radius(camera: &Camera) -> CornerRadius {
     CornerRadius::same((CARD_RADIUS * camera.scale()).clamp(0.0, 18.0) as u8)
+}
+
+/// The on-screen rect for a card under the card-scale compromise (`proj-card-scale`):
+/// the card's world CENTER mapped through the lens-composed `world_to_screen`,
+/// with the rect built from the card's base (affine-only, `scale` × world size)
+/// dimensions multiplied by a per-card scale — axis-aligned, centered on the
+/// projected screen center. `fill_scale` is the optional neighbor-gap "fill the
+/// space" factor from [`fill_scales`]: `Some` replaces the magnification-derived
+/// `card_scale_at` so cards size to the gap to their nearest neighbour; `None`
+/// keeps the historical magnification sizing. Under the Off lens `card_scale ==
+/// 1.0` and center-mapping equals corner-mapping, so this returns the exact rect
+/// `world_rect_to_screen` would (verified by `affine_card_rect_matches_corner_map`).
+fn projected_card_rect(
+    camera: &Camera,
+    viewport: Rect,
+    bounds: hiker_canvas::geometry::Rect,
+    fill_scale: Option<f32>,
+) -> Rect {
+    let center = camera.world_to_screen(viewport, bounds.center());
+    let card_scale = fill_scale.unwrap_or_else(|| camera.card_scale_at(bounds.center()));
+    let half = Vec2::new(
+        bounds.width as f32 * camera.scale() * 0.5 * card_scale,
+        bounds.height as f32 * camera.scale() * 0.5 * card_scale,
+    );
+    Rect::from_center_size(center, half * 2.0)
+}
+
+/// Neighbor-gap "fill the space" per-card scales under an active lens: each card
+/// grows to roughly the screen distance to its nearest neighbour so sparse
+/// regions fill out and dense regions stay compact (natural focus+context).
+///
+/// `screen_centers` are the projected on-screen centres and `base_sizes` the
+/// affine-world on-screen sizes (width/height) of the same cards (parallel
+/// slices). For card `i` the target on-screen size is `gap_i · fill`, where
+/// `gap_i` is the min distance to any other centre (a lone card uses a sensible
+/// default gap). The returned scale is `target / max(base_w, base_h)` — sizing by
+/// the *larger* base dimension so cards grow to fill the gap without overlapping
+/// — clamped to `clamp`'s `[min, max]`. Pure (no egui painter) so it is
+/// unit-testable. [proj-card-fill]
+/// Per-node neighbor-gap fill scales for a whole canvas, aligned 1:1 with
+/// `canvas.nodes`. Under an active lens every non-group node gets `Some(scale)`
+/// from [`fill_scales`] (computed over the projected screen centres of all
+/// non-group nodes), and groups get `None`. With the lens Off the whole vector is
+/// `None`, so card sizing falls back to the historical affine path — the
+/// byte-identical guarantee is preserved. The scene pre-pass calls this once per
+/// frame and threads each entry into [`node_card_filled`]. [proj-card-fill]
+#[must_use]
+pub fn lens_fill_scales(camera: &Camera, viewport: Rect, canvas: &Canvas) -> Vec<Option<f32>> {
+    if !camera.lens_active() {
+        return vec![None; canvas.nodes.len()];
+    }
+    // Collect the projected centres and affine-world screen sizes of every
+    // non-group card, remembering each card's index in `canvas.nodes` so the
+    // computed scales can be scattered back into a node-aligned vector.
+    let mut idx = Vec::new();
+    let mut centers = Vec::new();
+    let mut sizes = Vec::new();
+    for (i, node) in canvas.nodes.iter().enumerate() {
+        if matches!(node.kind, NodeKind::Group { .. }) {
+            continue;
+        }
+        let bounds = node_bounds(node);
+        idx.push(i);
+        centers.push(camera.world_to_screen(viewport, bounds.center()));
+        sizes.push(Vec2::new(bounds.width as f32 * camera.scale(), bounds.height as f32 * camera.scale()));
+    }
+    let scales = fill_scales(&centers, &sizes, camera.card_scale_clamp().fill, camera.card_scale_clamp());
+    let mut out = vec![None; canvas.nodes.len()];
+    for (slot, scale) in idx.into_iter().zip(scales) {
+        out[slot] = Some(scale);
+    }
+    out
+}
+
+fn fill_scales(screen_centers: &[Pos2], base_sizes: &[Vec2], fill: f32, clamp: CardScaleClamp) -> Vec<f32> {
+    let n = screen_centers.len();
+    // Lone card: no neighbour to measure against — fall back to its own size as
+    // the gap so it keeps (clamped) its natural footprint instead of dividing by
+    // a degenerate distance.
+    let default_gap = |i: usize| base_sizes.get(i).map_or(1.0, |s| s.x.max(s.y)).max(1.0);
+    (0..n)
+        .map(|i| {
+            let mut gap = f32::INFINITY;
+            for (j, &c) in screen_centers.iter().enumerate() {
+                if j != i {
+                    gap = gap.min((screen_centers[i] - c).length());
+                }
+            }
+            if !gap.is_finite() {
+                gap = default_gap(i);
+            }
+            let base = base_sizes.get(i).map_or(1.0, |s| s.x.max(s.y)).max(1.0);
+            let target = gap * fill;
+            clamp.apply(target / base)
+        })
+        .collect()
 }
 
 /// Re-export the handle size constant for the interaction layer.
@@ -429,13 +782,71 @@ pub const fn handle_size() -> f32 {
 
 #[cfg(test)]
 mod lod_tests {
-    use super::{arrowhead_size, file_basename, first_nonempty_line, group_label_size, is_tiny, lod_title, url_host, LOD_MIN_PX};
+    use super::{
+        adaptive_segments, arrowhead_size, file_basename, fill_scales, first_nonempty_line,
+        group_label_size, is_bare_dot, is_tiny, lod_title, projected_card_rect, url_host,
+        BARE_DOT_PX, MAX_GEODESIC_SEGMENTS, LOD_MIN_PX,
+    };
+    use canvas_view_core::camera::{Camera, CardScaleClamp};
+    use hiker_projection::Complex;
     use egui::{Pos2, Rect, Vec2};
+    use hiker_canvas::geometry::{node_bounds, Point, Rect as CanvasRect};
     use hiker_canvas::model::{Node, NodeKind};
     use std::collections::BTreeMap;
 
     fn rect(w: f32, h: f32) -> Rect {
         Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h))
+    }
+
+    /// Under the Off (Affine) lens the center-mapped card rect MUST equal the
+    /// corner-mapped `world_rect_to_screen` rect exactly — the byte-identical
+    /// guarantee for a non-projected canvas. [proj-card-scale]
+    #[test]
+    fn affine_card_rect_matches_corner_map() {
+        let mut cam = Camera::default();
+        cam.set_pan_scale(Point::new(-40.0, 22.0), 0.75);
+        let vp = Rect::from_min_size(Pos2::new(10.0, 5.0), Vec2::new(800.0, 600.0));
+        let node = Node {
+            id: "n".into(),
+            x: 120,
+            y: -60,
+            width: 300,
+            height: 200,
+            color: None,
+            kind: NodeKind::Text { text: "hi".into() },
+            extra: BTreeMap::new(),
+        };
+        let bounds = node_bounds(&node);
+        let proj = projected_card_rect(&cam, vp, bounds, None);
+        let corner = cam.world_rect_to_screen(vp, bounds);
+        assert!((proj.min.x - corner.min.x).abs() < 1e-3, "{proj:?} vs {corner:?}");
+        assert!((proj.min.y - corner.min.y).abs() < 1e-3);
+        assert!((proj.max.x - corner.max.x).abs() < 1e-3);
+        assert!((proj.max.y - corner.max.y).abs() < 1e-3);
+    }
+
+    /// A fisheye lens scales cards by magnification while keeping them
+    /// axis-aligned: a card at the focus is larger than one at the rim, and both
+    /// rects stay axis-aligned (width/height stay positive, no rotation is
+    /// representable in an `egui::Rect`). [proj-card-scale]
+    #[test]
+    fn fisheye_scales_card_by_magnification_axis_aligned() {
+        let mut cam = Camera::default();
+        cam.set_projection(hiker_projection::ProjectionConfig {
+            kind: hiker_projection::ProjectionKind::Fisheye,
+            strength: 1.0,
+            size_falloff: 1.0,
+            geodesic_segments: 16,
+        });
+        let world = CanvasRect::new(-500.0, -500.0, 1000.0, 1000.0);
+        cam.update_lens(Some(world));
+        let vp = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let center_node = CanvasRect::new(-50.0, -50.0, 100.0, 100.0);
+        let rim_node = CanvasRect::new(440.0, 440.0, 100.0, 100.0);
+        let c = projected_card_rect(&cam, vp, center_node, None);
+        let r = projected_card_rect(&cam, vp, rim_node, None);
+        assert!(c.width() > r.width(), "center card {} wider than rim {}", c.width(), r.width());
+        assert!(c.width() > 0.0 && c.height() > 0.0 && r.width() >= 0.0, "axis-aligned, non-negative");
     }
 
     #[test]
@@ -445,6 +856,21 @@ mod lod_tests {
         // Narrow but tall, or wide but short, both count as tiny.
         assert!(is_tiny(rect(LOD_MIN_PX - 1.0, 500.0)));
         assert!(is_tiny(rect(500.0, LOD_MIN_PX * 0.64 - 1.0)));
+    }
+
+    /// The deepest LOD tier: a card below `BARE_DOT_PX` in either dimension
+    /// collapses to a bare dot, and the dot tier is strictly deeper than the
+    /// title-placeholder tier (a bare dot is always also "tiny"). [proj-lod-ladder]
+    #[test]
+    fn bare_dot_when_too_small_for_a_title() {
+        // Below the width or (looser) height bound → bare dot.
+        assert!(is_bare_dot(rect(BARE_DOT_PX - 1.0, 500.0)));
+        assert!(is_bare_dot(rect(500.0, BARE_DOT_PX * 0.64 - 1.0)));
+        // A card large enough for a title (but still LOD-tiny) is NOT a bare dot.
+        assert!(!is_bare_dot(rect(BARE_DOT_PX, BARE_DOT_PX)));
+        assert!(!is_bare_dot(rect(LOD_MIN_PX - 1.0, LOD_MIN_PX - 1.0)));
+        // Every bare dot is also tiny (the ladder nests: dot ⊂ tiny ⊂ readable).
+        assert!(is_tiny(rect(BARE_DOT_PX - 1.0, BARE_DOT_PX - 1.0)));
     }
 
     #[test]
@@ -506,5 +932,94 @@ mod lod_tests {
         assert_eq!(lod_title(&mk(NodeKind::File { file: "d/x.md".into(), subpath: None })), "x");
         assert_eq!(lod_title(&mk(NodeKind::Text { text: "First\nSecond".into() })), "First");
         assert_eq!(lod_title(&mk(NodeKind::Link { url: "https://a.io/p".into() })), "a.io");
+    }
+
+    /// Two cards far apart fill more of the empty space (larger scale) than two
+    /// cards close together, and every scale stays within the clamp bounds.
+    /// [proj-card-fill]
+    #[test]
+    fn fill_scales_fills_sparse_more_than_dense() {
+        let clamp = CardScaleClamp { min: 0.2, max: 4.0, fill: 0.9 };
+        let base = vec![Vec2::new(100.0, 60.0); 2];
+        let far = fill_scales(&[Pos2::new(0.0, 0.0), Pos2::new(800.0, 0.0)], &base, 0.9, clamp);
+        let near = fill_scales(&[Pos2::new(0.0, 0.0), Pos2::new(120.0, 0.0)], &base, 0.9, clamp);
+        assert!(far[0] > near[0], "sparse {} should fill more than dense {}", far[0], near[0]);
+        for s in far.iter().chain(near.iter()) {
+            assert!(*s >= clamp.min - 1e-6 && *s <= clamp.max + 1e-6, "scale {s} out of clamp");
+        }
+    }
+
+    /// A single node has no neighbour to measure against, so the gap helper must
+    /// still return a finite, clamped scale (no divide-by-zero / infinity).
+    /// [proj-card-fill]
+    #[test]
+    fn fill_scale_single_node_is_sane() {
+        let clamp = CardScaleClamp::default();
+        let scales = fill_scales(&[Pos2::new(40.0, 40.0)], &[Vec2::new(100.0, 60.0)], 0.9, clamp);
+        assert_eq!(scales.len(), 1);
+        assert!(scales[0].is_finite(), "scale must be finite");
+        assert!(scales[0] >= clamp.min - 1e-6 && scales[0] <= clamp.max + 1e-6, "scale {} out of clamp", scales[0]);
+    }
+
+    /// A wider geodesic arc earns more samples than a shallow one, never above the
+    /// MAX cap. [proj-card-fill]
+    #[test]
+    fn adaptive_segments_increase_with_arc_span() {
+        let base = 8;
+        // A near-diameter pair: shallow arc → stays near base.
+        let shallow = adaptive_segments(Complex::new(0.1, 0.02), Complex::new(-0.1, -0.015), base);
+        // A wide right-angle pair near the rim: sharply-curved arc → more samples.
+        let wide = adaptive_segments(Complex::new(0.85, 0.0), Complex::new(0.0, 0.85), base);
+        assert!(wide > shallow, "wider arc {wide} should out-sample shallow {shallow}");
+        assert!(wide <= MAX_GEODESIC_SEGMENTS, "capped at MAX");
+        assert!(shallow >= base, "never below base");
+    }
+
+    /// Under Poincaré a central card's drawn rect is larger than a rim card's
+    /// when both are sized by the neighbor-gap fill pre-pass: the central card's
+    /// neighbours project farther apart on screen than the squished rim card's, so
+    /// focus+context is preserved even with fill sizing. [proj-card-fill]
+    #[test]
+    fn poincare_central_card_fills_larger_than_rim() {
+        use canvas_view_core::camera::Camera as Cam;
+        use hiker_canvas::geometry::Rect as CanvasRect;
+        use hiker_canvas::model::{Node, NodeKind};
+        use std::collections::BTreeMap;
+        let mut cam = Cam::default();
+        cam.set_projection(hiker_projection::ProjectionConfig {
+            kind: hiker_projection::ProjectionKind::Poincare,
+            strength: 2.2,
+            size_falloff: 1.0,
+            geodesic_segments: 16,
+        });
+        // A dense, regular 6×6 grid (uniform world spacing). Under the disk the
+        // periphery compresses, so corner cards pack tighter on screen (small
+        // neighbour gap → small fill) while the central cards keep room to grow.
+        let mk = |row: i64, col: i64| Node {
+            id: format!("{row}:{col}"),
+            x: -1500 + col * 600,
+            y: -1500 + row * 600,
+            width: 200,
+            height: 130,
+            color: None,
+            kind: NodeKind::Text { text: "x".into() },
+            extra: BTreeMap::new(),
+        };
+        let mut nodes = Vec::new();
+        for row in 0..6 {
+            for col in 0..6 {
+                nodes.push(mk(row, col));
+            }
+        }
+        // Frame the lens to the grid extent so it fills the disk.
+        let world = CanvasRect::new(-1800.0, -1800.0, 3600.0, 3600.0);
+        cam.update_lens(Some(world));
+        let vp = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let canvas = hiker_canvas::model::Canvas { nodes: nodes.clone(), ..Default::default() };
+        let fills = super::lens_fill_scales(&cam, vp, &canvas);
+        // A near-centre card (row 2, col 2 → index 14) vs a far corner (index 0).
+        let central = fills[14].expect("central fill");
+        let rim = fills[0].expect("rim fill");
+        assert!(central > rim, "central fill {central} should exceed rim {rim}");
     }
 }

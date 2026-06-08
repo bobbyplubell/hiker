@@ -12,6 +12,7 @@ pub mod cluster_thumbnail;
 pub mod board;
 pub mod boards_index;
 pub mod canvas;
+pub mod charts_tab;
 pub mod graph;
 pub mod home;
 pub mod indexer_detail;

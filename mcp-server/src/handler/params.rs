@@ -104,6 +104,16 @@ pub struct SearchNotes {
     pub top_k: Option<u32>,
 }
 
+/// status: diagram-agent-check
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct CheckDiagram {
+    /// Diagram language: `mermaid`, `wavedrom` (alias `wavejson`), or `latex`
+    /// (alias `math`). Matched case-insensitively.
+    pub lang: String,
+    /// The diagram source to syntax-check.
+    pub src: String,
+}
+
 #[derive(Debug, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum NoteDetail {

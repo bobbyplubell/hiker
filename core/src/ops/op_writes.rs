@@ -71,8 +71,9 @@ fn kind_for(rel: &str) -> &'static str {
 ///
 /// Idempotent: a path that already has `.ops` history is skipped, so a
 /// second open is a no-op walk. The on-disk `.md` already equals
-/// `materialize(accepted)` by construction, so [`OpLog::create_document`]
-/// performs no rewrite of the user's file.
+/// `materialize(accepted)` by construction, so seeding goes through
+/// [`OpLog::seed_document`], which verifies the bytes against disk instead of
+/// rewriting the user's file — a first open never touches any note's mtime.
 ///
 /// status: op-log-doc-id-bootstrap
 pub fn bootstrap(vault: &Vault, log: &OpLog) -> Result<usize, HikerError> {
@@ -121,7 +122,11 @@ fn seed_one(vault: &Vault, log: &OpLog, rel: &str) -> Result<bool, HikerError> {
             return Ok(false);
         }
     };
-    log.create_document(rel, kind_for(rel), &text, &Author::User)
+    // Seed, don't write: the file already exists on disk holding exactly
+    // `text`, so we register the doc and verify the bytes match rather than
+    // rewriting the file over itself (which would churn every note's mtime on
+    // first open). status: op-log-disk-canonical
+    log.seed_document(rel, kind_for(rel), &text, &Author::User)
         .map_err(map_err)?;
     Ok(true)
 }

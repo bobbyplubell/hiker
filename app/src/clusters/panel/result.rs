@@ -395,6 +395,12 @@ impl Review<'_> {
         }
 
         let state_key = format!("review:{}", tab_id.0);
+        // "Live preview" lives in the result graph's view/eye menu (a display
+        // control). Its flag lives on `advanced_params` while the graph view is
+        // borrowed from `app.panels.cluster_graph`, so copy it to a local,
+        // thread `&mut` of that down, then write it back — no double borrow.
+        // status: cluster-review-tab-live-preview
+        let mut lp = app.clusters_state.advanced_params.live_preview;
         crate::panels::cluster_graph::show_with_nodes(
             ui,
             app,
@@ -403,7 +409,9 @@ impl Review<'_> {
             /*clickable_leaves=*/ false,
             // Live preview re-clusters in place — keep the user's pan/zoom.
             /*preserve_view=*/ true,
+            /*live_preview=*/ Some(&mut lp),
         );
+        app.clusters_state.advanced_params.live_preview = lp;
     }
 
     /// Adapter (post-Done): synthesize an `EditableNode` row for every

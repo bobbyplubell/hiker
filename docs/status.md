@@ -329,6 +329,19 @@ Moved to [`bug_tracking.md`](bug_tracking.md). Same conventions (kebab-case slug
 | `widget-render-async` | planned | — | background render+raster for heavy diagrams with a spinner placeholder (`embedder-spawn-blocking` shape); deferred until profiling shows the synchronous cache path janks |
 
 
+## Diagram renderers (diagram.md)
+
+| Slug | Status | Evidence | Notes |
+| ---- | ------ | -------- | ----- |
+| `diagram-crate` | done | `hiker-render/diagram/src/lib.rs` (`hiker-diagram`) | shared egui-free seam over the mermaid / wavedrom / math engines; each keeps its own `render_*` + options type |
+| `diagram-render-trait` | done | `hiker-render/diagram/src/lib.rs` (`DiagramRenderer`) | per-engine zero-sized marker (`Mermaid`/`WaveDrom`/`Math`) with `render` + parse-only `check`; usable without an instance |
+| `diagram-render-output` | done | `hiker-render/diagram/src/lib.rs` (`DiagramRender`, `Diagnostic`, `Severity`) | common output: SVG + px size, or `Vec<Diagnostic>` of `{message, span, severity}`; per-engine render structs flatten to it |
+| `diagram-check` | done | `hiker-render/diagram/src/lib.rs` (`DiagramRenderer::check`) | parse-only syntax seam; empty `Vec` = OK; coarse v0 byte spans, enrichable; clamped into the checked block by the host |
+| `diagram-math-diagnostics` | done | `hiker-render/math/src/lib.rs` (`MathError`, `check_latex`) | math render/check returns a `Result` carrying `MathError`/diagnostics (not `Option`), so it joins the shared `check()` seam |
+| `diagram-editor-diagnostics` | done | `app/src/panels/buffer/widgets/mod.rs` (`diagram_diagnostic_decorations`) | editor squiggle (underline + gutter) under ```mermaid/```wavedrom fences failing `check_diagram`; independent of the Render-widgets toggle |
+| `diagram-agent-check` | done | `core/src/diagrams.rs` (`check_diagram`), `mcp-server/src/handler/dispatch/diagram.rs` | `check_diagram(lang, src)` core helper + MCP tool returning `{ok, diagnostics}`; one seam shared with the editor; math reachable here (not on the fence path) |
+
+
 ## Watcher (watcher.md)
 
 | Slug | Status | Evidence | Notes |
@@ -1451,6 +1464,9 @@ Path-based note references authored and stored as names. Stored form is `[[Name]
 | `canvas-lod-placeholder` | done | `hiker-canvas/view/src/paint.rs` (`is_tiny`/`lod_title`/`paint_lod_placeholder`, `node_card` branch), `hiker-canvas/view/src/widget.rs` (`handle_zoom` wheel routing) | below ~150px on-screen a card skips the content engine and paints a cheap title + skeleton placeholder; collapsed zoom-to-fit on 121 nodes from 81ms to 0.04ms/frame (profiled via `tools/profile-canvas`). A wheel over a placeholder (no scrollable content) passes through to camera zoom via the shared `is_tiny` check, so a tiny card crossing the cursor mid-zoom-out doesn't stall the zoom |
 | `canvas-static-paint` | done | `hiker-canvas/view/src/widget.rs` (`CanvasView::show_static`, shares the private `paint_scene` helper with `show`), `hiker-canvas/view/src/content.rs` (`NoContentRenderer`) | A paint-only display render: `show_static(ui, &Canvas, &mut dyn NodeContentRenderer)` paints the SCENE only (grid + group backgrounds + edges + cards / LOD placeholders) at the current camera with NO interaction — no `ui.interact` surface, no input (zoom/keys/pointer), no overlays/handles/context menu, nothing committed. It calls the same `paint_scene` the interactive `show` does (one helper, no duplication, keeps `show` under the length budget). Safe inside a non-interactable `Area`: registers no interactive widget, so it can't steal row hover. Zero-cost `NoContentRenderer` (paints nothing, echoes card scroll) lets a caller skip the `!Send` per-node content engine — at fit/thumbnail zoom every node is a LOD placeholder, so the renderer is never invoked anyway. First consumer: the canvas expanded hover preview (`preview-canvas-thumbnail`). Tested via `egui_kittest` (drives one frame, asserts the ctx wants no pointer/keyboard input) + a `NoContentRenderer` scroll-echo test |
 | `canvas-inline-edit` | done | `app/src/panels/canvas/edit.rs` (overlay + `EDIT_VIEWS` thread-local + `forget`/`enter`/`is_editable`/`show_overlay`); `render.rs::activate_or_edit` / `resolve_edit_overlay` / `render_edit_overlay` / `persist_text_edit`; `Pane::editing` in `mod.rs`; `widget.rs::node_screen_rect` / `is_node_lod`; `buffer_view.rs` edit-preview popup + `EmbedOpts::focus`; `edit::forget` in `editor_pane::close_tab` | cards editable in place: double-click a full-detail File/Text card → foreground `Area` overlay over the node rect (captures kbd+pointer, tracks rect via `node_screen_rect` on pan/zoom; Esc / click-out / select-other / off-screen exit). Overlay seeds at the card's current scroll (`card_scroll`), no jump to top. Entry gestures (2026-06-03): double-click, **click-again on the already-sole-selected node** (widget `CanvasResponse.edit_requested`), and **Enter/F2 on a single selected editable node** (app-side, focus-gated), all through one `try_enter_edit` seam; a bright accent outline marks the active overlay. Save routing (`handle_canvas_save`, 2026-06-03): Ctrl/Cmd+S **always commits the canvas document** AND saves a single SELECTED File node's note buffer (keyed on selection via `editing_file_path`, not just inline-edit, so re-selecting after click-out still flushes); `save_canvas_document` pokes + toasts only on a real `Ok(true)` commit (a no-op no longer fakes a save). [bug-canvas-save-does-not-sync, bug-canvas-inline-edit-discoverability] File node → edits the shared note buffer via `embedded-buffer-view` (typing shows in any tab, one dirty buffer); Text node → transient editor reconciled to its own `text` via `canvas-edit-ops` `SetText` through the `persist_canvas` op-log path. Per-edit `EmbeddedView` / transient `Editor` parked in a `TabId`-keyed thread-local (off `AppState`) so `show_embedded_buffer` holds `&mut app` + `&mut embed` without aliasing — mirrors `content::PANES`. Read path unchanged (cards read live `working` buffer; LOD placeholder double-click opens a tab via the existing `activate_node`). Diagram preview-while-typing added to the `embedded-buffer-view` primitive (disjoint `buffers[path]` immut / `panels.edit_preview` mut), so every embed gets it; the buffer tab doesn't use the primitive, so no double-fire. Context-follows-edit: while a File node is in inline-edit, `canvas::inline_edited_note(app, tab_id)` (reads `Pane::editing` + the node's `file`) surfaces the edited note as the activity `Ctx::active_path` (override in `activity::with_ctx`, ahead of the canvas tab's own `.canvas` path), so the context panel (backlinks / related / appears-in) tracks the note you're editing on the canvas rather than the `.canvas` file. Verified: `cargo test -p hiker-app -p canvas-view` 237 pass; clippy clean in touched files (`-D` budget lints); `profile-canvas` zoom-to-fit 0.06ms p50 |
+| `canvas-auto-arrange` | done | `hiker-canvas/core/src/tidy.rs` (`auto_arrange`/`ArrangeOpts`/`RankDirection`), `app/src/panels/canvas/menu.rs` (`EmptyMenuAction::AutoArrange`) | pure egui-free dagre "Tidy": maps the canvas onto `hiker_graph::LayeredEngine`, returns one `SetNodeRect` per shifted node (op-log/undo path); rank dir + sep options; result re-centered on the original content |
+| `canvas-auto-arrange-groups` | done | `hiker-canvas/core/src/tidy.rs` (`node_parents`, group cluster rect) | a `Group` maps to a dagre cluster; geometric leaf membership (smallest containing group, nested) fed as `node_parents`; each group frame resized to the engine's cluster rectangle |
+| `canvas-routed-edges` | planned | | deferred: optional orthogonal edge routing after auto-arrange, reusing the layered engine's poly-line routes (`graph-routed-edges`) instead of direct curves |
 
 
 ## Canvas export (canvas-export.md)
@@ -1529,39 +1545,59 @@ Path-based note references authored and stored as names. Stored form is `[[Name]
 | `style-accent-config` | planned | — | user-chosen accent hue recolored through the `accent` token |
 
 
+## Graph view (graph-view.md)
+
+| Slug | Status | Evidence | Notes |
+| ---- | ------ | -------- | ----- |
+| `graph-view-source-trait` | done | `widgets/graph-view/src/graph_view.rs` (`Source`), `app/src/panels/graph.rs`, `app/src/panels/cluster_graph.rs` | one engine, many sources: caller turns its data into node descriptors / edges / layout tree; drives vault Graph tab + cluster graphs |
+| `graph-layout-egui-free` | done | `hiker-render/graph/src/lib.rs` (`hiker-graph`), `widgets/graph-widgets/src/lib.rs` | force/tree/dagre layout math is egui-free with its own `Vec2`; `graph-widgets` is the thin egui façade converting at the boundary |
+| `graph-force-layout` | done | `hiker-render/graph/src/force.rs` (`LayoutWorker`), `widgets/graph-widgets/src/force_layout.rs` | ForceAtlas2 + Barnes–Hut on a background worker; positions snapshotted into the view each frame until convergence |
+| `graph-tree-layouts` | done | `hiker-render/graph/src/tree.rs` (radial / vertical / horizontal) | pure deterministic tree layouts over the `Source`'s `layout_tree`, computed inline (no worker) |
+| `graph-layered-layout` | done | `hiker-render/graph/src/layered/`, `widgets/graph-widgets/src/lib.rs` (`layered_layout`) | dagre/Sugiyama layered layout via the façade; directed; rank direction from the view menu |
+| `graph-routed-edges` | done | `widgets/graph-view/src/graph_view.rs` (`State::edge_routes`) | layered layout returns orthogonal poly-line edge routes; other kinds clear routes and draw straight segments |
+| `force-node-identity` | done | `widgets/graph-view/src/graph_view.rs` (`Source::node_key`, `prev_positions`) | stable per-node identity captured each frame so a rebuild maps old positions onto the new graph (morph, not reshuffle) |
+| `force-anchor-springs` | done | `widgets/graph-view/src/graph_view.rs` (`build_warm_seed`), `hiker-render/graph/src/force.rs` (`force_to_convergence_anchored`) | same-kind force rebuild warm-seeds + tethers retained nodes by anchor springs; re-converges from the warm seed |
+| `force-structural-diff` | done | `widgets/graph-view/src/graph_view.rs` (`build_warm_seed`) | a new (unkeyed) node seeds at its placed-neighbour centroid + jitter (unanchored), else deterministic scatter |
+| `force-seeded-rng` | done | `widgets/graph-view/src/graph_view.rs` (`scatter`, `scatter_point`) | deterministic hash-based scatter (splitmix-style over node index) for fresh seeds, so layouts/snapshots reproduce |
+| `cluster-config-live-stable` | done | `app/src/panels/cluster_graph.rs` (`node_key`), `app/src/clusters/panel/mod.rs` (debounced live preview) | live re-clustering morphs from the prior layout via the cluster `node_key`; camera preserved across the re-seed |
+| `force-cfg-anchor-stiffness` | done | `widgets/graph-view/src/graph_view.rs` (`anchor_stiffness`, `view_options_menu`) | view-menu slider (force-directed only): low = lively re-settle, high = nodes hold prior positions |
+| `view-menu-display-controls` | done | `widgets/graph-view/src/graph_view.rs` (`view_options_menu`) | eye-menu owns display-engine controls (layout kind, projection, sizes, anchor stiffness); clustering options stay on the clustering engine |
+
+
 ## Projection (projection.md)
 
 | Slug | Status | Evidence | Notes |
 | ---- | ------ | -------- | ----- |
-| `proj-seam` | planned | — | generalize the graph `screen_mapper` (`force_graph.rs`) + canvas `Camera` (`camera.rs`) into a swappable `Projection` over `world_to_screen`/`screen_to_world`; affine is one impl; pure view state |
-| `proj-euclidean-storage` | planned | — | hyperbolic is a lens over Euclidean coords; no `{p,q}` tiling / anchor-identity storage model (rejects the reference app's approach) |
-| `proj-geometry` | planned | — | egui-free complex / Möbius / geodesic-sampling math (~200 lines, ported from reference) in a dedicated `hiker-projection` crate beside `hiker-graph` |
-| `proj-magnification` | planned | — | projection reports a local scale factor (`(1−|z|²)` Poincaré / fisheye derivative) driving node+card size, label visibility, LOD |
-| `proj-fisheye` | planned | — | radial focus+context lens (`r'=tanh(k·r)` or graphical fisheye) over the affine map; no mode switch; the cheap shared substrate |
-| `proj-card-scale` | planned | — | canvas cards stay axis-aligned rects at projected center with per-card uniform scale (no glyph shearing) |
-| `proj-poincare` | planned | — | Poincaré disk projection into the unit disk; conformal object scaling; the showpiece mode on the seam |
-| `proj-poincare-mode` | planned | — | Poincaré is a navigate-only `ViewMode` toggled into/out of for editing on the canvas (Canvas/JSON-toggle pattern); a plain view option on the graph |
-| `proj-mobius-pan` | planned | — | drag re-centers the disk via a Möbius transform (no scroll-off); per-frame re-centering sidesteps boundary-precision re-anchoring |
-| `proj-flyto` | planned | — | animated Möbius fly-to glides a clicked/opened node to disk center (cubic ease-out); pure view state, hooks `nav-stack` |
-| `proj-geodesic-edges` | planned | — | edges draw as geodesic arcs (sampled polylines) under curved projections; curvature encodes hyperbolic distance |
-| `proj-boundary` | planned | — | draw the unit-disk boundary + rim alpha fade near `|z|→1` (mirrors the reference shader) |
-| `proj-lod-ladder` | planned | — | magnification-coupled LOD reusing `canvas-lod-placeholder` / label-min-zoom: full → title dot → edge-marker toward the rim |
-| `proj-graph-mode` | planned | — | projection modes apply to all `graph_view` consumers (vault `Graph` tab + cluster graphs); primary target (no flat-card problem) |
-| `proj-canvas-mode` | planned | — | `.canvas` board adopts the seam with `proj-card-scale`; Euclidean coords + canonical-JSON op-log binding untouched |
-| `proj-minimap` | planned | — | always-on corner Poincaré minimap overview via the paint-only `canvas-static-paint` path; distinct from the affine `canvas-minimap` |
-| `proj-minimap-expand` | planned | — | click the minimap to promote the disk to full pane while the Euclidean view demotes into the corner (animated swap entrypoint) |
-| `proj-minimap-shape` | planned | — | per-view circle ↔ square framing of the disk/minimap |
-| `proj-view-toggle` | planned | — | View/eye-menu projection selector (Off/Fisheye/Poincaré) per surface; default Off restores exact affine; persisted as view state |
-| `proj-config-live` | planned | — | live config sub-menu in the View menu; controls show per active mode, apply next frame, view state only |
-| `proj-cfg-strength` | planned | — | slider: distortion strength `k` (distance→radius mapping / disk spread) |
-| `proj-cfg-focus-mode` | planned | — | focus source: cursor-follow / locked-center / follow-selection |
-| `proj-cfg-size-falloff` | planned | — | slider: how strongly node/card size tracks magnification toward the rim (0 uniform → 1 full conformal) |
-| `proj-cfg-card-scale-clamp` | planned | — | min/max per-card scale clamp (canvas) so rim cards stay clickable, center cards don't explode |
-| `proj-cfg-geodesic` | planned | — | geodesic edges on/off + segment count (chord vs smooth arc) |
-| `proj-cfg-boundary-fade` | planned | — | boundary circle on/off + fade start radius + fade strength |
-| `proj-cfg-lod-thresholds` | planned | — | magnification cutoffs for full → dot → edge-marker LOD ladder |
-| `proj-cfg-flyto` | planned | — | fly-to on/off + animation duration |
-| `proj-cfg-minimap` | planned | — | minimap on/off + corner + size + circle/square shape |
+| `proj-seam` | done | — | generalize the graph `screen_mapper` (`force_graph.rs`) + canvas `Camera` (`camera.rs`) into a swappable `Projection` over `world_to_screen`/`screen_to_world`; affine is one impl; pure view state |
+| `proj-euclidean-storage` | done | — | hyperbolic is a lens over Euclidean coords; no `{p,q}` tiling / anchor-identity storage model (rejects the reference app's approach) |
+| `proj-geometry` | done | — | egui-free complex / Möbius / geodesic-sampling math (~200 lines, ported from reference) in a dedicated `hiker-projection` crate beside `hiker-graph` |
+| `proj-magnification` | done | — | projection reports a local scale factor (`(1−|z|²)` Poincaré / fisheye derivative) driving node+card size, label visibility, LOD |
+| `proj-fisheye` | done | — | radial focus+context lens (`r'=tanh(k·r)` or graphical fisheye) over the affine map; no mode switch; the cheap shared substrate |
+| `proj-card-scale` | done | `hiker-canvas/view/src/paint.rs:projected_card_rect` | canvas cards stay axis-aligned rects at projected center with per-card uniform scale (no glyph shearing); center-mapped + base affine size × clamped magnification; Off == corner-map (byte-identical) |
+| `proj-card-fill` | done | `hiker-canvas/view/src/paint.rs:fill_scales` / `lens_fill_scales` | under a lens, cards auto-expand to fill empty space: each non-group card sizes to ~`gap·fill` of the screen distance to its nearest projected neighbour (sparse regions grow, dense stay compact), clamped to `CardScaleClamp` (default max bumped to 2.5 so cards actually grow); scene pre-pass in `widget.rs:paint_scene`; `card_fill` slider (`Fill`) in the canvas View menu; high-strength geodesics get adaptive segment counts (`paint.rs:adaptive_segments`, ref-angle 0.5 / max 64) + in-disk endpoint clamping so edges stay smooth, not faceted; Off unchanged |
+| `proj-poincare` | done | — | Poincaré disk projection into the unit disk; conformal object scaling; the showpiece mode on the seam |
+| `proj-poincare-mode` | done | `hiker-canvas/view/src/widget/pointer.rs:on_press` | navigate-only on canvas: any non-Off projection gates OUT edit gestures (drag-move/resize/edge-create/inline-edit) — left-press on a node pans; pan+zoom+selection stay live; Off = full editing. Plain view option on the graph |
+| `proj-mobius-pan` | done | — | drag re-centers the disk via a Möbius transform (no scroll-off); per-frame re-centering sidesteps boundary-precision re-anchoring |
+| `proj-flyto` | done | — | animated Möbius fly-to glides a clicked/opened node to disk center (cubic ease-out); pure view state, hooks `nav-stack` |
+| `proj-geodesic-edges` | done | — | edges draw as geodesic arcs (sampled polylines) under curved projections; curvature encodes hyperbolic distance |
+| `proj-boundary` | done | — | draw the unit-disk boundary + rim alpha fade near `|z|→1` (mirrors the reference shader) |
+| `proj-lod-ladder` | done | — | magnification-coupled LOD reusing `canvas-lod-placeholder` / label-min-zoom: full → title dot → edge-marker toward the rim |
+| `proj-graph-mode` | done | — | projection modes apply to all `graph_view` consumers (vault `Graph` tab + cluster graphs); primary target (no flat-card problem) |
+| `proj-canvas-mode` | done | `hiker-canvas/view-core/src/camera.rs:Lens` | `.canvas` board adopts the seam: lens in `Camera` (`update_lens`/`world_to_screen`/`screen_to_world` compose `world→lensed→affine`, closed-form inverse), Off = identity (byte-identical). View-menu selector in `app/.../canvas/render.rs:projection_menu`. Euclidean coords + canonical-JSON op-log binding untouched |
+| `proj-minimap` | done | — | always-on corner Poincaré minimap overview via the paint-only `canvas-static-paint` path; distinct from the affine `canvas-minimap` |
+| `proj-minimap-expand` | done | — | click the minimap to promote the disk to full pane while the Euclidean view demotes into the corner (animated swap entrypoint) |
+| `proj-minimap-shape` | done | — | per-view circle ↔ square framing of the disk/minimap |
+| `proj-view-toggle` | done | — | View/eye-menu projection selector (Off/Fisheye/Poincaré) per surface; default Off restores exact affine; persisted as view state |
+| `proj-config-live` | done | — | live config sub-menu in the View menu; controls show per active mode, apply next frame, view state only |
+| `proj-cfg-strength` | done | — | slider: distortion strength `k` (distance→radius mapping / disk spread) |
+| `proj-cfg-focus-mode` | done | — | focus source: cursor-follow / locked-center / follow-selection |
+| `proj-cfg-size-falloff` | done | — | slider: how strongly node/card size tracks magnification toward the rim (0 uniform → 1 full conformal) |
+| `proj-cfg-card-scale-clamp` | done | `hiker-canvas/view-core/src/camera.rs:CardScaleClamp` | min/max per-card scale clamp (canvas) so rim cards stay clickable, center cards don't explode; defaults 0.35/2.5 (max raised from 1.0 so the `proj-card-fill` neighbor-gap sizing can actually grow cards); Min/Max/Fill sliders in the canvas View menu |
+| `proj-cfg-geodesic` | done | — | geodesic edges on/off + segment count (chord vs smooth arc) |
+| `proj-cfg-boundary-fade` | done | — | boundary circle on/off + fade start radius + fade strength |
+| `proj-cfg-lod-thresholds` | done | — | magnification cutoffs for full → dot → edge-marker LOD ladder |
+| `proj-cfg-flyto` | done | — | fly-to on/off + animation duration |
+| `proj-cfg-minimap` | done | — | minimap on/off + corner + size + circle/square shape |
 | `proj-h3-3d` | planned | — | deferred 3D hyperbolic (unit-ball) riding `scene3d-shared`, not this 2D seam |
 | `proj-alt-models` | planned | — | deferred Beltrami–Klein / upper-half-plane projections as alternate impls on the same seam |
 | `proj-multi-focus` | planned | — | deferred two-focus elliptical/bipolar lens to compare neighborhoods |

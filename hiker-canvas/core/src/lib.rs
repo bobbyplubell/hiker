@@ -15,6 +15,9 @@
 //! - [`geometry`] — egui-free [`geometry::Point`] / [`geometry::Rect`], node
 //!   bounds, z-ordered hit testing, content bounds, and edge anchors.
 //! - [`ops`] — pure, invertible [`ops::EditOp`] verbs for a future undo stack.
+//! - [`tidy`] — a pure dagre auto-arrange ("Tidy"):
+//!   [`tidy::auto_arrange`] maps cards/edges/group-membership onto the layered
+//!   engine and returns `SetNodeRect` ops, egui-free.
 //!
 //! Deterministic, tab-indented, idempotent serialization lives on the model as
 //! [`model::Canvas::to_canonical_json`], so a single node edit is a localized
@@ -24,6 +27,7 @@ pub mod color;
 pub mod geometry;
 pub mod model;
 pub mod ops;
+pub mod tidy;
 
 #[cfg(test)]
 mod canonical_tests {

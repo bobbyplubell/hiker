@@ -23,8 +23,11 @@ allowed (so the rule doesn't churn the existing comment-heavy code):
   - ellipsis (U+2026) — used in many UI labels
   - misc technical symbols already in active use
 
-Allowlist intentionally empty for the banned ranges: a single tofu
-char in a comment can be copy-pasted into a label and break rendering.
+Test code is exempt: tests never render in the UI, and emoji are useful
+there as UTF-8 / multibyte fixtures. Exempt = whole test files (a `tests.rs`,
+a `*_test(s).rs`, or anything under a `tests/` dir) plus inline
+`#[cfg(test)]` modules in any file. Non-test code stays banned: a single
+tofu char in a real label breaks rendering.
 """
 
 from __future__ import annotations
@@ -55,6 +58,43 @@ EMOJI_RE = re.compile(
 )
 
 
+def is_test_file(rel: Path) -> bool:
+    """Whole-file exemption: a dedicated test file or anything under tests/."""
+    name = rel.name
+    return (
+        "tests" in rel.parts
+        or name in ("tests.rs", "test.rs")
+        or name.endswith("_tests.rs")
+        or name.endswith("_test.rs")
+    )
+
+
+def cfg_test_lines(lines: list[str]) -> set[int]:
+    """1-based line numbers that fall inside a `#[cfg(test)]` module.
+
+    Brace-counts from each `#[cfg(test)]` attribute through the matching close
+    of the module it guards. Heuristic (counts braces in strings/comments too),
+    which is fine here: emoji inside a test module are allowed regardless.
+    """
+    exempt: set[int] = set()
+    i, n = 0, len(lines)
+    while i < n:
+        if "#[cfg(test)]" not in lines[i]:
+            i += 1
+            continue
+        depth, opened = 0, False
+        j = i
+        while j < n:
+            depth += lines[j].count("{") - lines[j].count("}")
+            opened = opened or "{" in lines[j]
+            exempt.add(j + 1)
+            if opened and depth <= 0:
+                break
+            j += 1
+        i = j + 1
+    return exempt
+
+
 def scan_file(path: Path) -> list[tuple[int, int, str, str]]:
     """Return (line_no, col, char, line_text) tuples for every hit."""
     hits: list[tuple[int, int, str, str]] = []
@@ -62,7 +102,11 @@ def scan_file(path: Path) -> list[tuple[int, int, str, str]]:
         text = path.read_text(encoding="utf-8", errors="strict")
     except (UnicodeDecodeError, OSError):
         return hits
-    for line_no, line in enumerate(text.splitlines(), start=1):
+    lines = text.splitlines()
+    exempt = cfg_test_lines(lines)
+    for line_no, line in enumerate(lines, start=1):
+        if line_no in exempt:
+            continue
         for m in EMOJI_RE.finditer(line):
             hits.append((line_no, m.start() + 1, m.group(0), line))
     return hits
@@ -77,6 +121,8 @@ def main() -> int:
         for ext in SCAN_EXTS:
             for path in base.rglob(f"*{ext}"):
                 if path.resolve() == SELF:
+                    continue
+                if is_test_file(path.relative_to(ROOT)):
                     continue
                 hits = scan_file(path)
                 if not hits:

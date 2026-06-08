@@ -1,0 +1,25 @@
+[package]
+name = "hiker-graph-view"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+egui = { workspace = true }
+# Layout kinds + tree types (LayoutKind/LayoutTree/LayoutParams).
+hiker-graph = { workspace = true }
+# Shared theme colors used by the view-options menu + styles.
+hiker-theme = { workspace = true }
+# The egui adapter over the layout engines (force worker + tree positions).
+graph-widgets = { workspace = true }
+# The egui-free lens kernel (forward/inverse/magnification + geodesic sampling).
+hiker-projection = { workspace = true }
+
+[dev-dependencies]
+egui_kittest = { version = "0.32", features = ["snapshot", "wgpu"] }
+eframe = { version = "0.32", features = ["glow", "wgpu"] }
+image = { version = "0.25", default-features = false, features = ["png"] }

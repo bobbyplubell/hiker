@@ -103,6 +103,22 @@ pub fn open_file(state: &mut AppState, rel: &str, sticky: bool) {
         crate::panels::canvas::open(state, rel);
         return;
     }
+    // A `.csv` opens in the chart-builder view (the `hiker-charts` panel over
+    // its data), never as a raw-text buffer — like `.canvas`. Find-or-open a
+    // per-path ChartBuilder tab so every caller (sidebar, backlinks, wikilinks)
+    // lands on the builder. status: chart-csv-tab
+    if rel.ends_with(".csv") {
+        if !state.session.nav.locked {
+            nav_push(state, rel);
+        }
+        let source = crate::tab::ChartSource::Csv { path: rel.to_string() };
+        let for_build = source.clone();
+        state.find_or_open_tab(
+            |k| matches!(k, TabKind::ChartBuilder { source: s } if *s == source),
+            move || TabKind::ChartBuilder { source: for_build },
+        );
+        return;
+    }
     // A cluster-tree note opens in its force-graph view, not as raw markdown — it
     // has no in-buffer view (unlike a board, which has a Markdown toggle), so a
     // plain buffer would just show its YAML. The kind-routing sibling of the
@@ -764,6 +780,13 @@ pub fn close_tab(state: &mut AppState, id: TabId) {
         state.panels.canvases.remove(&id);
         crate::panels::canvas::content::forget(id);
         crate::panels::canvas::edit::forget(id);
+    }
+
+    // Drop a chart-builder tab's cached pane (builder model + preview texture),
+    // keyed by the source's pane key. status: chart-csv-tab
+    if let TabKind::ChartBuilder { source } = &removed.kind {
+        let key = source.pane_key();
+        crate::panels::charts_tab::forget(state, &key);
     }
 }
 

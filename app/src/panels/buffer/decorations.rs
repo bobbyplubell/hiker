@@ -1,12 +1,12 @@
 //! Editor decoration assembly for the buffer panel: the per-frame
-//! `rebuild_editor_decorations` driver that fingerprints and caches every
+//! `rebuild_editor_layers` driver that fingerprints and caches every
 //! decoration layer, plus the app-side providers (chunk-boundary tints, the
 //! index-diff gutter markers) that hang off `editor_core`'s `Editor` rather
 //! than the panel's `BufCtx` — they're computed inside the `cached!` closures
 //! in the rebuild, which already hold a `&mut buffer.decoration_cache` and so
 //! can only borrow `buffer.editor` immutably. Pulled out of `buffer/mod.rs` to
 //! keep that file under the workspace's per-file length cap; the panel calls
-//! `decorations::rebuild_editor_decorations` through the widget's
+//! `decorations::rebuild_editor_layers` through the widget's
 //! decoration-rebuild hook.
 
 use editor_md::admonitions::callout_decorations;
@@ -15,7 +15,7 @@ use editor_md::notes::footnote_decorations;
 use editor_md::meta::frontmatter_fold;
 use editor_md::styling::markdown_decorations;
 use editor_md::equations::math_decorations;
-use editor_md::diagrams::{mermaid_decorations, wavedrom_decorations};
+use editor_md::diagrams::{chart_decorations, mermaid_decorations, wavedrom_decorations};
 use editor_md::embeds::transclusion_decorations;
 use editor_md::links::wikilink_decorations;
 use editor_view::brackets::DEFAULT_BRACKETS;
@@ -34,43 +34,51 @@ use super::widgets;
 
 /// Buffer-derived inputs the decoration rebuild needs that are *not* the
 /// editor state or view (those arrive as the widget hook's two args). Bundling
-/// them keeps `rebuild_editor_decorations` under the `too_many_arguments` cap
+/// them keeps `rebuild_editor_layers` under the `too_many_arguments` cap
 /// while preserving identical behavior — every field is read exactly where the
 /// old inline block read the matching `buffer.*` field.
-pub(crate) struct DecoRebuildCtx<'a> {
-    pub(crate) cache: &'a mut DecorationCache,
-    pub(crate) folds: &'a std::collections::HashSet<u64>,
-    pub(crate) loaded_text: &'a str,
-    pub(crate) theme: Option<&'a editor_core::theme::Theme>,
-    pub(crate) live_preview: bool,
+pub struct DecoRebuildCtx<'a> {
+    pub cache: &'a mut DecorationCache,
+    pub folds: &'a std::collections::HashSet<u64>,
+    pub loaded_text: &'a str,
+    pub theme: Option<&'a editor_core::theme::Theme>,
+    pub live_preview: bool,
     /// When true (default), the math/widget render layer replaces source with
     /// rasterized widgets; off shows the tinted-source marks
     /// (`widget-render-toggle`).
-    pub(crate) render_widgets: bool,
+    pub render_widgets: bool,
     /// True when this buffer renders as markdown (`.md`, or `.txt` with the
     /// render-txt-as-markdown flag). Gates the widget provider independently of
     /// `live_preview` (`widget-render-gating`).
-    pub(crate) is_markdown: bool,
+    pub is_markdown: bool,
     /// Device pixel ratio for the widget raster (`ui.ctx().pixels_per_point()`),
     /// captured before the rebuild closure runs. Part of the math-widget
     /// fingerprint so a DPI change re-renders (`widget-render-cache`).
-    pub(crate) dpr: f32,
+    pub dpr: f32,
     /// Editor body font size in logical points; drives the math render size.
-    pub(crate) font_px: f32,
-    pub(crate) chunk_boundaries: bool,
-    pub(crate) show_whitespace: bool,
-    pub(crate) highlight_trailing_whitespace: bool,
-    pub(crate) diff: Option<&'a diff_overlay::DiffOverlay>,
+    pub font_px: f32,
+    pub chunk_boundaries: bool,
+    pub show_whitespace: bool,
+    pub highlight_trailing_whitespace: bool,
+    pub diff: Option<&'a diff_overlay::DiffOverlay>,
     /// Maps a wikilink target (ULID or name) to the note's current title for
     /// live-title rendering; `None` falls back to plain (non-clickable) link
     /// pills (read-only previews). status: wikilink-render-live-title
-    pub(crate) resolve_title: Option<&'a editor_md::links::TitleResolver<'a>>,
+    pub resolve_title: Option<&'a editor_md::links::TitleResolver<'a>>,
     /// Persisted diagram-cache context (`<vault>/.hiker/diagram-cache`), or
     /// `None` when `[render] cache_diagrams` is off. Owned (it's just a
     /// `PathBuf`) so the rebuild closure doesn't have to borrow `app`; passed
     /// by reference into the math/mermaid/wavedrom widget providers, which read
     /// it below the in-memory `cached!` layer. status: widget-render-disk-cache
-    pub(crate) diagram_cache: Option<widgets::disk_cache::DiagramCacheCtx>,
+    pub diagram_cache: Option<widgets::disk_cache::DiagramCacheCtx>,
+    /// Vault-backed resolver for an inline ```` ```chart ```` block that
+    /// references an external `data:` CSV, bound to the note's directory so the
+    /// reference resolves the way a Hiker link does (note-relative, then vault,
+    /// then by-name) under the vault sandbox. Owned (just a `Vault` clone + two
+    /// strings) so the rebuild closure doesn't borrow `app`. `None` in read-only
+    /// / embedded hosts — inline-CSV charts still render; external ones fall back
+    /// to source. status: widget-chart-render
+    pub chart_resolver: Option<crate::charts::VaultDataResolver>,
 }
 
 /// Rebuild every decoration layer for the editor against the *current* doc
@@ -81,7 +89,7 @@ pub(crate) struct DecoRebuildCtx<'a> {
 ///
 /// `editor` / `view` are the post-edit editor state + view the widget hands
 /// back; everything else rides in `ctx`.
-pub(crate) fn rebuild_editor_decorations(
+pub fn rebuild_editor_layers(
     editor: &editor_core::state::Editor,
     view: &mut editor_view::viewport::ViewState,
     ctx: &mut DecoRebuildCtx<'_>,
@@ -102,10 +110,12 @@ pub(crate) fn rebuild_editor_decorations(
         diff,
         resolve_title,
         diagram_cache,
+        chart_resolver,
     } = ctx;
     let theme = *theme;
     let resolve_title = *resolve_title;
     let diagram_cache = diagram_cache.as_ref();
+    let chart_resolver = chart_resolver.as_ref();
     // status: live-preview-conflict-regions-raw
     // A conflicted buffer (one whose text still carries the unified conflict
     // surface's `<<<<<<< / ======= / >>>>>>>` markers, `sync-unified-conflict-
@@ -276,6 +286,8 @@ pub(crate) fn rebuild_editor_decorations(
             || mermaid_decorations(editor, theme, Some(&visible_range)), vp_scoped);
         cached!(wavedrom, mix(doc_id, vp_fp),
             || wavedrom_decorations(editor, theme, Some(&visible_range)), vp_scoped);
+        cached!(chart, mix(doc_id, vp_fp),
+            || chart_decorations(editor, theme, Some(&visible_range)), vp_scoped);
     }
 
     // Rendered LaTeX math widgets (`widget-render-providers`). Independent of
@@ -331,6 +343,25 @@ pub(crate) fn rebuild_editor_decorations(
         cached!(table_widget, render_fp,
             || widgets::tables::table_widget_decorations(editor, theme, None, font_px, dpr),
             heights);
+        // Rendered chart widgets (`widget-chart-render`). Same gate + render
+        // fingerprint as math / mermaid; emits `hide` lines + a `BlockWidget`
+        // per ```chart fence, so it goes through `push_with_heights`. The
+        // external-`data:` resolver rides in `chart_resolver` (note-bound).
+        cached!(chart_widget, render_fp,
+            || widgets::chart::widget_decorations(editor, theme, None, dpr, diagram_cache, chart_resolver),
+            heights);
+    }
+
+    // Diagram syntax squiggles (`diagram-editor-diagnostics`). Runs the shared
+    // `hiker-diagram` `check()` over each on-screen mermaid / wavedrom fence body
+    // and underlines the broken ones. NOT gated on `render_widgets` — a broken
+    // block is exactly the one the render layer drops, so its squiggle must show
+    // regardless. Viewport-scoped (it scans viewport-scoped diagram spans), so it
+    // keys on `(doc_id, vp_fp)` and routes through `push_viewport_scoped`.
+    if *is_markdown {
+        cached!(diagram_diagnostics, mix(doc_id, vp_fp),
+            || widgets::diagram_diagnostics::diagram_diagnostic_decorations(editor, theme, Some(&visible_range)),
+            vp_scoped);
     }
 
     // Chunk-boundary visualisation: a gutter marker + faint background at

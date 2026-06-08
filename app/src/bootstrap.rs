@@ -649,10 +649,6 @@ fn open_and_seed_oplog(
     let oplog = Arc::new(
         OpLog::open_with_threshold(root, compact_threshold).with_context(|| "open op log")?,
     );
-    // Relocate any legacy hidden `.hiker/sessions/` content into the visible
-    // chats folder *before* the op-log seed below, so the moved notes are in
-    // the main walk and get doc_ids + indexing on this same open. Idempotent.
-    run_sessions_migration_on_open(root, config);
     // Startup disk-reconcile MUST run before the bootstrap seed (see the
     // ordering invariant on `run_disk_reconcile_on_open`).
     run_disk_reconcile_on_open(root, vault, &oplog);
@@ -661,7 +657,6 @@ fn open_and_seed_oplog(
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "oplog: bootstrap seed failed (non-fatal)"),
     }
-    run_trails_companion_migration_on_open(vault, &oplog);
     run_oplog_retention_gc_on_open(&oplog, config);
     Ok(oplog)
 }
@@ -682,41 +677,6 @@ fn run_disk_reconcile_on_open(root: &std::path::Path, vault: &Vault, oplog: &Arc
         Ok(n) if n > 0 => tracing::info!(reconciled = n, "oplog: reconciled disk drift on open"),
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "oplog: disk reconcile failed (non-fatal)"),
-    }
-}
-
-/// One-time chat-sessions storage-layout migration
-/// (`bug-sessions-to-visible-chats-folder`): relocate any legacy hidden
-/// `.hiker/sessions/` content (incl. `imported/`) into the visible
-/// `<chats_dir>/` folder (default `chats/`). Idempotent — a no-op on vaults
-/// already on the new layout or freshly created. Mirrors the trails
-/// companion-folder migration's shape. Failures are logged, not fatal.
-fn run_sessions_migration_on_open(root: &std::path::Path, config: &std::sync::RwLock<Config>) {
-    let chats_dir = config
-        .read()
-        .map(|c| c.chat.chats_dir.clone())
-        .unwrap_or_else(|_| "chats/".to_string());
-    match hiker_core::sessions::migrate_to_chats_dir(root, &chats_dir) {
-        Ok(n) if n > 0 => {
-            tracing::info!(migrated = n, "sessions: relocated to visible chats folder")
-        }
-        Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "sessions: migration failed (non-fatal)"),
-    }
-}
-
-/// One-time trails storage-layout migration (`trail-storage-layout`):
-/// relocate any legacy hidden `.hiker/trails/<id>/waypoints/` dirs to the
-/// trail-doc's visible companion folder. Idempotent — a no-op on vaults
-/// already on the new layout. Runs after the op-log seed so trail-doc paths
-/// resolve from their doc_ids. Failures are logged, not fatal.
-fn run_trails_companion_migration_on_open(vault: &Vault, oplog: &Arc<OpLog>) {
-    match hiker_core::trails::ops::migrate_waypoints_to_companion_folders(vault, oplog) {
-        Ok(n) if n > 0 => {
-            tracing::info!(migrated = n, "trails: migrated waypoints to companion folders")
-        }
-        Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "trails: waypoint migration failed (non-fatal)"),
     }
 }
 
@@ -1139,6 +1099,12 @@ impl AppState {
             p if p.starts_with("canvas:") => {
                 Some(TabKind::Canvas { path: p["canvas:".len()..].to_string() })
             }
+            // status: chart-csv-tab
+            // Per-CSV chart-builder tab: the persist key is `chart:<csv-path>`.
+            // (Note-block builders are ephemeral and never persisted.)
+            p if p.starts_with("chart:") => Some(TabKind::ChartBuilder {
+                source: crate::tab::ChartSource::Csv { path: p["chart:".len()..].to_string() },
+            }),
             // status: zim-view
             // Per-archive ZIM viewer tab: persist key is `zim:<archive-path>`;
             // restore lands on the archive's main page (`article: None`).

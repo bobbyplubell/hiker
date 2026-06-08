@@ -6,7 +6,6 @@
 use super::*;
 
 mod cursor;
-mod migrate;
 mod parse;
 mod rename;
 

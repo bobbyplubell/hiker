@@ -13,6 +13,9 @@ hiker-core.workspace = true
 # Shared LLM client (extracted from core) for the agent-bridge ToolDef type.
 # status: crawler-shared-llm
 hiker-llm.workspace = true
+# Diagnostic / Severity shapes for the `check_diagram` tool's JSON mapping.
+# status: diagram-agent-check
+hiker-diagram.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yml.workspace = true

@@ -36,6 +36,8 @@ use editor_core::theme::Theme;
 use editor_md::diagrams::{mermaid_spans, wavedrom_spans};
 use editor_md::equations::{MathKind as SpanKind, math_spans};
 
+pub mod chart;
+pub mod diagram_diagnostics;
 pub mod disk_cache;
 pub mod edit_preview;
 pub(crate) mod render;
@@ -126,7 +128,7 @@ impl InlineWidget for InlineMath {
 /// letterboxed paint with no excess vertical band. A diagram narrower than the
 /// column keeps its natural size (not upscaled). Mirrors the aspect-preserving
 /// fit `texture_cache::letterbox` applies at paint time. status: widget-wavedrom-render
-fn fit_block_height(rendered: &RenderedWidget, dpr: f32, width: f32) -> f32 {
+pub(super) fn fit_block_height(rendered: &RenderedWidget, dpr: f32, width: f32) -> f32 {
     let natural_w = rendered.width as f32 / dpr;
     let natural_h = rendered.height as f32 / dpr;
     if width > 0.0 && natural_w > width {
@@ -559,6 +561,12 @@ pub fn widget_edit_targets(
         targets.insert(id, offset);
     }
 
+    // Charts route a LEFT click to caret-into-source like the other block
+    // widgets (the right-click menu opens the builder instead). status: chart-open-in-builder
+    for (id, t) in chart::edit_targets(state, theme, viewport, dpr) {
+        targets.insert(id, t.inner_range.start);
+    }
+
     targets
 }
 
@@ -567,7 +575,8 @@ pub fn widget_edit_targets(
 pub enum WidgetClickBucket {
     /// Interactive mermaid region (link dispatch).
     Diagram,
-    /// Block-widget body / table cell → caret-into-source.
+    /// Block-widget body / table cell / chart → caret-into-source. (A chart's
+    /// *right*-click opens the builder; its left click reveals source here.)
     Edit,
     /// Wikilink pill → open the target.
     Wikilink,

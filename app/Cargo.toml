@@ -9,6 +9,15 @@ rust-version.workspace = true
 name = "hiker"
 path = "src/main.rs"
 
+# Library facade over the app's module tree, consumed by tools/profile-buffer to
+# drive the real decoration-rebuild path. Root lives at `app/lib.rs` (outside
+# `src/`, via `#[path]`) so the repo's structural lint scripts — which scan
+# `app/src` — don't treat it as a new module-root for the bin's files. The bin
+# above is unaffected.
+[lib]
+name = "hiker_app"
+path = "lib.rs"
+
 [features]
 default = []
 # Puffin profiler. Turns on the `profile_function!` / `profile_scope!`
@@ -44,6 +53,7 @@ egui.workspace = true
 egui_extras.workspace = true
 egui_workbench = { workspace = true, features = ["serde"] }
 graph-widgets.workspace = true
+hiker-graph-view.workspace = true
 # JSON Canvas editor: the egui-agnostic core (`hiker-canvas`), the egui-free
 # view layer (`canvas-view-core`, for `CreateKind` and friends), and the egui
 # shell (`canvas-view`). The canvas panel glues them to the op-log + tab spine;
@@ -52,6 +62,9 @@ graph-widgets.workspace = true
 hiker-canvas.workspace = true
 canvas-view-core.workspace = true
 canvas-view.workspace = true
+# The egui-free projection math kernel, so the canvas View menu can name
+# `ProjectionKind` for the Off/Fisheye/Poincaré selector. [proj-canvas-mode]
+hiker-projection.workspace = true
 # Vector-free layout types (`LayoutParams`, `LayoutKind`, `LayoutTree`, the
 # tree builders) come from here directly; `graph-widgets` façades only the
 # egui-wrapped pieces (the project bans `pub use` re-exports).
@@ -71,6 +84,18 @@ zxr = { path = "../zxr" }
 hiker-math = { path = "../hiker-render/math" }
 hiker-mermaid = { path = "../hiker-render/mermaid" }
 hiker-wavedrom = { path = "../hiker-render/wavedrom" }
+# Shared diagram `Diagnostic` / `Severity` types behind the `check()` seam. The
+# editor squiggle layer (panels/buffer/widgets/mod.rs) maps these onto the
+# editor's decoration diagnostics. status: diagram-editor-diagnostics
+hiker-diagram = { path = "../hiker-render/diagram" }
+# Grammar-of-graphics charts (the `hiker-charts` submodule): `-core` (spec +
+# CSV typing + resolve + `DataResolver` host seam), `-plotters` (SVG-string
+# renderer), `-gui` (pure-egui builder panel). Inline ```chart blocks render
+# through the same resvg SVG→RGBA path as mermaid (panels/buffer/widgets), and
+# a `.csv` opens the builder in its own tab. status: chart-render
+hiker-charts-core.workspace = true
+hiker-charts-plotters.workspace = true
+hiker-charts-gui.workspace = true
 # SVG → RGBA rasterization (usvg parse + tiny-skia pixmap). Same version
 # `hiker-htmlview` already pulls in, so the dep set stays consistent.
 resvg = "0.47.0"

@@ -605,35 +605,27 @@ fn render_config_form(&mut self, ui: &mut egui::Ui, cfg: &mut ReviewConfig) {
                         .on_hover_text("Keep unclustered notes in an outliers bucket instead of force-routing them into the nearest cluster");
                     ui.end_row();
 
-                    // Live preview toggle + size-gate notice.
+                    // Live-preview size-gate notice. The toggle itself is a
+                    // DISPLAY control and lives in the result graph's view/eye
+                    // menu, not here — these config knobs hold only clustering
+                    // ENGINE params. This row just explains the gate when live
+                    // preview can't run for the current note count.
                     // status: cluster-review-tab-live-preview
                     let gated = note_count > live_gate;
-                    ui.label("Live preview");
-                    ui.vertical(|ui| {
-                        ui.add_enabled_ui(!gated, |ui| {
-                            ui.checkbox(&mut p.live_preview, "")
-                                .on_hover_text(
-                                    "Re-cluster automatically (debounced) when you change a knob, \
-                                     after the first Run",
-                                );
-                        });
-                        if gated {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "off — {note_count} notes over the {live_gate} live limit; use Run"
-                                ))
-                                .small()
-                                .color(theme::muted()),
-                            );
-                        } else if note_count == 0 {
-                            ui.label(
-                                egui::RichText::new("starts after the first Run")
-                                    .small()
-                                    .color(theme::muted()),
-                            );
-                        }
-                    });
-                    ui.end_row();
+                    if gated {
+                        // Force live preview off above the gate so a stale
+                        // `true` can't drive an auto-rerun over the limit.
+                        p.live_preview = false;
+                        ui.label("Live preview");
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "off — {note_count} notes over the {live_gate} live limit; use Run"
+                            ))
+                            .small()
+                            .color(theme::muted()),
+                        );
+                        ui.end_row();
+                    }
                 });
         });
 }

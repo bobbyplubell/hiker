@@ -14,6 +14,9 @@ egui = { workspace = true }
 # / gesture state / undo). This crate is the thin egui shell over it: painter,
 # widget, pointer plumbing, and the `NodeContentRenderer` content seam.
 canvas-view-core = { workspace = true }
+# The egui-free projection math kernel, so the widget's projection accessors can
+# name `ProjectionConfig` (the camera lens math lives in `canvas-view-core`).
+hiker-projection = { workspace = true }
 # The egui-agnostic JSON Canvas core (document model + `EditOp`s reported back to
 # the host). This crate does NOT depend on any content engine (editor-egui /
 # hiker-htmlview): node content is painted by a host-supplied trait so it stays
@@ -23,4 +26,9 @@ hiker-canvas = { workspace = true }
 [dev-dependencies]
 # Headless egui harness to drive `show_static` through a real `Ui` and confirm
 # the display-only paint registers no interactive widget. status: canvas-static-paint
+# The `wgpu` feature (carried by the workspace dep) also backs the headless
+# `projection_snapshot` example, which renders the card-warp PNGs. status: proj-canvas-mode
 egui_kittest = { workspace = true }
+# Compose the three projection-mode renders into one 3-up comparison PNG (the
+# per-mode PNGs are saved via `egui_kittest`'s `image::RgbaImage::save`).
+image = "0.25"

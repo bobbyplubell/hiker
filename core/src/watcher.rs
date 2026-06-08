@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use notify::{EventKind, RecursiveMode};
@@ -22,6 +22,12 @@ use notify_debouncer_full::{new_debouncer, DebounceEventResult, DebouncedEvent, 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::broadcast;
+use walkdir::WalkDir;
+
+/// The concrete debouncer type. Shared (behind `Arc<Mutex<_>>`) between the
+/// `Watcher` handle and the bridge thread so the latter can register watches
+/// on directories that appear after startup.
+type Deb = Debouncer<notify::RecommendedWatcher, notify_debouncer_full::RecommendedCache>;
 
 const DEBOUNCE_WINDOW: Duration = Duration::from_millis(200);
 const BROADCAST_CAPACITY: usize = 1024;
@@ -57,7 +63,11 @@ pub enum Error {
 /// normalized `FileEvent`s and broadcasts them. Drop the watcher to stop
 /// watching and close the broadcast channel.
 pub struct Watcher {
-    _debouncer: Debouncer<notify::RecommendedWatcher, notify_debouncer_full::RecommendedCache>,
+    // The sole strong owner of the debouncer: when the `Watcher` drops, this
+    // Arc's refcount hits zero (the bridge thread holds only a `Weak`), the
+    // debouncer drops, its `raw_tx` closes, and the bridge thread's
+    // `for batch in raw_rx` ends — so drop still stops watching cleanly.
+    _debouncer: Arc<Mutex<Deb>>,
     tx: broadcast::Sender<FileEvent>,
     suppressed: SuppressMap,
 }
@@ -69,19 +79,32 @@ impl Watcher {
         let (raw_tx, raw_rx) = mpsc::channel::<DebounceEventResult>();
         let suppressed: SuppressMap = Arc::new(Mutex::new(HashMap::new()));
 
-        let mut debouncer = new_debouncer(DEBOUNCE_WINDOW, None, raw_tx)?;
-        debouncer
-            .watch(&vault_root, RecursiveMode::Recursive)?;
+        let debouncer = Arc::new(Mutex::new(new_debouncer(DEBOUNCE_WINDOW, None, raw_tx)?));
+        // Register a NonRecursive watch per non-ignored directory rather than
+        // one Recursive watch on the root. Recursive mode would place inotify
+        // watches on `target/`, `.git/`, `.hiker/`, etc., whose churn overflows
+        // the kernel event queue; pruning at registration is the only thing
+        // that actually prevents that. See `watch_tree`.
+        watch_tree(
+            &mut debouncer.lock().expect("debouncer lock poisoned"),
+            &vault_root,
+            &vault_root,
+        )?;
 
         // Bridge thread: translates raw events into normalized form and
-        // forwards into the broadcast channel. Owns no async runtime.
+        // forwards into the broadcast channel. Owns no async runtime. It holds
+        // a `Weak` to the debouncer (to register watches on new directories)
+        // so it never keeps the debouncer — and thus the watch — alive past
+        // the `Watcher` handle's own drop.
         let bcast = broadcast_tx.clone();
         let root_for_thread = vault_root.clone();
         let suppressed_for_thread = suppressed.clone();
+        let debouncer_weak = Arc::downgrade(&debouncer);
         std::thread::spawn(move || {
             let wctx = WatcherCtx {
                 vault_root: &root_for_thread,
                 suppressed: &suppressed_for_thread,
+                debouncer: debouncer_weak,
             };
             wctx.run_bridge_thread(raw_rx, &bcast);
         });
@@ -117,6 +140,10 @@ impl Watcher {
 struct WatcherCtx<'a> {
     vault_root: &'a Path,
     suppressed: &'a SuppressMap,
+    /// Weak handle to the shared debouncer, used to register watches on
+    /// directories created after startup. `Weak` (not `Arc`) so the bridge
+    /// thread never extends the debouncer's lifetime past the `Watcher` drop.
+    debouncer: Weak<Mutex<Deb>>,
 }
 
 impl<'a> WatcherCtx<'a> {
@@ -155,9 +182,60 @@ impl<'a> WatcherCtx<'a> {
             tracing::debug!(event = ?file_event, "watcher: suppressed self-write");
             return;
         }
+        // A directory that just appeared needs its own NonRecursive watch (and
+        // its existing contents surfaced) — see `register_new_subtree`.
+        self.register_new_subtree(&file_event, bcast);
         tracing::debug!(event = ?file_event, "watcher: debounced event");
         // send returns Err when no receivers; that's fine.
         let _ = bcast.send(file_event);
+    }
+
+    /// When a directory is created or moved into the vault, register a watch on
+    /// it and every non-ignored subdir — recursive watching is deliberately not
+    /// used (we prune ignored subtrees at registration), so notify won't pick
+    /// up new directories on its own. Also surface any files ALREADY inside it
+    /// as `Created`: a bulk `mv folder/` into the vault yields a single inotify
+    /// event for the directory and none for its contents, so without this the
+    /// moved-in notes would stay unindexed until the next full scan. A no-op for
+    /// non-directory events.
+    fn register_new_subtree(&self, ev: &FileEvent, bcast: &broadcast::Sender<FileEvent>) {
+        let rel = match ev {
+            FileEvent::Created { path } => path,
+            FileEvent::Renamed { to, .. } => to,
+            _ => return,
+        };
+        let abs = self.vault_root.join(rel);
+        if !abs.is_dir() {
+            return;
+        }
+        if let Some(debouncer) = self.debouncer.upgrade() {
+            match debouncer.lock() {
+                Ok(mut guard) => {
+                    if let Err(e) = watch_tree(&mut guard, self.vault_root, &abs) {
+                        tracing::warn!(error = %e, dir = %rel, "watcher: failed to watch new directory");
+                    }
+                }
+                Err(_) => return,
+            }
+        } else {
+            // Watcher has been dropped; nothing to register against.
+            return;
+        }
+        for entry in WalkDir::new(&abs)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|e| should_watch(self.vault_root, e.path()))
+        {
+            let Ok(entry) = entry else { continue };
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let Some(child) = to_rel(self.vault_root, entry.path()) else { continue };
+            if is_ignored(&child) {
+                continue;
+            }
+            let _ = bcast.send(FileEvent::Created { path: child });
+        }
     }
 
     /// Drop a normalized event if any of its referenced paths is currently
@@ -295,6 +373,49 @@ impl<'a> WatcherCtx<'a> {
 fn evict_expired(map: &mut HashMap<String, Instant>) {
     let now = Instant::now();
     map.retain(|_, t| now.duration_since(*t) < SUPPRESS_TTL);
+}
+
+/// Register a NonRecursive watch on `dir` and every non-ignored directory
+/// beneath it. Pruning ignored directories (`target/`, `.git/`, `.hiker/`, …)
+/// at REGISTRATION — rather than filtering their events after the kernel has
+/// already queued them — is what actually stops inotify's event queue from
+/// overflowing when a high-churn tree (a Rust `target/` with 600k+ files, a
+/// busy `.git/`) sits under the vault root. Recursive mode is deliberately not
+/// used: it would watch every ignored subtree. Symlinked directories are not
+/// followed (`follow_links(false)` → they surface as non-dir entries and are
+/// never watched), matching `watcher-symlink-policy`.
+fn watch_tree(debouncer: &mut Deb, vault_root: &Path, dir: &Path) -> Result<(), Error> {
+    for entry in WalkDir::new(dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| should_watch(vault_root, e.path()))
+    {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::debug!(error = %e, "watcher: skipping unreadable entry during watch registration");
+                continue;
+            }
+        };
+        if entry.file_type().is_dir() {
+            debouncer.watch(entry.path(), RecursiveMode::NonRecursive)?;
+        }
+    }
+    Ok(())
+}
+
+/// Walk/registration predicate: keep (and, for directories, descend into)
+/// every entry except the ignored set. The vault root itself is always kept.
+/// Shared by the startup registration walk and the new-subtree walk so both
+/// prune identically.
+fn should_watch(vault_root: &Path, path: &Path) -> bool {
+    if path == vault_root {
+        return true;
+    }
+    match to_rel(vault_root, path) {
+        Some(rel) => !is_ignored(&rel),
+        None => false,
+    }
 }
 
 /// Hard-coded ignore list. Mirrors docs/watcher.md.
@@ -501,7 +622,11 @@ mod tests {
         symlink(outside.path().join("d"), vault_root.join("linked")).unwrap();
         // Path under the in-vault symlink → must be detected.
         let suppressed_for_test = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let ctx = WatcherCtx { vault_root: &vault_root, suppressed: &suppressed_for_test };
+        let ctx = WatcherCtx {
+            vault_root: &vault_root,
+            suppressed: &suppressed_for_test,
+            debouncer: Weak::new(),
+        };
         assert!(ctx.has_symlink_ancestor(&vault_root.join("linked").join("leaf.md")));
         // Path through a real directory → must not be flagged.
         fs::create_dir(vault_root.join("real")).unwrap();
@@ -557,6 +682,81 @@ mod tests {
             }
         }
         assert!(saw_real, "expected at least one event for real.md");
+    }
+
+    /// A directory created AFTER startup must get its own watch (we register
+    /// per-dir NonRecursive, not one recursive watch), so a file written inside
+    /// the new subdir still surfaces an event.
+    #[tokio::test]
+    async fn watcher_picks_up_writes_in_subdir_created_after_start() {
+        let dir = tempdir().unwrap();
+        let watcher = Watcher::start(dir.path()).unwrap();
+        let mut rx = watcher.subscribe();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Create the subdir, let its Created event register a watch, then write
+        // a note inside it.
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        fs::write(dir.path().join("sub/note.md"), b"hi").unwrap();
+
+        let started = Instant::now();
+        let mut saw = false;
+        while started.elapsed() < Duration::from_secs(2) {
+            match timeout(Duration::from_millis(300), rx.recv()).await {
+                Ok(Ok(ev)) => {
+                    let p = match &ev {
+                        FileEvent::Created { path } | FileEvent::Modified { path } => path.clone(),
+                        _ => continue,
+                    };
+                    if p == "sub/note.md" {
+                        saw = true;
+                        break;
+                    }
+                }
+                _ => continue,
+            }
+        }
+        assert!(saw, "expected an event for a note in a subdir created post-startup");
+    }
+
+    /// A folder moved into the vault as a unit (one inotify event for the dir,
+    /// none for its pre-existing contents) must still surface its files as
+    /// Created so they get indexed.
+    #[tokio::test]
+    async fn watcher_surfaces_files_of_moved_in_folder() {
+        let dir = tempdir().unwrap();
+        let watcher = Watcher::start(dir.path()).unwrap();
+        let mut rx = watcher.subscribe();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Build a populated folder OUTSIDE the vault, then rename it in as a
+        // unit — the contents already exist, so only the dir move is observed.
+        let staging = tempdir().unwrap();
+        fs::create_dir(staging.path().join("incoming")).unwrap();
+        fs::write(staging.path().join("incoming/a.md"), b"a").unwrap();
+        fs::write(staging.path().join("incoming/b.md"), b"b").unwrap();
+        fs::rename(staging.path().join("incoming"), dir.path().join("incoming")).unwrap();
+
+        let started = Instant::now();
+        let mut saw_a = false;
+        let mut saw_b = false;
+        while started.elapsed() < Duration::from_secs(2) && !(saw_a && saw_b) {
+            match timeout(Duration::from_millis(300), rx.recv()).await {
+                Ok(Ok(ev)) => {
+                    if let FileEvent::Created { path } | FileEvent::Modified { path } = &ev {
+                        if path == "incoming/a.md" {
+                            saw_a = true;
+                        }
+                        if path == "incoming/b.md" {
+                            saw_b = true;
+                        }
+                    }
+                }
+                _ => continue,
+            }
+        }
+        assert!(saw_a && saw_b, "expected Created for both files of the moved-in folder (a={saw_a}, b={saw_b})");
     }
 
     #[tokio::test]

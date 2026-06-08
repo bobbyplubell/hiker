@@ -17,7 +17,7 @@ mod format;
 // provider + the floating edit-preview overlay. `pub(crate)` because the
 // overlay's render-cache type lives on `AppState` (`PanelStates::edit_preview`).
 // status: widget-render-providers
-pub(crate) mod widgets;
+pub mod widgets;
 pub mod minimap_opts;
 pub mod patch_review;
 pub mod patch_review_pill;
@@ -355,6 +355,9 @@ impl<'a> BufCtx<'a> {
     // Seed the sink with any undo/redo change set resolved above so the
     // editor binding mirrors it into `working` alongside this frame's typing.
     let mut txns: Vec<editor_core::transaction::Transaction> = undo_txns;
+    // Set by the editor's right-click "Open in chart editor" menu item; executed
+    // after the editor block so `open_block` can take `&mut app`. status: chart-open-in-builder
+    let mut chart_open: Option<widgets::chart::EditTarget> = None;
     {
         crate::profile_scope!("Widget::show");
         let mut editor_ui = ui.new_child(egui::UiBuilder::new().max_rect(editor_rect));
@@ -379,11 +382,18 @@ impl<'a> BufCtx<'a> {
             diff,
             resolve_title: Some(&resolve_title),
             diagram_cache,
+            // Bind the chart data resolver to this note's directory so an inline
+            // ```chart block's `data: x.csv` resolves note-relative under the
+            // vault sandbox (the same machinery wikilinks use). status: widget-chart-render
+            chart_resolver: Some(crate::charts::VaultDataResolver::new(
+                app.vault_session.vault.as_ref().clone(),
+                path,
+            )),
         };
         let mut rebuild =
             |editor: &editor_core::state::Editor,
              view: &mut editor_view::viewport::ViewState| {
-                decorations::rebuild_editor_decorations(editor, view, &mut deco_ctx);
+                decorations::rebuild_editor_layers(editor, view, &mut deco_ctx);
             };
         let editor_resp = EditorWidget::new(&mut buffer.editor, &mut buffer.view)
             .with_click_sink(click_buffer)
@@ -391,7 +401,17 @@ impl<'a> BufCtx<'a> {
             .with_transactions_sink(&mut txns)
             .with_decoration_rebuild(&mut rebuild)
             .show(&mut editor_ui);
-        clipboard_menu::attach(&editor_resp);
+        // Right-click → "Open in chart editor" (a LEFT click reveals the chart's
+        // source like other block widgets, via `edit_targets`). status: chart-open-in-builder
+        let chart_targets = widgets::chart::edit_targets(&buffer.editor, theme, None, dpr);
+        let chart_menu_target = chart_under_right_click(
+            editor_ui.ctx(),
+            editor_rect,
+            &buffer.view.click_zones,
+            &chart_targets,
+            egui::Id::new(("chart-ctx-menu", path)),
+        );
+        clipboard_menu::attach(&editor_resp, chart_menu_target.as_ref(), &mut chart_open);
     }
     if let Some(opts) = mini_opts {
         crate::profile_scope!("Widget::show");
@@ -458,37 +478,12 @@ impl<'a> BufCtx<'a> {
     // nothing). Region ids and edit-target ids are minted with the wikilink bit
     // clear, so a genuine wikilink pill never lands in either map. Everything
     // unclaimed falls to the diff-overlay hunk consumer.
-    let mut wikilink_clicks: Vec<u64> = Vec::new();
-    let mut diagram_clicks: Vec<u64> = Vec::new();
-    let mut edit_clicks: Vec<u64> = Vec::new();
-    let mut widget_clicks: Vec<u64> = Vec::new();
-    for id in &all_widget_clicks {
-        let id = *id;
-        match widgets::classify_widget_click(id, &diagram_registry, &edit_targets) {
-            widgets::WidgetClickBucket::Diagram => diagram_clicks.push(id),
-            widgets::WidgetClickBucket::Edit => edit_clicks.push(id),
-            widgets::WidgetClickBucket::Wikilink => wikilink_clicks.push(id),
-            widgets::WidgetClickBucket::Other => widget_clicks.push(id),
-        }
-    }
-    // TEMP diagnostic (widget-block-click-to-edit): one line per frame that has
-    // any WidgetClick, showing which bucket each landed in and the available
-    // edit-target / region keys — so a diagram body click that does nothing can
-    // be traced to a zone-miss (no line at all) vs an id mismatch (line present
-    // but `edit`/`diagram` both 0). Remove once the click path is confirmed.
-    if !all_widget_clicks.is_empty() {
-        tracing::debug!(
-            target: "hiker::widget_click",
-            ids = ?all_widget_clicks,
-            wikilink = wikilink_clicks.len(),
-            diagram = diagram_clicks.len(),
-            edit = edit_clicks.len(),
-            other = widget_clicks.len(),
-            edit_target_keys = ?edit_targets.keys().collect::<Vec<_>>(),
-            region_keys = ?diagram_registry.keys().collect::<Vec<_>>(),
-            "widget-click drain",
-        );
-    }
+    let WidgetClickBuckets {
+        wikilink: wikilink_clicks,
+        diagram: diagram_clicks,
+        edit: edit_clicks,
+        other: widget_clicks,
+    } = classify_widget_clicks(&all_widget_clicks, &diagram_registry, &edit_targets);
     let mod_click = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
 
     // Apply fold toggles from this frame's clicks.
@@ -536,6 +531,12 @@ impl<'a> BufCtx<'a> {
     // source span, which triggers the existing reveal (source shows + the
     // edit-preview popup) so there's a way into the otherwise-hidden source.
     place_caret_for_block_click(app, ui.ctx(), path, &edit_clicks, &edit_targets);
+
+    // Open-in-builder (`chart-open-in-builder`): the editor's right-click menu set
+    // `chart_open` to the chart block under the pointer; open it in the builder.
+    if let Some(t) = chart_open {
+        crate::panels::charts_tab::open_block(app, path, &t.inner, t.inner_range);
+    }
 
     // Per-hunk overlay-widget click dispatch. The diff overlay maps each
     // button id to the pending op id(s) it covers; we flip them through
@@ -631,6 +632,82 @@ fn build_diagram_interaction(
         .cloned()
         .collect();
     (registry, zones, edit_targets)
+}
+
+/// The inline ```` ```chart ```` widget the editor's right-click menu should
+/// target, if any. On a secondary click, hit-test the pointer against the chart
+/// click zones and stash the result (or `None`) in egui temp memory keyed by
+/// `menu_id` — so the choice persists while the menu is open and self-corrects on
+/// each right-click; then return the currently-stashed target. Reads the global
+/// pointer (not the editor response's secondary-click sense) so it's independent
+/// of the widget's `Sense`. status: chart-open-in-builder
+fn chart_under_right_click(
+    ctx: &egui::Context,
+    editor_rect: egui::Rect,
+    zones: &[editor_view::viewport::ClickZone],
+    chart_targets: &widgets::chart::EditTargets,
+    menu_id: egui::Id,
+) -> Option<widgets::chart::EditTarget> {
+    let (secondary, pos) =
+        ctx.input(|i| (i.pointer.secondary_clicked(), i.pointer.interact_pos()));
+    if secondary {
+        let hit = pos.filter(|p| editor_rect.contains(*p)).and_then(|p| {
+            let (lx, ly) = (p.x - editor_rect.min.x, p.y - editor_rect.min.y);
+            zones.iter().find_map(|z| match z.action {
+                ClickAction::WidgetClick(id) if z.rect.contains(lx, ly) => {
+                    chart_targets.get(&id).cloned()
+                }
+                _ => None,
+            })
+        });
+        ctx.data_mut(|d| d.insert_temp(menu_id, hit));
+    }
+    ctx.data(|d| d.get_temp::<Option<widgets::chart::EditTarget>>(menu_id)).flatten()
+}
+
+/// This frame's `WidgetClick` ids sorted by consumer (`widget-block-click-to-edit`).
+struct WidgetClickBuckets {
+    wikilink: Vec<u64>,
+    diagram: Vec<u64>,
+    edit: Vec<u64>,
+    other: Vec<u64>,
+}
+
+/// Sort this frame's `WidgetClick` ids into consumer buckets via
+/// [`widgets::classify_widget_click`] (membership-keyed consumers before the
+/// wikilink bit test — see that function's note). Pulled out of `show_editor`
+/// so the per-bucket routing + the click-drain trace live in one place.
+fn classify_widget_clicks(
+    all: &[u64],
+    diagram_registry: &widgets::DiagramRegionRegistry,
+    edit_targets: &widgets::WidgetEditTargets,
+) -> WidgetClickBuckets {
+    let mut b = WidgetClickBuckets {
+        wikilink: Vec::new(),
+        diagram: Vec::new(),
+        edit: Vec::new(),
+        other: Vec::new(),
+    };
+    for &id in all {
+        match widgets::classify_widget_click(id, diagram_registry, edit_targets) {
+            widgets::WidgetClickBucket::Diagram => b.diagram.push(id),
+            widgets::WidgetClickBucket::Edit => b.edit.push(id),
+            widgets::WidgetClickBucket::Wikilink => b.wikilink.push(id),
+            widgets::WidgetClickBucket::Other => b.other.push(id),
+        }
+    }
+    if !all.is_empty() {
+        tracing::debug!(
+            target: "hiker::widget_click",
+            ids = ?all,
+            wikilink = b.wikilink.len(),
+            diagram = b.diagram.len(),
+            edit = b.edit.len(),
+            other = b.other.len(),
+            "widget-click drain",
+        );
+    }
+    b
 }
 
 /// Paint the floating live edit-preview overlay for the buffer at `path`: when
