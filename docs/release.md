@@ -7,7 +7,7 @@ How versions are numbered, how branches flow into releases, and what a "release"
 
 Pre-stable SemVer (`0.MAJOR.MINOR`-style use of the slots), interpreted as:
 
-- **`0.x.0` (minor bump while pre-1.0)** — may break any persisted format or public surface (see the breaking-change table below). The `store-version-fail-loud` rule applies — if the user's existing vault is incompatible, we bail loudly and provide a migration path or a `hiker reindex --rebuild`.
+- **`0.x.0` (minor bump while pre-1.0)** — may break any persisted format or public surface (see the breaking-change table below). The [[spec:store-version-fail-loud]] rule applies — if the user's existing vault is incompatible, we bail loudly and provide a migration path or a `hiker reindex --rebuild`.
 - **`0.x.y` (patch bump)** — bug fixes, internal refactors, additive features that don't change persisted formats or public surfaces. Safe to upgrade in place.
 - **`1.0.0`** — when the persisted formats and public surfaces are stable enough to defend across a year. Not on the near-term roadmap.
 

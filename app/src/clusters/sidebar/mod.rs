@@ -712,7 +712,7 @@ pub(super) fn stage_forms_inline(&mut self, ui: &mut egui::Ui) {
                     if ui.button("Stage").clicked() && !target.trim().is_empty() {
                         // status: cluster-editor-multi-select-stage-move
                         let store_mutex = services.read_store.clone();
-                        let oplog = services.oplog.clone();
+                        let layered = services.layered.clone();
                         if let Ok(store) = store_mutex.lock() {
                             let args = hiker_core::suggest::StageMoveArgs {
                                 tree_id: &tree_id,
@@ -724,7 +724,7 @@ pub(super) fn stage_forms_inline(&mut self, ui: &mut egui::Ui) {
                                 &args,
                                 &store,
                                 vault,
-                                &oplog,
+                                &layered,
                             ) {
                                 Ok(outcome) => push_toast(
                                     toasts,
@@ -774,7 +774,7 @@ pub(super) fn stage_forms_inline(&mut self, ui: &mut egui::Ui) {
                     if ui.button("Stage").clicked() && !slug.trim().is_empty() {
                         // status: cluster-editor-multi-select-stage-tag
                         let store_mutex = services.read_store.clone();
-                        let oplog = services.oplog.clone();
+                        let layered = services.layered.clone();
                         if let Ok(store) = store_mutex.lock() {
                             let args = hiker_core::suggest::StageTagArgs {
                                 tree_id: &tree_id,
@@ -786,7 +786,7 @@ pub(super) fn stage_forms_inline(&mut self, ui: &mut egui::Ui) {
                                 &args,
                                 vault,
                                 &store,
-                                &oplog,
+                                &layered,
                             ) {
                                 Ok(ids) => push_toast(
                                     toasts,

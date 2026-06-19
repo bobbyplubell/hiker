@@ -1,6 +1,6 @@
 //! Agent-side writes: full-body `write_note` plus the
 //! frontmatter-only helpers (`set_frontmatter`, `apply_tag`,
-//! `remove_tag`). Each queues a pending op-log op authored as
+//! `remove_tag`). Each queues a pending layered-doc op authored as
 //! `agent:<client_id>` so the review surfaces and rollback substrate
 //! distinguish agent vs. user writes.
 
@@ -18,22 +18,29 @@ pub struct WriteCtx<'a> {
     pub watcher: &'a Watcher,
     pub jobs: &'a IndexJobTx,
     pub vault: &'a Vault,
-    /// The op log this vault session rides on, when open. Agent writes
+    /// The layered doc this vault session rides on, when open. Agent writes
     /// queue as pending ops here (`op-log-ops-producer-helpers`). `None` for
-    /// callers with no op log open (early CLI, some tests).
-    pub op_log: Option<&'a super::op_writes::OpLogHandle>,
+    /// callers with no layered doc open (early CLI, some tests).
+    pub layered: Option<&'a super::op_writes::LayeredDocHandle>,
     pub client_id: &'a str,
 }
 
 /// Agent write of a note's full body. Routes through the indexer so the
-/// post-write upsert runs against the same writer the UI uses; queues an
-/// `author='agent:<client_id>'` pending op-log op (the rollback / review
-/// substrate per `mcp.md`'s authorship + audit-trail spec).
+/// post-write upsert runs against the same writer the UI uses.
 ///
-/// `expected_hash` enables drift-aware writes (`write_file_checked` shape):
-/// `Some(h)` runs the on-disk hash compare and errors `DiskDrift` if the
-/// file has changed since the agent last read it; `None` is an unconditional
-/// write. Returns the new content hash.
+/// `expected_hash` enables drift-aware writes: `Some(h)` errors `DiskDrift`
+/// if the file has changed since the agent last read it (`get_note` returns
+/// the hash); `None` is an unconditional write. Returns the new content hash.
+///
+/// With a layered doc open the write is **stage + auto-accept**: the edit is
+/// staged as an `agent:<client_id>` op, then accepted immediately —
+/// `accept_pending` advances `accepted` and atomically rewrites the `.md`
+/// under one lock hold, so disk and the layered editing model move together
+/// (this is the direct, review-off path; review-on writes stage in the MCP
+/// dispatch layer and never reach here). The ordering is deliberate: a staging
+/// failure aborts before any bytes land on disk, so a success result always
+/// means "written AND tracked" — never a write that silently escaped the
+/// review/rollback substrate.
 ///
 /// status: mcp-tool-write-note
 pub async fn write_note(
@@ -42,46 +49,65 @@ pub async fn write_note(
     content: &str,
     expected_hash: Option<&str>,
 ) -> Result<String, HikerError> {
+    if let Some(h) = expected_hash {
+        ctx.vault.verify_disk_hash(rel, h)?;
+    }
+
     ctx.watcher.suppress(rel.to_string());
 
-    let new_hash = match expected_hash {
-        Some(h) => ctx.vault.write_file_checked(rel, h, content)?,
-        None => {
-            ctx.vault.write_file(rel, content)?;
-            hash_string(content)
-        }
-    };
-
-    // Re-suppress so the TTL window starts close to when notify surfaces the
-    // post-write event.
-    ctx.watcher.suppress(rel.to_string());
-
-    // Record the agent edit in the op log's pending queue when one is open.
-    // Whole-body rewrite (`old_str = None`); the op stays pending until the
-    // user accepts via `flip_op_status`. Best-effort: a staging failure logs.
-    if let Some(op_log) = ctx.op_log
-        && let Err(e) = super::op_writes::stage_agent_edits(
-            op_log,
+    if let Some(layered) = ctx.layered {
+        let outcome = super::op_writes::stage_agent_edits(
+            layered,
             ctx.vault,
             ctx.client_id,
             "mcp-tool-call",
             rel,
             &[super::op_writes::AgentEdit { old_str: None, new_str: content.to_string() }],
-        )
-    {
-        tracing::warn!(error = %e, path = %rel, "op-log: stage_pending failed (agent write)");
+        )?;
+        // Empty outcome: the content already equals the session view — an
+        // idempotent re-write, nothing to accept.
+        if !outcome.op_ids.is_empty()
+            && let Err(e) =
+                super::op_writes::flip_op_status(layered, rel, &outcome.op_ids, true)
+        {
+            // Pull the staged ops back out so the failed write doesn't leave
+            // phantom pending ops in the review queue.
+            if let Err(rb) =
+                super::op_writes::flip_op_status(layered, rel, &outcome.op_ids, false)
+            {
+                tracing::error!(error = %rb, path = %rel,
+                    "agent write failed AND its staged ops could not be \
+                     rejected; orphaned pending ops remain in the queue");
+            }
+            return Err(e);
+        }
+    } else {
+        // No layered doc open (early CLI, some tests): plain direct write.
+        ctx.vault.write_file(rel, content)?;
     }
 
+    // Re-suppress so the TTL window starts close to when notify surfaces the
+    // post-write event.
+    ctx.watcher.suppress(rel.to_string());
+
     // Re-index the new content so search/related see the agent's changes.
-    let _ = ctx
+    // A send failure (indexer gone) can't fail the write — the bytes are on
+    // disk — but it must not be silent: the agent's own next search won't
+    // see this note until a rescan.
+    if let Err(e) = ctx
         .jobs
         .send(IndexJob::Upsert {
             rel_path: rel.to_string(),
             force: false,
         })
-        .await;
+        .await
+    {
+        tracing::warn!(error = %e, path = %rel,
+            "index upsert not queued after agent write; search is stale for \
+             this note until the next scan");
+    }
 
-    Ok(new_hash)
+    Ok(hash_string(content))
 }
 
 /// Agent merge of frontmatter fields. Reads the existing file, merges

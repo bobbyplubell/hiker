@@ -42,11 +42,15 @@ struct Booted {
     idx: Handle,
     read_store: Arc<Mutex<Store>>,
     vault: Vault,
-    oplog: std::sync::Arc<hiker_core::oplog::OpLog>,
+    layered: std::sync::Arc<hiker_core::editing::LayeredDoc>,
     ui_context: Shared,
 }
 
 async fn boot(config: McpConfig) -> Booted {
+    // The MCP server defaults to `enabled = false` (opt-in localhost listener).
+    // These tests exercise the *running* server, so force it on regardless of
+    // what the caller passed.
+    let config = McpConfig { enabled: true, ..config };
     let td = TempDir::new().unwrap();
     let vault = Vault::open(td.path()).unwrap();
     let store = Store::open(td.path()).unwrap();
@@ -63,7 +67,7 @@ async fn boot(config: McpConfig) -> Booted {
         hiker_core::config::sections::TasksConfig::default(),
     ));
     let mcp_tools = std::sync::Arc::new(std::sync::RwLock::new(config.tools.clone()));
-    let oplog = std::sync::Arc::new(hiker_core::oplog::OpLog::open(td.path()).unwrap());
+    let layered = std::sync::Arc::new(hiker_core::editing::LayeredDoc::open(td.path()).unwrap());
     let ui_context = hiker_mcp::ui_context::shared_empty();
     let deps = McpDeps {
         vault: vault.clone(),
@@ -79,8 +83,12 @@ async fn boot(config: McpConfig) -> Booted {
         tasks_config: hiker_core::config::sections::TasksConfig::default(),
         boards_config: hiker_core::config::sections::BoardsConfig::default(),
         llm_enabled: false,
-        oplog: Some(oplog.clone()),
+        layered: Some(layered.clone()),
         ui_context: ui_context.clone(),
+        // status: mcp-registry-tools — the built-in PM set, compiled the
+        // same way the app host compiles `[kinds]` at vault open, so the
+        // generated create_<kind>/update_<kind> pairs exist in every boot.
+        kinds: Arc::new(hiker_core::kinds::builtin_registry()),
     };
     let handle = start(deps).await.expect("start mcp");
     let url = handle.url();
@@ -108,7 +116,7 @@ async fn boot(config: McpConfig) -> Booted {
     assert_eq!(resp.status(), 200);
     let _ = resp.text().await.unwrap();
 
-    Booted { td, handle, client, url, idx, read_store, vault, oplog, ui_context }
+    Booted { td, handle, client, url, idx, read_store, vault, layered, ui_context }
 }
 
 async fn rpc(b: &Booted, method: &str, params: serde_json::Value) -> serde_json::Value {
@@ -178,6 +186,7 @@ async fn server_lists_expected_tools() {
         "board_reorder_column",
         "board_delete_column",
         "check_diagram",
+        "query",
     ] {
         assert!(tools.contains(&expected.to_string()), "missing {expected} in {tools:?}");
     }
@@ -282,7 +291,7 @@ async fn board_write_tools_round_trip_direct() {
     shutdown(b).await;
 }
 
-/// `board_create` commits directly EVEN under `review_required` — the op-log
+/// `board_create` commits directly EVEN under `review_required` — the layered-doc
 /// staging path for a new file would seed the document by writing an empty
 /// `.md` to disk, leaving a phantom board-doc in the vault. Creates are
 /// structural; the safer fallback is direct-commit with the user deleting on
@@ -319,19 +328,19 @@ async fn board_get_returns_columns_and_cards() {
     let board_src = "---\nhiker:\n  kind: board\n  id: 01BOARD\n  columns:\n    - name: Todo\n      cards:\n        - { id: 01CARD, path: \"note.md\" }\n    - name: Done\n      cards: []\n---\n# Roadmap\n\nframing\n";
     std::fs::write(b.td.path().join("boards/roadmap.md"), board_src).unwrap();
     // Hand-written file bypassed the watcher/indexer path that would normally
-    // seed the op-log; do the bootstrap walk so `board_get`'s
+    // seed the layered doc; do the bootstrap walk so `board_get`'s
     // `doc_id_for_path` lookup resolves. status: op-log-doc-id-bootstrap
-    hiker_core::ops::op_writes::bootstrap(&b.vault, &b.oplog).unwrap();
+    hiker_core::ops::op_writes::bootstrap(&b.vault, &b.layered).unwrap();
 
     let resp = call_tool(&b, "board_get", serde_json::json!({
         "rel_path": "boards/roadmap.md",
     })).await;
     let s = structured(&resp);
     assert_eq!(s["rel_path"], "boards/roadmap.md");
-    // board_id comes from op-log's path→doc_id mapping (`store-path-is-identity`),
+    // board_id comes from the layered-doc path→doc_id mapping (`store-path-is-identity`),
     // not the frontmatter `hiker.id`. The seeded id is a fresh ULID; just
     // assert presence.
-    let expected_id = b.oplog.doc_id_for_path("boards/roadmap.md").unwrap().unwrap();
+    let expected_id = b.layered.doc_id_for_path("boards/roadmap.md").unwrap().unwrap();
     assert_eq!(s["board_id"], expected_id);
     let columns = s["columns"].as_array().expect("columns array");
     assert_eq!(columns.len(), 2);
@@ -949,4 +958,323 @@ async fn ui_context_tools_respect_per_tool_disable() {
         "expected disabled error, got {resp}"
     );
     shutdown(b).await;
+}
+
+// ---------- query tool (query-mcp-tool) ----------
+
+/// Seed the read store the way the indexer would: note rows plus flattened
+/// `note_meta` entries, keyed on the note's path.
+fn seed_meta_note(b: &Booted, path: &str, meta: &[(&str, &str, Option<f64>)]) {
+    let mut s = b.read_store.lock().unwrap();
+    s.upsert_note(&NoteUpsert {
+        path,
+        content_hash: "h",
+        mtime: 1,
+        size: 1,
+        indexed_at: 1,
+        embedder_version: "zero-test",
+        chunks: vec![],
+    })
+    .unwrap();
+    let entries: Vec<hiker_core::store::dto::MetaEntry> = meta
+        .iter()
+        .map(|(k, v, n)| hiker_core::store::dto::MetaEntry {
+            key: (*k).to_string(),
+            value: (*v).to_string(),
+            num: *n,
+        })
+        .collect();
+    s.replace_note_metadata(path, &entries).unwrap();
+}
+
+/// The `query` tool runs both shapes — an inline filter and a saved
+/// query-doc — through the same compile path and returns
+/// `{ rows: [{path, title, mtime, fields}] }`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn query_tool_runs_inline_filter_and_saved_doc() {
+    let b = boot(McpConfig::default()).await;
+    seed_meta_note(&b, "notes/lang.md", &[("tags", "rust", None), ("status", "active", None)]);
+    seed_meta_note(&b, "notes/other.md", &[("tags", "go", None)]);
+
+    // Inline filter.
+    let resp = call_tool(
+        &b,
+        "query",
+        serde_json::json!({"filter": {"tags": "rust"}, "select": ["status"]}),
+    )
+    .await;
+    let rows = structured(&resp)["rows"].as_array().expect("rows array").clone();
+    assert_eq!(rows.len(), 1, "resp: {resp}");
+    assert_eq!(rows[0]["path"], "notes/lang.md");
+    assert_eq!(rows[0]["title"], "lang");
+    assert_eq!(rows[0]["fields"]["status"], "active");
+
+    // Saved query-doc (read from disk by path; indexed enumeration isn't
+    // needed to *run* one).
+    std::fs::create_dir_all(b.td.path().join("queries")).unwrap();
+    std::fs::write(
+        b.td.path().join("queries/rust.md"),
+        "---\nhiker:\n  kind: query\n  query:\n    tags: rust\n---\nprose\n",
+    )
+    .unwrap();
+    let resp = call_tool(&b, "query", serde_json::json!({"query_doc": "queries/rust.md"})).await;
+    let rows = structured(&resp)["rows"].as_array().expect("rows array").clone();
+    assert_eq!(rows.len(), 1, "resp: {resp}");
+    assert_eq!(rows[0]["path"], "notes/lang.md");
+
+    shutdown(b).await;
+}
+
+/// Error model: both/neither of `query_doc`/`filter` and an out-of-grammar
+/// filter are `invalid_params`; a missing or non-query `query_doc` path is
+/// `1002 note_not_found`; the per-tool toggle answers `1004 disabled`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn query_tool_error_codes() {
+    let b = boot(McpConfig::default()).await;
+
+    let resp = call_tool(&b, "query", serde_json::json!({})).await;
+    assert_eq!(resp["error"]["code"], -32602, "neither arg: {resp}");
+    let resp = call_tool(
+        &b,
+        "query",
+        serde_json::json!({"query_doc": "q.md", "filter": {"kind": "story"}}),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602, "both args: {resp}");
+
+    // A clause outside the closed grammar is a loud invalid_params.
+    let resp = call_tool(&b, "query", serde_json::json!({"filter": {"nope": 1}})).await;
+    assert_eq!(resp["error"]["code"], -32602, "unknown clause: {resp}");
+
+    // Missing doc, and an existing note that is not a query-doc -> 1002.
+    let resp = call_tool(&b, "query", serde_json::json!({"query_doc": "missing.md"})).await;
+    assert_eq!(resp["error"]["code"], 1002, "missing doc: {resp}");
+    std::fs::write(b.td.path().join("plain.md"), "# not a query\n").unwrap();
+    let resp = call_tool(&b, "query", serde_json::json!({"query_doc": "plain.md"})).await;
+    assert_eq!(resp["error"]["code"], 1002, "non-query doc: {resp}");
+
+    shutdown(b).await;
+}
+
+/// Per-tool toggle: `[mcp.tools] query_enabled = false` refuses with
+/// `1004 disabled`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn query_tool_respects_per_tool_disable() {
+    let mut cfg = McpConfig::default();
+    cfg.tools.query_enabled = false;
+    let b = boot(cfg).await;
+    let resp = call_tool(&b, "query", serde_json::json!({"filter": {"kind": "story"}})).await;
+    assert_eq!(resp["error"]["code"], 1004, "resp: {resp}");
+    shutdown(b).await;
+}
+
+// ---------- registry-generated kind tools (mcp-registry-tools) ----------
+
+/// Every registered kind advertises its generated create/update pair
+/// through the same `tools/list` as the static surface, with typed param
+/// schemas derived from the field schema (number -> number, date -> ISO
+/// string; create requires the kind's required fields).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kind_tools_advertise_with_typed_param_schemas() {
+    let b = boot(McpConfig::default()).await;
+    let resp = rpc(&b, "tools/list", serde_json::json!({})).await;
+    let tools = resp["result"]["tools"].as_array().expect("tools array");
+    let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    for expected in [
+        "create_story", "update_story",
+        "create_task", "update_task",
+        "create_epic", "update_epic",
+        "create_sprint", "update_sprint",
+        "create_plan", "update_plan",
+    ] {
+        assert!(names.contains(&expected), "missing {expected} in {names:?}");
+    }
+    let schema_of = |name: &str| -> &serde_json::Value {
+        &tools.iter().find(|t| t["name"] == name).unwrap()["inputSchema"]
+    };
+    // create_sprint: rel_path + body + the kind's typed fields; required
+    // carries rel_path plus the schema's `required = true` fields.
+    let create_sprint = schema_of("create_sprint");
+    let props = &create_sprint["properties"];
+    assert_eq!(props["rel_path"]["type"], "string");
+    assert_eq!(props["start"]["type"], "string");
+    assert_eq!(props["start"]["format"], "date");
+    assert_eq!(props["goal"]["type"], "string");
+    let required: Vec<&str> = create_sprint["required"]
+        .as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+    assert_eq!(required, vec!["rel_path", "start", "end"]);
+    // create_story: numbers are JSON numbers; nothing required beyond path.
+    let create_story = schema_of("create_story");
+    assert_eq!(create_story["properties"]["priority"]["type"], "number");
+    assert_eq!(
+        create_story["required"].as_array().unwrap().len(),
+        1,
+        "story has no required fields: {create_story}"
+    );
+    // update_* has no body param and only rel_path required.
+    let update_sprint = schema_of("update_sprint");
+    assert!(update_sprint["properties"]["body"].is_null());
+    let required: Vec<&str> = update_sprint["required"]
+        .as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+    assert_eq!(required, vec!["rel_path"]);
+    shutdown(b).await;
+}
+
+/// Direct mode: create writes a typed-frontmatter note to disk; update
+/// merges fields through the frontmatter path; a wrong-kind target refuses
+/// to retype.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kind_tools_create_update_round_trip_direct() {
+    let cfg = McpConfig {
+        tools: McpToolsConfig { review_required: false, ..McpToolsConfig::default() },
+        ..McpConfig::default()
+    };
+    let b = boot(cfg).await;
+
+    let resp = call_tool(&b, "create_story", serde_json::json!({
+        "rel_path": "work/login.md",
+        "priority": 2,
+        "due": "2026-07-01",
+        "body": "# Login story\n",
+    })).await;
+    let s = structured(&resp);
+    assert!(s["status"].is_null(), "direct write, not staged: {resp}");
+    let on_disk = std::fs::read_to_string(b.td.path().join("work/login.md")).unwrap();
+    assert!(on_disk.contains("kind: story"), "{on_disk}");
+    assert!(on_disk.contains("priority: 2"), "{on_disk}");
+    assert!(on_disk.contains("2026-07-01"), "{on_disk}");
+    assert!(on_disk.ends_with("# Login story\n"), "{on_disk}");
+
+    // Creating over an existing path refuses (use update_<kind>).
+    let resp = call_tool(&b, "create_story", serde_json::json!({
+        "rel_path": "work/login.md",
+    })).await;
+    assert_eq!(resp["error"]["code"], -32602, "resp: {resp}");
+
+    // Update merges typed fields into the existing frontmatter.
+    let resp = call_tool(&b, "update_story", serde_json::json!({
+        "rel_path": "work/login.md",
+        "priority": 5,
+    })).await;
+    assert!(structured(&resp)["status"].is_null(), "resp: {resp}");
+    let on_disk = std::fs::read_to_string(b.td.path().join("work/login.md")).unwrap();
+    assert!(on_disk.contains("priority: 5"), "{on_disk}");
+    assert!(on_disk.contains("2026-07-01"), "merge keeps siblings: {on_disk}");
+
+    // A target of another kind errors rather than silently retyping.
+    let resp = call_tool(&b, "update_sprint", serde_json::json!({
+        "rel_path": "work/login.md",
+        "goal": "nope",
+    })).await;
+    assert_eq!(resp["error"]["code"], -32602, "resp: {resp}");
+    assert!(
+        resp["error"]["message"].as_str().unwrap().contains("retype"),
+        "resp: {resp}"
+    );
+    // Updating a missing note is 1002.
+    let resp = call_tool(&b, "update_story", serde_json::json!({
+        "rel_path": "work/missing.md",
+        "priority": 1,
+    })).await;
+    assert_eq!(resp["error"]["code"], 1002, "resp: {resp}");
+    shutdown(b).await;
+}
+
+/// Review mode: both halves of the pair stage a layered-doc pending proposal —
+/// the same staged path every other write tool rides — and disk stays
+/// unchanged until the user accepts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kind_tools_stage_when_review_required() {
+    let b = boot(McpConfig::default()).await; // review_required defaults true
+
+    let resp = call_tool(&b, "create_story", serde_json::json!({
+        "rel_path": "work/staged.md",
+        "priority": 1,
+    })).await;
+    let s = structured(&resp);
+    assert_eq!(s["status"], "staged", "resp: {resp}");
+    assert!(s["proposal_id"].as_str().is_some(), "resp: {resp}");
+    // The layered-doc whole-file-create staging path seeds an EMPTY .md on disk
+    // (the same `LayeredDoc::create_document` behavior `board_create` documents);
+    // the staged typed content itself must not land until the user accepts.
+    let on_disk =
+        std::fs::read_to_string(b.td.path().join("work/staged.md")).unwrap_or_default();
+    assert!(on_disk.is_empty(), "staged content must not reach disk: {on_disk}");
+
+    // Update against an existing note stages too.
+    std::fs::write(
+        b.td.path().join("existing.md"),
+        "---\nhiker:\n  kind: story\n---\nbody\n",
+    )
+    .unwrap();
+    let resp = call_tool(&b, "update_story", serde_json::json!({
+        "rel_path": "existing.md",
+        "priority": 4,
+    })).await;
+    assert_eq!(structured(&resp)["status"], "staged", "resp: {resp}");
+    let on_disk = std::fs::read_to_string(b.td.path().join("existing.md")).unwrap();
+    assert!(!on_disk.contains("priority"), "disk must be unchanged: {on_disk}");
+    shutdown(b).await;
+}
+
+/// The boundary is strict even though on-disk validation is lenient:
+/// malformed dates, non-number numbers, and unknown fields are
+/// `invalid_params`; the family toggle (and the writes master gate)
+/// answers `1004 disabled`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kind_tools_strict_boundary_and_family_toggle() {
+    let cfg = McpConfig {
+        tools: McpToolsConfig { review_required: false, ..McpToolsConfig::default() },
+        ..McpConfig::default()
+    };
+    let b = boot(cfg).await;
+
+    let bad_date = call_tool(&b, "create_story", serde_json::json!({
+        "rel_path": "a.md", "due": "someday",
+    })).await;
+    assert_eq!(bad_date["error"]["code"], -32602, "resp: {bad_date}");
+    let bad_number = call_tool(&b, "create_story", serde_json::json!({
+        "rel_path": "a.md", "priority": "high",
+    })).await;
+    assert_eq!(bad_number["error"]["code"], -32602, "resp: {bad_number}");
+    let unknown_field = call_tool(&b, "create_story", serde_json::json!({
+        "rel_path": "a.md", "points": 3,
+    })).await;
+    assert_eq!(unknown_field["error"]["code"], -32602, "resp: {unknown_field}");
+    let missing_required = call_tool(&b, "create_sprint", serde_json::json!({
+        "rel_path": "s.md", "start": "2026-07-01",
+    })).await;
+    assert_eq!(missing_required["error"]["code"], -32602, "resp: {missing_required}");
+    // Nothing reached disk through any of the rejected calls.
+    assert!(!b.td.path().join("a.md").exists());
+    shutdown(b).await;
+
+    // Family toggle off -> 1004 for the whole generated family.
+    let cfg = McpConfig {
+        tools: McpToolsConfig {
+            review_required: false,
+            kind_tools_enabled: false,
+            ..McpToolsConfig::default()
+        },
+        ..McpConfig::default()
+    };
+    let b = boot(cfg).await;
+    let resp = call_tool(&b, "create_story", serde_json::json!({ "rel_path": "a.md" })).await;
+    assert_eq!(resp["error"]["code"], 1004, "resp: {resp}");
+    // The master writes gate covers the family too.
+    let cfg = McpConfig {
+        tools: McpToolsConfig {
+            review_required: false,
+            writes_enabled: false,
+            ..McpToolsConfig::default()
+        },
+        ..McpConfig::default()
+    };
+    let b2 = boot(cfg).await;
+    let resp = call_tool(&b2, "update_story", serde_json::json!({
+        "rel_path": "a.md", "priority": 1,
+    })).await;
+    assert_eq!(resp["error"]["code"], 1004, "resp: {resp}");
+    shutdown(b).await;
+    shutdown(b2).await;
 }

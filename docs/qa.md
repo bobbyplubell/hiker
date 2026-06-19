@@ -23,6 +23,8 @@ Three layers, in build order:
 ```
 
 **The eval runner lives in the same external Python tool** (`tools/eval-synth/`) that generates synthetic corpora — gen + scoring + reporting in one place. The tool calls into hiker for retrieval via a small CLI primitive (`hiker query <q>` initially) or via MCP once that's real (post-v3). Hiker doesn't grow a `hiker eval` subcommand. [eval-golden-set]
+status:: planned
+note:: `vault/.hiker/eval.yaml` + `hiker eval`
 
 The tool runs `related_notes(source)` for each entry and checks whether expected paths appear in top-k. Reports:
 
@@ -37,6 +39,8 @@ The eval file lives in the vault by default. User decides whether to commit it v
 ### 2. Live thumbs feedback (add when v1 panel ships)
 
 Each row in the related-notes panel gets a 👍 / 👎. Clicks append to `vault/.hiker/feedback.jsonl`: [eval-thumbs-feedback]
+status:: planned
+note:: per-row up/down → feedback.jsonl
 
 ```jsonl
 {"source": "...", "hit": "...", "rank": 2, "verdict": "up", "ts": 1747000000}
@@ -52,6 +56,8 @@ The same data shape feeds the curated-tree reconcile flow when that lands — a 
 ### 3. Sanity dashboards (cheap, catches "is it broken")
 
 `hiker stats` subcommand prints: [eval-sanity-stats]
+status:: planned
+note:: chunk-distribution, mean top-1 sim, orphans, mutual-top-1
 
 - Distribution of chunks-per-note (huge tail = chunker pathology)
 - Mean / median top-1 similarity across the vault (collapsing toward 0 or saturating at 1 = embedder is broken)
@@ -64,6 +70,8 @@ Doesn't answer "is it good?" but catches "is it broken?" cheaply, and gives you 
 ## Auto-organization evaluation (curated tree, much later)
 
 Lands when curated-tree placement is built (design.md `hiker reconcile` flow). Two ground-truth sources: [eval-auto-org]
+status:: planned
+note:: manual-placement holdout + reconcile-history regression
 
 - **Manual placements** — every note with `hiker.placement: manual` is a ground-truth label for "where it should go." Eval flow: hide the placement, ask the placer where it would put the note, score = fraction of placements within ±1 tree-level of the manual choice.
 - **Reconcile-history** — `vault/.hiker/reconcile-history.yaml` already records rejected proposals. Re-running reconcile and re-proposing something previously rejected is a regression signal.
@@ -74,10 +82,14 @@ Cluster coherence as a secondary metric: per-cluster mean intra-distance vs near
 ## Synthetic corpora (bootstrap when real notes are thin)
 
 A personal vault starts empty, which means both the golden-set and the auto-org eval are starved for ground truth on day one. One way around this: generate synthetic notes across a spread of topics (e.g. ask an LLM for N notes across M domains, with intentional cross-links and near-duplicates) and use them as a seed corpus. [eval-synthetic-corpus]
+status:: planned
+note:: LLM-generated topical notes for bootstrap benchmark; implementation lives in [[spec:eval-synth-tool]] (external Python), not hiker
 
 **Implementation: external Python script, not a hiker feature.** Synthetic-corpus generation is a one-off batch workload that doesn't fit hiker's LLM strategy (`llm.md`'s one-action-one-prompt rule for non-fan-out features) and doesn't earn its keep being implemented in Rust. The tool lives at `tools/eval-synth/` as a plain Python script with a `requirements.txt` next to it (no packaging ceremony). Uses litellm for multi-provider LLM access, writes notes into a vault directory, exits. Hiker indexes the resulting notes like any other content; nothing in `core/` knows about the generator. [eval-synth-tool]
+status:: partial
+note:: v0 (`gen` subcommand) lives at `tools/eval-synth/eval-synth.py`; topic taxonomy in `topics.yaml`, prompts in `prompts/note.md` + `prompts/note-txt.md`, syntax-paste fixtures in `pastes/<kind>/`. `.md` notes stamp `hiker.provenance: synthetic-corpus` + `hiker.author: imported` per design.md authorship trichotomy. Ground-truth manifest (canonical, including `.txt`) at `<out>/.synth/manifest.jsonl`. Knobs: `--txt-rate` writes a fraction as plain `.txt` (no frontmatter, per txt-ingest.md:105 leading-`---`-is-content rule); `--paste-rate` splices fixture syntax (sql/shell/json/python/tcpdump/regex) into eligible topics — fenced in `.md`, indented/raw/inline in `.txt` to exercise txt-ingest's code-region exclusion ([[spec:txt-chunker-guardrails]]). Pathology mix (near-dup / topic-drift / very-short / very-long) at ~10%. Runner / scoring / recall@K still deferred until [[spec:cli-query]] lands
 
-**v0 scope: corpus generation only.** The first slice of `tools/eval-synth/` is just `gen` — produce N notes across a topic taxonomy, write them as `.md` files into a target vault directory. Frontmatter stamps `hiker.provenance: synthetic-corpus` so generated notes are filterable as imported (per `design.md`'s authorship trichotomy). Runner / scoring / `recall@K` reporting wait on `cli-query` (the small hiker CLI primitive `eval-synth-tool` calls to run real queries against an indexed vault) — that's separate work in the hiker repo, deferred until the corpus generator is real and there's something concrete to score against. Thumbs feedback (`eval-thumbs-feedback`) is a different feature with its own UI surface and isn't part of this script's scope.
+**v0 scope: corpus generation only.** The first slice of `tools/eval-synth/` is just `gen` — produce N notes across a topic taxonomy, write them as `.md` files into a target vault directory. Frontmatter stamps `hiker.provenance: synthetic-corpus` so generated notes are filterable as imported (per `design.md`'s authorship trichotomy). Runner / scoring / `recall@K` reporting wait on [[spec:cli-query]] (the small hiker CLI primitive [[spec:eval-synth-tool]] calls to run real queries against an indexed vault) — that's separate work in the hiker repo, deferred until the corpus generator is real and there's something concrete to score against. Thumbs feedback ([[spec:eval-thumbs-feedback]]) is a different feature with its own UI surface and isn't part of this script's scope.
 
 **Inputs/outputs (sketch).** Topic spec is a YAML file: list of topics with optional inter-topic crosslink hints. Generator's CLI shape is `eval-synth.py gen --topics topics.yaml --count 200 --out /path/to/vault [--model anthropic/claude-haiku-4-5 ...]`. Provider/model/keys via env (`ANTHROPIC_API_KEY` etc.) per litellm conventions. Prompts and topic specs check into the repo so runs are reproducible.
 

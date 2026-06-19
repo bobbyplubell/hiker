@@ -35,18 +35,55 @@ fn build_clipboard_menu() -> egui_workbench::menu::Menu<ClipboardVerb> {
         .action("Select All", ClipboardVerb::SelectAll)
 }
 
+/// Everything the editor's right-click context menu needs beyond the clipboard
+/// verbs: the optional chart / table targets the right-click landed on, plus the
+/// out-params the chosen action is written back through (applied by the caller
+/// once the editor's buffer borrow has ended). Grouped so [`attach`] stays under
+/// the argument cap. status: ctxmenu-editor-clipboard
+pub struct AttachCtx<'a> {
+    pub editor_resp: &'a egui::Response,
+    pub chart_target: Option<&'a super::widgets::chart::EditTarget>,
+    pub chart_open: &'a mut Option<super::widgets::chart::EditTarget>,
+    /// The table the right-click landed on, if any — drives the Fit ⇄ Scrollable
+    /// toggle items. status: widget-table-overflow-scroll
+    pub table_target: Option<super::widgets::tables::TableOverflowTarget>,
+    /// The live per-table overflow map, read to mark the current mode.
+    pub table_views: &'a super::widgets::tables::TableViewMap,
+    /// The `(byte_start, mode)` the user picked, written back for the caller to
+    /// apply after the borrow ends. status: widget-table-overflow-scroll
+    pub table_choice: &'a mut Option<(usize, super::widgets::tables::TableOverflow)>,
+    /// The cell the right-click landed on, if any — drives the "Edit diagram" /
+    /// "Edit cell" in-place edit item. status: widget-table-cell-edit-inplace
+    pub cell_target: Option<super::widgets::tables::cell_edit::TableCellTarget>,
+    /// The current document text, so the item can classify the cell (block →
+    /// "Edit diagram", text → "Edit cell"). status: widget-table-cell-edit-inplace
+    pub cell_doc: &'a str,
+    /// The cell to enter in-place edit on, written back for the caller to enter
+    /// after the borrow ends. status: widget-table-cell-edit-inplace
+    pub cell_edit: &'a mut Option<super::widgets::tables::cell_edit::TableCellTarget>,
+}
+
 /// Attach the editor's right-click context menu: the clipboard verbs, plus —
 /// when the right-click landed on an inline ```` ```chart ```` widget
-/// (`chart_target` is `Some`) — an "Open in chart editor" item at the top. The
-/// chosen chart target is written to `chart_open` for the caller to act on once
-/// the editor's buffer borrow has ended (opening the builder needs `&mut app`).
-/// A left click on a chart reveals its source instead (handled upstream).
-/// status: ctxmenu-editor-clipboard, chart-open-in-builder
-pub fn attach(
-    editor_resp: &egui::Response,
-    chart_target: Option<&super::widgets::chart::EditTarget>,
-    chart_open: &mut Option<super::widgets::chart::EditTarget>,
-) {
+/// (`chart_target` is `Some`) — an "Open in chart editor" item at the top, and —
+/// when it landed on a rendered pipe table (`table_target` is `Some`) — the
+/// Fit ⇄ Scrollable overflow toggle (`widget-table-overflow-scroll`). The chosen
+/// chart / table action is written to the ctx's out-params for the caller to act
+/// on once the editor's buffer borrow has ended. A left click on a chart / table
+/// reveals or edits its source instead (handled upstream).
+/// status: ctxmenu-editor-clipboard, chart-open-in-builder, widget-table-overflow-scroll
+pub fn attach(ctx: AttachCtx<'_>) {
+    let AttachCtx {
+        editor_resp,
+        chart_target,
+        chart_open,
+        table_target,
+        table_views,
+        table_choice,
+        cell_target,
+        cell_doc,
+        cell_edit,
+    } = ctx;
     let mut chosen = None;
     editor_resp.context_menu(|ui| {
         if let Some(target) = chart_target {
@@ -55,6 +92,20 @@ pub fn attach(
                 ui.close();
             }
             ui.separator();
+        }
+        // In-place cell edit (`widget-table-cell-edit-inplace`): "Edit diagram"
+        // (block cell) / "Edit cell" (text cell) — above the overflow toggle.
+        if let Some(target) = &cell_target {
+            if let Some(pick) = super::table_cell_edit::menu_item(ui, target, cell_doc) {
+                *cell_edit = Some(pick);
+            }
+        }
+        if let Some(target) = table_target {
+            if let Some(pick) =
+                super::table_overflow_menu::menu_items(ui, target, table_views)
+            {
+                *table_choice = Some(pick);
+            }
         }
         chosen = egui_workbench::menu::show(ui, build_clipboard_menu());
     });

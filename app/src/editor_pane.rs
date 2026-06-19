@@ -42,45 +42,36 @@ pub(crate) fn try_ensure_vault_buffer_loaded(
     if state.session.buffers.contains_key(rel) {
         return Ok(());
     }
-    // Open-time disk-reconcile (`op-log.md` §External-edit sync): the per-doc
-    // backstop for a change the in-session watcher dropped (a suppressed-write
-    // window, a notify-queue overflow). Fold any disk-vs-`accepted` drift in as
-    // one `author=external` op BEFORE the buffer's text is read below, so the
-    // rope and the editor binding load from the now-reconciled `accepted`. The
-    // underlying `apply_external_edit` is hash-gated: byte-identical disk is a
-    // no-op (no op minted, no rewrite), so this stays cheap on a clean open.
-    // A new path with no doc yet resolves to `Ok(false)` and is a no-op; the
-    // `ensure_doc` call below still mints its document.
-    // status: op-log-open-time-disk-reconcile
-    if let Err(e) = hiker_core::ops::op_writes::external_edit(
-        &state.vault_session.services.oplog,
-        &state.vault_session.vault,
-        rel,
-    ) {
-        tracing::warn!(path = %rel, error = %e, "op-log: open-time disk reconcile failed (non-fatal)");
-    }
+    // The former open-time disk-reconcile fold is gone (`hiker-core-rework-plan.md`
+    // WS7a): with no `.ops` frame to mint there is nothing to fold. The buffer's
+    // text is read straight off the canonical `.md` below, and the layered doc loads
+    // its `accepted` lazily from that same `.md` (`op-log-disk-canonical`), so a
+    // change made while the doc was closed is observed by construction — no
+    // reconcile pass needed.
     match state.vault_session.vault.read_file_with_hash(rel) {
         Ok((contents, hash)) => {
-            // Ensure the op log has a document for this path before the editor
+            // Ensure the layered doc has a document for this path before the editor
             // binding runs. A note created after the bootstrap walk (New Note
             // button, tree new-file, wikilink-create) has no doc yet; without
             // one the forward binding never mirrors typing into `working` and
-            // the save fails with "no op-log document". Existing files were
+            // the save fails with "no layered-doc document". Existing files were
             // seeded at vault open, so this is a no-op for them.
             if let Err(e) = hiker_core::ops::op_writes::ensure_doc(
-                &state.vault_session.services.oplog,
+                &state.vault_session.services.layered,
                 &state.vault_session.vault,
                 rel,
             ) {
                 tracing::warn!(path = %rel, error = %e, "op-log: failed to ensure document on open");
             }
             let cfg_guard = state.vault_session.config.read().ok();
-            let buf = Buffer::with_config_and_vault(
+            let code = crate::code_sources::completion_provider(state);
+            let buf = Buffer::with_config_vault_and_code(
                 rel.to_string(),
                 &contents,
                 hash,
                 cfg_guard.as_deref(),
                 Some(state.vault_session.vault.clone()),
+                Some(code),
             );
             drop(cfg_guard);
             state.session.buffers.insert(rel.to_string(), buf);
@@ -365,17 +356,18 @@ pub fn ensure_readonly_buffer_loaded(
     }
     let contents = match source {
         BufferSource::HistoryVersion { op_id, path } => {
-            // The version's content materialized from the op log at `op_id`.
-            let log = state.vault_session.services.oplog.as_ref();
-            hiker_core::ops::op_writes::content_at_op(log, path, op_id)
+            // The version's content read from the plain-file snapshot whose
+            // id (`op_id`) is the snapshot's millisecond timestamp.
+            let log = state.vault_session.services.layered.as_ref();
+            hiker_core::ops::op_writes::content_at_snapshot(log, path, op_id)
                 .ok()
                 .flatten()?
         }
         BufferSource::PendingProposal { proposal_id, target_path } => {
-            // The proposal content is the op-log pending-op materialization:
-            // `materialize(accepted + just this op)`. Read through the op-log
+            // The proposal content is the layered-doc pending-op materialization:
+            // `materialize(accepted + just this op)`. Read through the layered-doc
             // seam rather than a legacy pending store.
-            let log = state.vault_session.services.oplog.as_ref();
+            let log = state.vault_session.services.layered.as_ref();
             hiker_core::ops::op_writes::proposal_materializations(
                 log,
                 target_path,
@@ -386,6 +378,14 @@ pub fn ensure_readonly_buffer_loaded(
             .map(|(_accepted, proposed)| proposed)?
         }
         BufferSource::Trash { trash_path, .. } => std::fs::read_to_string(trash_path).ok()?,
+        BufferSource::CodeFile { path } => {
+            // Read through the vault: `read_file` resolves `path` under the
+            // vault root (path-clamped) and UTF-8-guards, so a non-text /
+            // out-of-bounds file yields `None` and the open is skipped — the
+            // same trust boundary every other read-only source honours.
+            // status: code-read-only-view
+            state.vault_session.vault.read_file(path).ok()?
+        }
         BufferSource::Vault { .. } => return None,
     };
     let cfg_guard = state.vault_session.config.read().ok();
@@ -455,6 +455,24 @@ fn navigate_to(state: &mut AppState, target: &NavTarget) {
             // re-push onto the stack.
             crate::panels::zim::restore_nav(state, zim_path, article.clone());
         }
+        NavTarget::CodeGraphNode { source, selected, scope } => {
+            // Open/focus the code-graph tab, then restore the drill location
+            // (selection + scope) on its view. `nav.locked` (set by `nav_go`)
+            // keeps the panel from re-recording this restore.
+            let _tab = crate::panels::code_graph::open(state, source.clone());
+            let key = source.key();
+            if let Some(view) = state.panels.code_graph.get_mut(&key) {
+                crate::panels::code_graph::apply_nav_target(view, selected.clone(), *scope);
+            }
+        }
+        NavTarget::VaultGraphNode { focus, scope } => {
+            // Open/focus the singleton Graph tab, then restore the focus
+            // location onto the panel (or its pending slot when the panel
+            // isn't built yet). `nav.locked` keeps `graph::show` from
+            // re-recording the restore. status: graph-nav-extract
+            crate::toolbar::open_singleton_tab(state, TabKind::Graph { focus: None, scope_query: None });
+            crate::panels::graph::apply_nav_target(state, focus.clone(), *scope);
+        }
     }
 }
 
@@ -485,6 +503,45 @@ pub fn open_trash_in_tab(state: &mut AppState, trash_path: &str, original_path: 
         return;
     }
     let kind = TabKind::trash_preview(trash_path.to_string(), original_path.to_string());
+    if let Some(prev_id) = state.session.preview_tab {
+        if let Some(tab) = state.tab_by_id_mut(prev_id) {
+            tab.kind = kind;
+            tab.sticky = false;
+        }
+        state.session.active_tab = Some(prev_id);
+        return;
+    }
+    let tab_id = state.next_tab_id();
+    state.session.tabs.push(Tab::new(tab_id, kind, false));
+    state.session.active_tab = Some(tab_id);
+    state.session.preview_tab = Some(tab_id);
+}
+
+/// Open a vault code file (`.rs`, `.py`, …) as a strictly read-only preview in
+/// the editor's preview slot (reused like a non-sticky file open). Code is
+/// read-only reference content: the buffer is a `CodeFile` source, so the
+/// autosave / layered-doc save path short-circuits it (no write ever reaches disk).
+/// Syntax-highlighted via the editor-ts decoration layer when the extension
+/// has a wired grammar (`code-syntax-highlight`). status: code-read-only-view
+pub fn open_code_file(state: &mut AppState, rel: &str) {
+    use crate::tab::BufferSource;
+    if !state.session.nav.locked {
+        nav_push(state, rel);
+    }
+    let source = BufferSource::CodeFile { path: rel.to_string() };
+    // Focus an already-open code tab for this path instead of opening a second.
+    let existing = state.session.tabs.iter().find_map(|t| {
+        matches!(&t.kind, TabKind::Editor { buffer, .. } if *buffer == source).then_some(t.id)
+    });
+    if let Some(id) = existing {
+        state.session.active_tab = Some(id);
+        return;
+    }
+    if ensure_readonly_buffer_loaded(state, &source).is_none() {
+        state.push_toast(format!("Can't open {}", rel), crate::state::ToastLevel::Error);
+        return;
+    }
+    let kind = TabKind::code_preview(rel.to_string());
     if let Some(prev_id) = state.session.preview_tab {
         if let Some(tab) = state.tab_by_id_mut(prev_id) {
             tab.kind = kind;
@@ -578,7 +635,7 @@ impl AppState {
 /// is superseded; external-edit reconciliation is handled separately by the
 /// watcher (`op_writes::external_edit`).
 ///
-/// On success, the op log records the commit (an accepted `user` op) so the
+/// On success, the layered doc records the commit (an accepted `user` op) so the
 /// status-bar version dropdown and activity feed see a snapshot.
 pub fn save_buffer(state: &mut AppState, rel: &str) -> Result<(), String> {
     let Some(buffer) = state.session.buffers.get(rel) else {
@@ -592,7 +649,7 @@ pub fn save_buffer(state: &mut AppState, rel: &str) -> Result<(), String> {
     if !buffer.is_dirty() {
         return Ok(());
     }
-    let log = &state.vault_session.services.oplog;
+    let log = &state.vault_session.services.layered;
     let Some(doc_id) = log.doc_id_for_path(rel).map_err(|e| e.to_string())? else {
         return Err(format!("no op-log document for {}", rel));
     };
@@ -602,7 +659,7 @@ pub fn save_buffer(state: &mut AppState, rel: &str) -> Result<(), String> {
     let text = buffer.current_text();
     // Path-form wikilinks (per `wikilink-path-form`) are stored as-typed —
     // no save-time normalize step. What the user typed reaches disk verbatim.
-    let log = &state.vault_session.services.oplog;
+    let log = &state.vault_session.services.layered;
     // Fidelity invariant (`op-log-binding-fidelity-invariant`): the forward
     // mirror keeps `materialize(working)` byte-equal to the editor's text, so
     // the commit folds exactly the buffer the user sees. Asserted here at Save
@@ -627,36 +684,27 @@ pub fn save_buffer(state: &mut AppState, rel: &str) -> Result<(), String> {
             }
             // Auto-reject-on-drift (`op-log-status-states`): the commit just
             // advanced `accepted`, so any pending agent op anchored to the
-            // changed region may have drifted. When `[op-log]
+            // changed region may have drifted. When `[editing]
             // auto_reject_on_drift` is set, flip those to rejected immediately.
             let auto_reject = state
                 .vault_session
                 .config
                 .read()
-                .map(|c| c.op_log.auto_reject_on_drift)
+                .map(|c| c.editing.auto_reject_on_drift)
                 .unwrap_or(false);
             if auto_reject
                 && let Err(e) = hiker_core::ops::op_writes::auto_reject_drifted(
-                    &state.vault_session.services.oplog,
+                    &state.vault_session.services.layered,
                     rel,
                     true,
                 )
             {
-                tracing::warn!(error = %e, path = %rel, "oplog: auto-reject-on-drift failed");
+                tracing::warn!(error = %e, path = %rel, "layered: auto-reject-on-drift failed");
             }
-            // Nudge enrolled peers to pull this just-committed change promptly
-            // instead of waiting for their own poll tick. Cheap, non-blocking,
-            // and a no-op when sync is off / there are no peers.
-            // status: sync-poke-on-commit
-            if let Some(sync) = &state.vault_session.services.sync {
-                sync.notify_local_change();
-            }
-            // The git transport hooks the same save trigger: a save schedules a
+            // The git transport hooks the save trigger: a save schedules a
             // debounced commit-on-save (and push, integrated mode w/ remote).
-            // Mutually exclusive with the libp2p `sync` engine above.
             // status: git-commit-on-save
             if let Some(git) = &state.vault_session.services.git_sync {
-                use hiker_sync::seam::Transport;
                 git.notify_local_change();
             }
             state.push_toast(format!("Saved {}", rel), ToastLevel::Info);
@@ -672,11 +720,11 @@ impl AppState {
 /// the drift modal.
 pub fn force_save(&mut self, rel: &str, text: &str) -> Result<(), String> {
     let state = self;
-    // Route the forced write through the op log: `user_save` applies the
+    // Route the forced write through the layered doc: `user_save` applies the
     // edit to `accepted` and writes the materialized `.md`. No drift check
     // here — the user already chose to overwrite via "Keep mine".
     hiker_core::ops::op_writes::user_save(
-        &state.vault_session.services.oplog,
+        &state.vault_session.services.layered,
         &state.vault_session.vault,
         rel,
         text,
@@ -701,12 +749,14 @@ pub fn reload_from_disk(state: &mut AppState, rel: &str) -> Result<(), String> {
         .read_file_with_hash(rel)
         .map_err(|e| e.to_string())?;
     let cfg_guard = state.vault_session.config.read().ok();
-    let buf = crate::buffer::Buffer::with_config_and_vault(
+    let code = crate::code_sources::completion_provider(state);
+    let buf = crate::buffer::Buffer::with_config_vault_and_code(
         rel.to_string(),
         &contents,
         hash,
         cfg_guard.as_deref(),
         Some(state.vault_session.vault.clone()),
+        Some(code),
     );
     drop(cfg_guard);
     state.session.buffers.insert(rel.to_string(), buf);

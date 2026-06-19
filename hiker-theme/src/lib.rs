@@ -98,6 +98,24 @@ pub const fn hover_bg() -> egui::Color32 {
     egui::Color32::from_rgb(0xea, 0xee, 0xf4)
 }
 
+/// The canonical "click acts here" hover signal (`docs/interaction.md`
+/// [hover-open-signal]): an openable row/card paints THIS wash — [`active_bg`]
+/// while the row is the active/selected item, [`hover_bg`] on hover, nothing
+/// otherwise — alongside `CursorIcon::PointingHand`. One signal per meaning:
+/// surfaces that paint their row/card background by hand route the colour
+/// decision through here instead of hand-rolling a wash, and widget-based rows
+/// inherit the same [`hover_bg`] from the installed style's
+/// `widgets.hovered.weak_bg_fill`.
+pub const fn open_signal_wash(active: bool, hovered: bool) -> Option<egui::Color32> {
+    if active {
+        Some(active_bg())
+    } else if hovered {
+        Some(hover_bg())
+    } else {
+        None
+    }
+}
+
 /// Accent colour for dirty markers, focus rings, etc.
 pub const fn accent() -> egui::Color32 {
     egui::Color32::from_rgb(0x2f, 0x6f, 0xed)
@@ -112,4 +130,74 @@ pub const fn muted() -> egui::Color32 {
 /// (stale-buffer hint, index-offline hint, tool-error chat badges).
 pub const fn warn() -> egui::Color32 {
     egui::Color32::from_rgb(0xc4, 0x86, 0x00)
+}
+
+/// Vault-graph kind palette (`vault-graph-kind-nodes`): one hue per container
+/// kind, shared by the node fill, its membership edges, and the toolbar
+/// filter labels — the toolbar doubles as the legend. Plain notes keep the
+/// engine's user-editable flat node color, so only containers live here.
+pub const fn kind_board() -> egui::Color32 {
+    egui::Color32::from_rgb(0xc9, 0x7b, 0x2a)
+}
+
+/// Trail-doc hue (see [`kind_board`]).
+pub const fn kind_trail() -> egui::Color32 {
+    egui::Color32::from_rgb(0x4c, 0xaf, 0x72)
+}
+
+/// Query-doc (smart folder) hue (see [`kind_board`]).
+pub const fn kind_query() -> egui::Color32 {
+    egui::Color32::from_rgb(0x95, 0x75, 0xcd)
+}
+
+/// Plan-doc hue (the PM root container; see [`kind_board`]).
+/// status: vault-graph-kind-nodes
+pub const fn kind_plan() -> egui::Color32 {
+    egui::Color32::from_rgb(0x3f, 0x6f, 0xb5)
+}
+
+/// Epic / list-like-kind hue, shared by the list-membership edges (see
+/// [`kind_board`]). status: vault-graph-kind-nodes
+pub const fn kind_epic() -> egui::Color32 {
+    egui::Color32::from_rgb(0x2f, 0x9e, 0x8f)
+}
+
+/// Sprint / board-like-kind hue (see [`kind_board`]).
+/// status: vault-graph-kind-nodes
+pub const fn kind_sprint() -> egui::Color32 {
+    egui::Color32::from_rgb(0xc7, 0x5b, 0x8d)
+}
+
+/// Story/task work-note hue — a typed LEAF: the hue marks the kind without
+/// the container (square) treatment (see [`kind_board`]).
+/// status: vault-graph-kind-nodes
+pub const fn kind_story() -> egui::Color32 {
+    egui::Color32::from_rgb(0x7f, 0x9a, 0xc9)
+}
+
+/// Spec-note hue: notes defining `[slug]` spec anchors, plus their
+/// `[[spec:…]]` reference edges (see [`kind_board`]).
+/// status: vault-graph-spec-edges
+pub const fn kind_spec() -> egui::Color32 {
+    egui::Color32::from_rgb(0x5b, 0x8a, 0xa6)
+}
+
+#[cfg(test)]
+mod open_signal_wash_tests {
+    use super::{active_bg, hover_bg, open_signal_wash};
+
+    /// The active/selected state outranks plain hover — a hovered active row
+    /// keeps the active treatment, never the lighter hover wash.
+    #[test]
+    fn active_beats_hover() {
+        assert_eq!(open_signal_wash(true, true), Some(active_bg()));
+        assert_eq!(open_signal_wash(true, false), Some(active_bg()));
+    }
+
+    /// Plain hover paints the standard hover wash; an idle row paints nothing.
+    #[test]
+    fn hover_paints_hover_bg_and_idle_paints_nothing() {
+        assert_eq!(open_signal_wash(false, true), Some(hover_bg()));
+        assert_eq!(open_signal_wash(false, false), None);
+    }
 }

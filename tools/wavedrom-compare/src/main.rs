@@ -87,7 +87,7 @@ const QUANT: u32 = 32;
 /// A quantized color bucket key: the bin index per channel packed into one u32.
 type Bucket = u32;
 
-fn quantize(r: u8, g: u8, b: u8) -> Bucket {
+const fn quantize(r: u8, g: u8, b: u8) -> Bucket {
     let rb = (r as u32) / QUANT;
     let gb = (g as u32) / QUANT;
     let bb = (b as u32) / QUANT;
@@ -113,7 +113,7 @@ struct Histogram {
 /// Treat near-white and near-black as "background/foreground structure" that
 /// dominates every diagram and drowns out the palette signal we care about.
 /// We keep them OUT of the palette histogram so the score reflects fills.
-fn is_structural(r: u8, g: u8, b: u8) -> bool {
+const fn is_structural(r: u8, g: u8, b: u8) -> bool {
     let near_white = r > 244 && g > 244 && b > 244;
     let near_black = r < 24 && g < 24 && b < 24;
     near_white || near_black
@@ -245,7 +245,7 @@ fn draw_label(canvas: &mut [u8], cw: u32, text: &str, x: u32, y: u32, color: [u8
 /// Minimal 5x7 bitmap font covering just the glyphs used by our labels
 /// (uppercase letters, lowercase letters, digits, and a few symbols). Each
 /// glyph is 7 rows of a 5-bit mask. Unknown chars render as a blank box.
-fn glyph5x7(ch: char) -> [u8; 7] {
+const fn glyph5x7(ch: char) -> [u8; 7] {
     match ch.to_ascii_uppercase() {
         'O' => [0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
         'U' => [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],

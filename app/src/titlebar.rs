@@ -41,8 +41,7 @@ impl AppState {
                 // replaces the old "carve empty gaps between widgets" model,
                 // which left no draggable region — and lost the controls under
                 // them — whenever the toolbar grew wide enough to fill the strip
-                // (`left_to_right` doesn't wrap). Double-click toggles maximize;
-                // pointer-down starts a 1:1 drag.
+                // (`left_to_right` doesn't wrap). Double-click toggles maximize.
                 let drag = ui.interact(
                     full,
                     ui.id().with("titlebar-drag-bg"),
@@ -51,7 +50,18 @@ impl AppState {
                 if drag.double_clicked() {
                     let max = ctx.input(|i| i.viewport().maximized).unwrap_or(false);
                     ctx.send_viewport_cmd(ViewportCommand::Maximized(!max));
-                } else if drag.is_pointer_button_down_on() {
+                } else if drag.drag_started() {
+                    // Start the OS window move only once egui resolves an actual
+                    // DRAG on the background — NOT on mere pointer-down. A press on
+                    // a button layered above still hits this full-rect background as
+                    // the *drag* target (egui returns click=button + drag=background
+                    // for overlapping widgets), so `is_pointer_button_down_on()` is
+                    // true the instant any button is pressed — firing `StartDrag`
+                    // would hand the press to the compositor and the button click
+                    // would never land (the "buttons don't click, window grabs the
+                    // cursor" regression). `drag_started()` only fires after the
+                    // pointer moves past the drag threshold, by which point a plain
+                    // click has already resolved on the button. [command-center-topbar]
                     ctx.send_viewport_cmd(ViewportCommand::StartDrag);
                 }
 

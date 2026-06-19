@@ -41,6 +41,13 @@ pub struct DecoRebuildCtx<'a> {
     pub cache: &'a mut DecorationCache,
     pub folds: &'a std::collections::HashSet<u64>,
     pub loaded_text: &'a str,
+    /// The open file's committed content at git HEAD, for the dirty-diff gutter
+    /// (`git-dirty-diff-gutter`, G4). `Some(text)` when `[git].enabled` and the
+    /// file is tracked (empty string = untracked / newly added → whole buffer
+    /// reads as added); `None` disables the dirty-diff layer entirely (git off /
+    /// no engine / lookup failed). Snapshotted off-frame by the panel like
+    /// `loaded_text`, never re-fetched per paint. status: git-dirty-diff-gutter
+    pub git_head_text: Option<&'a str>,
     pub theme: Option<&'a editor_core::theme::Theme>,
     pub live_preview: bool,
     /// When true (default), the math/widget render layer replaces source with
@@ -51,6 +58,10 @@ pub struct DecoRebuildCtx<'a> {
     /// render-txt-as-markdown flag). Gates the widget provider independently of
     /// `live_preview` (`widget-render-gating`).
     pub is_markdown: bool,
+    /// Tree-sitter language for a read-only code buffer, picked by file
+    /// extension via [`code_language_for`]; `None` for markdown / unknown
+    /// extensions (no highlighting layer). status: code-syntax-highlight
+    pub code_language: Option<editor_ts::languages::Language>,
     /// Device pixel ratio for the widget raster (`ui.ctx().pixels_per_point()`),
     /// captured before the rebuild closure runs. Part of the math-widget
     /// fingerprint so a DPI change re-renders (`widget-render-cache`).
@@ -61,6 +72,12 @@ pub struct DecoRebuildCtx<'a> {
     pub show_whitespace: bool,
     pub highlight_trailing_whitespace: bool,
     pub diff: Option<&'a diff_overlay::DiffOverlay>,
+    /// Inline git-conflict resolver overlay (`git-conflict-inline-markers`):
+    /// side tints + per-region Accept Current/Incoming/Both action rows, present
+    /// only when the buffer carries `git merge` conflict markers. Pushed last
+    /// (above the live-preview / diff layers, which are suppressed while
+    /// conflicted) so the resolver chrome sits on top of the raw markers.
+    pub conflict: Option<&'a super::conflict_overlay::ConflictOverlay>,
     /// Maps a wikilink target (ULID or name) to the note's current title for
     /// live-title rendering; `None` falls back to plain (non-clickable) link
     /// pills (read-only previews). status: wikilink-render-live-title
@@ -71,6 +88,17 @@ pub struct DecoRebuildCtx<'a> {
     /// by reference into the math/mermaid/wavedrom widget providers, which read
     /// it below the in-memory `cached!` layer. status: widget-render-disk-cache
     pub diagram_cache: Option<widgets::disk_cache::DiagramCacheCtx>,
+    /// Borrowed ephemeral per-table overflow map (`buffer.table_overflow`),
+    /// keyed by each table's byte-range start. Passed into the table provider so
+    /// a Scrollable table lays out at natural width clipped to its inset; absent
+    /// keys (the common case) render Fit. status: widget-table-overflow-scroll
+    pub table_overflow: &'a widgets::tables::TableViewMap,
+    /// The byte start of the table whose cell is in active in-place edit
+    /// (`widget-table-cell-edit-inplace`), if any. Passed into the table provider
+    /// so that table suppresses its whole-table reveal and stays rendered while a
+    /// cell edits in a popover; `None` (every host without an in-progress cell
+    /// edit) keeps the normal cursor-in reveal. status: widget-table-cell-edit-inplace
+    pub editing_table: Option<usize>,
     /// Vault-backed resolver for an inline ```` ```chart ```` block that
     /// references an external `data:` CSV, bound to the note's directory so the
     /// reference resolves the way a Hiker link does (note-relative, then vault,
@@ -79,6 +107,13 @@ pub struct DecoRebuildCtx<'a> {
     /// / embedded hosts — inline-CSV charts still render; external ones fall back
     /// to source. status: widget-chart-render
     pub chart_resolver: Option<crate::charts::VaultDataResolver>,
+    /// Vault-backed image loader for an `![alt](path)` hosted in a pipe-table
+    /// cell, bound to the note's directory so the reference resolves under the
+    /// vault sandbox (note-relative, then vault, then by-name) — the binary-bytes
+    /// counterpart to `chart_resolver`. Owned (a `Vault` clone + two strings) so
+    /// the rebuild closure doesn't borrow `app`. `None` in read-only / embedded
+    /// hosts — those image cells fall back to source. status: widget-table-render
+    pub image_resolver: Option<widgets::tables::image_loader::CellImageResolver>,
 }
 
 /// Rebuild every decoration layer for the editor against the *current* doc
@@ -98,24 +133,33 @@ pub fn rebuild_editor_layers(
         cache,
         folds,
         loaded_text,
+        git_head_text,
         theme,
         live_preview,
         render_widgets,
         is_markdown,
+        code_language,
         dpr,
         font_px,
         chunk_boundaries,
         show_whitespace,
         highlight_trailing_whitespace,
         diff,
+        conflict,
         resolve_title,
         diagram_cache,
         chart_resolver,
+        image_resolver,
+        table_overflow,
+        editing_table,
     } = ctx;
     let theme = *theme;
     let resolve_title = *resolve_title;
     let diagram_cache = diagram_cache.as_ref();
     let chart_resolver = chart_resolver.as_ref();
+    let image_resolver = image_resolver.as_ref();
+    let table_overflow: &widgets::tables::TableViewMap = table_overflow;
+    let editing_table: Option<usize> = *editing_table;
     // status: live-preview-conflict-regions-raw
     // A conflicted buffer (one whose text still carries the unified conflict
     // surface's `<<<<<<< / ======= / >>>>>>>` markers, `sync-unified-conflict-
@@ -130,55 +174,8 @@ pub fn rebuild_editor_layers(
         false
     };
     let live_preview = &live_preview;
-    // Compute the visible byte range up-front so we can scope paint-only
-    // providers to the viewport.
-    let visible = view.visible_lines();
-    let last_line = editor.doc.len_lines().saturating_sub(1);
-    let visible_start = editor.doc.line_to_byte(visible.start.min(last_line));
-    let visible_end_line = visible.end.min(last_line);
-    let visible_end = if visible_end_line + 1 < editor.doc.len_lines() {
-        editor.doc.line_to_byte(visible_end_line + 1)
-    } else {
-        editor.doc.len_bytes()
-    };
-    let visible_range = visible_start..visible_end;
-
-    // Fingerprint inputs for memoized providers. `content_id` is an Arc
-    // pointer into the rope tree — changes only on doc edits, so idle / pure
-    // scroll frames hit the cache.
-    let doc_id = editor.doc.content_id() as u64;
-    let sel = editor.selection.main().head.offset() as u64;
-    // Layers whose only cursor dependence is "is the cursor on this line?"
-    // (markdown reveal, wikilink reveal) key on the line index instead of
-    // the byte offset — otherwise a selection drag busts the cache on every
-    // byte and reparses the whole doc per frame.
-    let cursor_line = editor.doc.byte_to_line(sel as usize) as u64;
-    // Full multi-cursor selection fingerprint: the widget layer reveals per
-    // exact cursor/selection (delimiter-inclusive, all ranges), so a per-line
-    // key like `cursor_line` would miss a cursor moving within the same line
-    // into/out of a span. Order-independent XOR over every range's [start,end).
-    let sel_fp: u64 = {
-        let mut h: u64 = 0;
-        for r in editor.selection.ranges() {
-            let packed = (r.start() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                ^ (r.end() as u64).rotate_left(32);
-            h ^= packed;
-        }
-        h
-    };
-    // Inlined `folds_hash`: XOR-mix the fold ids in an order-independent
-    // way. Cheap and stable for memoization keys (HashSet iteration order
-    // isn't deterministic).
-    let folds_id: u64 = {
-        let mut h: u64 = 0;
-        for &id in folds.iter() {
-            h ^= id.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        }
-        h
-    };
-    let vp_lo = visible_start as u64;
-    let vp_hi = visible_end as u64;
-    let vp_fp = mix(vp_lo, vp_hi);
+    let LayerKeys { visible_range, doc_id, sel, cursor_line, sel_fp, folds_id, vp_fp } =
+        layer_keys(editor, view, folds);
 
     crate::profile_scope!("rebuild decorations");
     view.decorations.clear();
@@ -244,6 +241,37 @@ pub fn rebuild_editor_layers(
     cached!(index_diff, mix(doc_id, loaded_fp), || {
         editor.index_diff_decorations(loaded_text)
     });
+
+    // Dirty-diff gutter vs git HEAD (`git-dirty-diff-gutter`, G4). Same
+    // diff→gutter-marker shape as `index_diff` but the *before* side is the
+    // committed text at HEAD (`git show HEAD:<path>`), snapshotted off-frame on
+    // the buffer. Present only when `[git].enabled` + the file is tracked (the
+    // panel leaves `git_head_text` `None` otherwise). Cached on (doc id, the
+    // HEAD snapshot's ptr+len fingerprint) so it recomputes only when the buffer
+    // edits or the HEAD snapshot is refreshed — never per paint.
+    //
+    // NOTE (editor boundary): these decorations carry `GutterMarker::Diff*`,
+    // which the egui widget's `paint_gutter` does not yet read — so they are
+    // computed + wired here but not painted as a VSCode-style gutter strip until
+    // `editor-egui` is taught to render `LineStyle.gutter_marker`. See the
+    // module doc in `dirty_diff.rs`. Factored into a helper to keep this driver
+    // under the per-function length budget.
+    if let Some(head) = git_head_text {
+        push_git_diff_layer(view, &mut cache.git_diff, editor, doc_id, head);
+    }
+
+    // Tree-sitter syntax marks for code buffers (`code-syntax-highlight`).
+    // Keyed on doc id alone: code buffers are read-only reference content
+    // (`code-read-vs-write`), so this is one full parse per open, then pure
+    // cache hits. Whole-doc (not viewport-scoped) so scrolling never reparses.
+    if let Some(lang) = code_language {
+        let lang = *lang;
+        cached!(ts_syntax, doc_id, || {
+            let bundle = editor_ts::languages::bundle(lang);
+            let ts = editor_ts::parsing::parse(&bundle, &editor.doc.to_string());
+            editor_ts::highlight::ts_decorations(editor, &ts, theme)
+        });
+    }
 
     // markdown / fold / fold emit Line decorations with
     // `hide: true` or `height_scale`, so they go through `push_with_heights`
@@ -331,7 +359,8 @@ pub fn rebuild_editor_layers(
         let math_fp = mix(
             mix(
                 reveal_fp(&spans.math_inline, |r| {
-                    widgets::line_active(editor, r) || widgets::selection_overlaps(editor, r)
+                    widgets::placement::line_active(editor, r)
+                        || widgets::placement::selection_overlaps(editor, r)
                 }),
                 reveal_fp(&spans.math_display, |r| reveal(editor, r)),
             ),
@@ -363,8 +392,25 @@ pub fn rebuild_editor_layers(
         // + per-family reveal key; emits `hide` lines + a `BlockWidget` per table
         // (painted from a `paint_list`, no raster), so it goes through
         // `push_with_heights`. status: widget-table-render
-        cached!(table_widget, mix(doc_id, table_fp),
-            || widgets::tables::table_widget_decorations(editor, theme, None, font_px, dpr),
+        // `editing_table` rides the fingerprint so entering / leaving an in-place
+        // cell edit re-runs the provider (toggling that table's reveal
+        // suppression). status: widget-table-cell-edit-inplace
+        let edit_fp = editing_table.map_or(0, |s| s as u64 ^ 0x9E37_79B9);
+        cached!(table_widget,
+            mix(doc_id, mix(table_fp, mix(table_overflow_fp(table_overflow), edit_fp))),
+            || widgets::tables::table_widget_decorations(
+                editor,
+                theme,
+                None,
+                widgets::tables::TableProviderInputs {
+                    font_px,
+                    dpr,
+                    cache: diagram_cache,
+                    images: image_resolver,
+                    views: Some(table_overflow),
+                    editing_table,
+                },
+            ),
             heights);
         // Rendered chart widgets (`widget-chart-render`). Same gate + per-family
         // reveal key; emits `hide` lines + a `BlockWidget` per ```chart fence, so
@@ -421,6 +467,15 @@ pub fn rebuild_editor_layers(
         view.decorations.push_with_heights(ov.decorations.clone());
     }
 
+    // Inline git-conflict resolver (`git-conflict-inline-markers`): side tints +
+    // per-region Accept Current/Incoming/Both action rows. Pushed after the diff
+    // overlay (a conflicted buffer's live-preview layers are already suppressed
+    // above) and through `push_with_heights` because each region's ActionRow is a
+    // Block entry that reserves space in the line-height map.
+    if let Some(cv) = conflict {
+        view.decorations.push_with_heights(cv.decorations.clone());
+    }
+
     // Find-in-note match highlights (`editor-find-in-note`). Pure
     // paint layer driven off `view.search`; recomputed each frame
     // because the match list is small and the call is gated on
@@ -447,13 +502,114 @@ pub fn rebuild_editor_layers(
     }, vp_scoped);
 }
 
+/// Build + push the dirty-diff gutter layer (`git-dirty-diff-gutter`, G4):
+/// diff the live buffer against its committed text at git HEAD (`head`) and
+/// emit a `GutterMarker::Diff*` per changed line. Cached on `(doc id, HEAD
+/// snapshot ptr+len)` in `slot` so it recomputes only on a doc edit or a HEAD
+/// refresh, never per paint. Factored out of [`rebuild_editor_layers`] to keep
+/// that driver under the per-function length budget.
+fn push_git_diff_layer(
+    view: &mut editor_view::viewport::ViewState,
+    slot: &mut Option<crate::buffer::CachedDeco>,
+    editor: &editor_core::state::Editor,
+    doc_id: u64,
+    head: &str,
+) {
+    let head_fp = mix(head.as_ptr() as u64, head.len() as u64);
+    let set = DecorationCache::get_or_compute(slot, mix(doc_id, head_fp), || {
+        let working = editor.doc.to_string();
+        let markers = super::dirty_diff::line_markers(head, &working);
+        super::dirty_diff::marker_decorations(&editor.doc, &markers)
+    });
+    view.decorations.push(set);
+}
+
+/// The cache-key ingredients every decoration layer mixes into its slot
+/// fingerprint: the visible byte range plus the doc / selection / cursor-line /
+/// fold / viewport fingerprints. Computed once per rebuild (the *keying* step,
+/// distinct from the layer pushes that consume it) so each `cached!` line stays
+/// a single `mix(..)` expression.
+struct LayerKeys {
+    visible_range: std::ops::Range<usize>,
+    doc_id: u64,
+    sel: u64,
+    cursor_line: u64,
+    sel_fp: u64,
+    folds_id: u64,
+    vp_fp: u64,
+}
+
+/// Compute the [`LayerKeys`] for this frame's decoration rebuild.
+fn layer_keys(
+    editor: &editor_core::state::Editor,
+    view: &editor_view::viewport::ViewState,
+    folds: &std::collections::HashSet<u64>,
+) -> LayerKeys {
+    // Compute the visible byte range up-front so we can scope paint-only
+    // providers to the viewport.
+    let visible = view.visible_lines();
+    let last_line = editor.doc.len_lines().saturating_sub(1);
+    let visible_start = editor.doc.line_to_byte(visible.start.min(last_line));
+    let visible_end_line = visible.end.min(last_line);
+    let visible_end = if visible_end_line + 1 < editor.doc.len_lines() {
+        editor.doc.line_to_byte(visible_end_line + 1)
+    } else {
+        editor.doc.len_bytes()
+    };
+
+    // Fingerprint inputs for memoized providers. `content_id` is an Arc
+    // pointer into the rope tree — changes only on doc edits, so idle / pure
+    // scroll frames hit the cache.
+    let doc_id = editor.doc.content_id() as u64;
+    let sel = editor.selection.main().head.offset() as u64;
+    // Layers whose only cursor dependence is "is the cursor on this line?"
+    // (markdown reveal, wikilink reveal) key on the line index instead of
+    // the byte offset — otherwise a selection drag busts the cache on every
+    // byte and reparses the whole doc per frame.
+    let cursor_line = editor.doc.byte_to_line(sel as usize) as u64;
+    // Full multi-cursor selection fingerprint: the widget layer reveals per
+    // exact cursor/selection (delimiter-inclusive, all ranges), so a per-line
+    // key like `cursor_line` would miss a cursor moving within the same line
+    // into/out of a span. Order-independent XOR over every range's [start,end).
+    let sel_fp: u64 = {
+        let mut h: u64 = 0;
+        for r in editor.selection.ranges() {
+            let packed = (r.start() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                ^ (r.end() as u64).rotate_left(32);
+            h ^= packed;
+        }
+        h
+    };
+    // Inlined `folds_hash`: XOR-mix the fold ids in an order-independent
+    // way. Cheap and stable for memoization keys (HashSet iteration order
+    // isn't deterministic).
+    let folds_id: u64 = {
+        let mut h: u64 = 0;
+        for &id in folds.iter() {
+            h ^= id.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+        h
+    };
+    let vp_fp = mix(visible_start as u64, visible_end as u64);
+    LayerKeys {
+        visible_range: visible_start..visible_end,
+        doc_id,
+        sel,
+        cursor_line,
+        sel_fp,
+        folds_id,
+        vp_fp,
+    }
+}
+
 /// The block-widget reveal predicate shared by every diagram family except
 /// inline math: the span shows its source (no in-place widget) when the cursor
 /// sits anywhere inside its byte range or any selection overlaps it. Mirrors the
 /// providers in `widgets/mod.rs` exactly, so a reveal flip the fingerprint sees
 /// is the same flip that changes the layer's output.
 fn reveal(state: &editor_core::state::Editor, range: &std::ops::Range<usize>) -> bool {
-    widgets::cursor_inside(state, range) || widgets::selection_overlaps(state, range)
+    widgets::placement::cursor_inside(state, range)
+        || widgets::placement::selection_overlaps(state, range)
 }
 
 /// Order-independent fingerprint of the *revealed* subset of `spans`. XOR-mixes
@@ -477,6 +633,31 @@ fn reveal_fp(
     h
 }
 
+/// Fingerprint the ephemeral per-table overflow map so a Fit ⇄ Scrollable
+/// toggle (or an inset scroll) busts the cached table-widget layer and the grid
+/// re-lays out at the new mode / offset. Order-independent (XOR-folded) over each
+/// `(table byte start, mode discriminant, quantized h_offset)`; an empty map
+/// (every table Fit) hashes to 0, leaving the common case's key unchanged.
+/// status: widget-table-overflow-scroll
+fn table_overflow_fp(views: &widgets::tables::TableViewMap) -> u64 {
+    let mut h: u64 = 0;
+    for (start, v) in views {
+        let mode = match v.mode {
+            widgets::tables::TableOverflow::Fit => 0u64,
+            widgets::tables::TableOverflow::Scrollable => 1u64,
+        };
+        // Quantize the offset to whole points so sub-pixel jitter doesn't churn
+        // the cache; a 1pt scroll step is finer than the eye needs anyway.
+        let off = v.h_offset.round() as i64 as u64;
+        let packed = (*start as u64)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ mode.rotate_left(1)
+            ^ off.rotate_left(20);
+        h ^= packed;
+    }
+    h
+}
+
 /// Combine multiple u64 values into a single fingerprint via splitmix-style
 /// hashing. Order-dependent.
 const fn mix(seed: u64, x: u64) -> u64 {
@@ -484,6 +665,21 @@ const fn mix(seed: u64, x: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
+}
+
+/// The tree-sitter highlight language for a buffer path, by extension —
+/// `None` for markdown / unknown extensions (those get no ts layer). Only
+/// languages whose grammar is wired in `editor-ts` (`lang-*` features on the
+/// app dep) appear here. status: code-syntax-highlight
+pub fn code_language_for(path: &str) -> Option<editor_ts::languages::Language> {
+    let (_, ext) = path.rsplit_once('.')?;
+    if ext.eq_ignore_ascii_case("rs") {
+        Some(editor_ts::languages::Language::Rust)
+    } else if ext.eq_ignore_ascii_case("py") {
+        Some(editor_ts::languages::Language::Python)
+    } else {
+        None
+    }
 }
 
 /// Decoration-layer methods that hang off an `Editor` rather than

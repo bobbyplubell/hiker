@@ -95,16 +95,6 @@ impl EligibleKey {
                 .as_f64()
                 .map(|f| (0.25..=10.0).contains(&f))
                 .unwrap_or(false),
-            (ValueType::CompactThreshold, J::Number(n)) => n
-                .as_f64()
-                .map(|f| (1.0..=64.0).contains(&f))
-                .unwrap_or(false),
-            (ValueType::SyncMode, J::String(s)) => {
-                matches!(s.as_str(), "peer" | "server" | "both")
-            }
-            (ValueType::SyncTransport, J::String(s)) => {
-                matches!(s.as_str(), "libp2p" | "git" | "none")
-            }
             (ValueType::GitMode, J::String(s)) => {
                 matches!(s.as_str(), "integrated" | "manual")
             }
@@ -243,14 +233,6 @@ pub(super) enum ValueType {
     MinimapBarGap,
     /// Editor scroll-wheel multiplier: `0.25..=10.0`.
     ScrollSpeed,
-    /// `[op-log] compact_threshold` — vestigial size multiple over the
-    /// materialized content size that once triggered compaction. `1.0..=64.0`
-    /// (a multiple below 1.0 would compact constantly).
-    CompactThreshold,
-    /// `peer | server | both` for `[sync] mode`. status: sync-config-section.
-    SyncMode,
-    /// `libp2p | git | none` for `[sync] transport`. status: sync-transport-seam.
-    SyncTransport,
     /// `integrated | manual` for `[git] mode`. status: git-config-section.
     GitMode,
 }
@@ -350,8 +332,6 @@ pub(super) const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "llm.provider.base_url",            ty: ValueType::String },
     EligibleKey { path: "llm.limits.max_tokens",            ty: ValueType::PositiveInt },
     EligibleKey { path: "llm.limits.timeout_secs",          ty: ValueType::PositiveInt },
-    EligibleKey { path: "llm.agent.iteration_cap",          ty: ValueType::PositiveInt },
-    EligibleKey { path: "llm.agent.tool_timeout_secs",      ty: ValueType::PositiveInt },
     EligibleKey { path: "llm.audit.log_full_prompt",        ty: ValueType::Bool },
     // [tasks] section. Per-vault override: every key is eligible at
     // vault scope per `task-queue-settings-section`.
@@ -359,7 +339,6 @@ pub(super) const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "tasks.terminal_retention_secs",    ty: ValueType::PositiveInt },
     EligibleKey { path: "tasks.direct_worker.enabled",      ty: ValueType::Bool },
     EligibleKey { path: "tasks.direct_worker.parallelism",  ty: ValueType::PositiveInt },
-    EligibleKey { path: "tasks.expose_to_chat_agent",       ty: ValueType::Bool },
     EligibleKey { path: "tasks.lease.default_secs",         ty: ValueType::PositiveInt },
     EligibleKey { path: "tasks.lease.max_secs",             ty: ValueType::PositiveInt },
     // status: mcp-settings-ui-section
@@ -395,6 +374,8 @@ pub(super) const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "mcp.tools.board_rename_column_enabled",ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.board_reorder_column_enabled",ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.board_delete_column_enabled",ty: ValueType::Bool },
+    // status: mcp-registry-tools
+    EligibleKey { path: "mcp.tools.kind_tools_enabled",     ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.task_checkout_enabled",  ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.task_submit_enabled",    ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.task_fail_enabled",      ty: ValueType::Bool },
@@ -404,42 +385,24 @@ pub(super) const ELIGIBLE_VAULT: &[EligibleKey] = &[
     EligibleKey { path: "mcp.audit.log_full_input",         ty: ValueType::Bool },
     // status: agent-write-review-mode
     EligibleKey { path: "llm.background.review_required",   ty: ValueType::Bool },
-    // ACP section. The agent can be overridden per vault.
-    // Also eligible at user scope for a global default.
-    EligibleKey { path: "acp.command",                      ty: ValueType::String },
     // status: op-log-config-section
-    EligibleKey { path: "op-log.metadata_retention_days",   ty: ValueType::PositiveInt },
-    EligibleKey { path: "op-log.rejected_retention_days",   ty: ValueType::PositiveInt },
-    EligibleKey { path: "op-log.auto_reject_on_drift",      ty: ValueType::Bool },
-    EligibleKey { path: "op-log.review_required",           ty: ValueType::Bool },
-    EligibleKey { path: "op-log.compact_threshold",         ty: ValueType::CompactThreshold },
-    // status: sync-config-section
-    // [sync] is per-vault — the config lives in the vault TOML per
-    // docs/sync.md §`[sync]` config section. Secrets (the per-vault
-    // content key + per-device private key) are user-scope and never
-    // appear here — the same posture as `[llm].api_key`.
-    EligibleKey { path: "sync.enabled",                     ty: ValueType::Bool },
-    // status: sync-transport-seam
-    EligibleKey { path: "sync.transport",                   ty: ValueType::SyncTransport },
-    EligibleKey { path: "sync.mode",                        ty: ValueType::SyncMode },
-    EligibleKey { path: "sync.server_url",                  ty: ValueType::String },
-    EligibleKey { path: "sync.discovery",                   ty: ValueType::Bool },
-    EligibleKey { path: "sync.devices",                     ty: ValueType::StringArray },
-    // status: sync-device-name
-    // THIS device's self-set human name (vault scope, carried on the sync
-    // handshake). The learned `device_names` peer map is populated at runtime
-    // from handshakes (seeded from config), not user-set, so it is not an
-    // eligible write key.
-    EligibleKey { path: "sync.device_name",                 ty: ValueType::String },
+    EligibleKey { path: "editing.metadata_retention_days",   ty: ValueType::PositiveInt },
+    EligibleKey { path: "editing.rejected_retention_days",   ty: ValueType::PositiveInt },
+    EligibleKey { path: "editing.auto_reject_on_drift",      ty: ValueType::Bool },
+    EligibleKey { path: "editing.review_required",           ty: ValueType::Bool },
+    // status: plain-file-snapshots
+    EligibleKey { path: "history.max_snapshots",            ty: ValueType::NonNegativeInt },
+    EligibleKey { path: "history.max_age_days",             ty: ValueType::NonNegativeInt },
     // status: git-config-section
-    // [git] is per-vault — configures the git transport when
-    // `[sync].transport = "git"`. Credentials never live here (the user's git
-    // credential helper / SSH agent supplies them), so no secret keys appear.
+    // [git] is per-vault — configures the optional, user-driven git integration
+    // (the VSCode model). `enabled` opts the vault in. Credentials never live
+    // here (the user's git credential helper / SSH agent supplies them), so no
+    // secret keys appear.
+    EligibleKey { path: "git.enabled",                      ty: ValueType::Bool },
     EligibleKey { path: "git.mode",                         ty: ValueType::GitMode },
     EligibleKey { path: "git.remote",                       ty: ValueType::String },
     EligibleKey { path: "git.auto_commit",                  ty: ValueType::Bool },
     EligibleKey { path: "git.commit_debounce_ms",           ty: ValueType::NonNegativeInt },
-    EligibleKey { path: "git.gc_interval_days",             ty: ValueType::NonNegativeInt },
     // status: triage-review-required
     EligibleKey { path: "suggestions.triage.review_required", ty: ValueType::Bool },
     EligibleKey { path: "suggestions.triage.scope",           ty: ValueType::String },
@@ -482,8 +445,6 @@ pub(super) const ELIGIBLE_USER: &[EligibleKey] = &[
     EligibleKey { path: "llm.provider.base_url",            ty: ValueType::String },
     EligibleKey { path: "llm.limits.max_tokens",            ty: ValueType::PositiveInt },
     EligibleKey { path: "llm.limits.timeout_secs",          ty: ValueType::PositiveInt },
-    EligibleKey { path: "llm.agent.iteration_cap",          ty: ValueType::PositiveInt },
-    EligibleKey { path: "llm.agent.tool_timeout_secs",      ty: ValueType::PositiveInt },
     EligibleKey { path: "llm.audit.log_full_prompt",        ty: ValueType::Bool },
     // worker_preference is also valid at user scope (per `task-queue.md`'s
     // settings eligibility note); the rest of `[tasks]` is vault-only.
@@ -518,6 +479,8 @@ pub(super) const ELIGIBLE_USER: &[EligibleKey] = &[
     EligibleKey { path: "mcp.tools.board_rename_column_enabled",ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.board_reorder_column_enabled",ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.board_delete_column_enabled",ty: ValueType::Bool },
+    // status: mcp-registry-tools
+    EligibleKey { path: "mcp.tools.kind_tools_enabled",     ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.task_checkout_enabled",  ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.task_submit_enabled",    ty: ValueType::Bool },
     EligibleKey { path: "mcp.tools.task_fail_enabled",      ty: ValueType::Bool },
@@ -527,14 +490,14 @@ pub(super) const ELIGIBLE_USER: &[EligibleKey] = &[
     EligibleKey { path: "mcp.audit.log_full_input",         ty: ValueType::Bool },
     // status: agent-write-review-mode
     EligibleKey { path: "llm.background.review_required",   ty: ValueType::Bool },
-    // ACP section. Also eligible at user scope for a global default.
-    EligibleKey { path: "acp.command",                      ty: ValueType::String },
     // status: op-log-config-section
-    EligibleKey { path: "op-log.metadata_retention_days",   ty: ValueType::PositiveInt },
-    EligibleKey { path: "op-log.rejected_retention_days",   ty: ValueType::PositiveInt },
-    EligibleKey { path: "op-log.auto_reject_on_drift",      ty: ValueType::Bool },
-    EligibleKey { path: "op-log.review_required",           ty: ValueType::Bool },
-    EligibleKey { path: "op-log.compact_threshold",         ty: ValueType::CompactThreshold },
+    EligibleKey { path: "editing.metadata_retention_days",   ty: ValueType::PositiveInt },
+    EligibleKey { path: "editing.rejected_retention_days",   ty: ValueType::PositiveInt },
+    EligibleKey { path: "editing.auto_reject_on_drift",      ty: ValueType::Bool },
+    EligibleKey { path: "editing.review_required",           ty: ValueType::Bool },
+    // status: plain-file-snapshots
+    EligibleKey { path: "history.max_snapshots",            ty: ValueType::NonNegativeInt },
+    EligibleKey { path: "history.max_age_days",             ty: ValueType::NonNegativeInt },
     // status: triage-review-required
     EligibleKey { path: "suggestions.triage.review_required", ty: ValueType::Bool },
     EligibleKey { path: "suggestions.triage.scope",           ty: ValueType::String },

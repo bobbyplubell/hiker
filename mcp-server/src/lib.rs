@@ -14,7 +14,6 @@
 //! Handle is dropped at vault close — the cancellation token tears the
 //! task down and removes the discovery file.
 
-pub mod agent_bridge;
 pub mod audit;
 pub mod discovery;
 pub mod handler;
@@ -82,19 +81,23 @@ pub struct McpDeps {
     /// `1004 disabled` rather than letting external agents check work
     /// out that no one will drain.
     pub llm_enabled: bool,
-    /// The vault's op log, when open. Threaded into `HikerState` so the
+    /// The vault's layered doc, when open. Threaded into `HikerState` so the
     /// write tools queue agent edits into the pending queue
     /// (`op-log-ops-producer-helpers`). Review-mode writes stage a pending
     /// op the user accepts/rejects in the hiker UI.
     ///
     /// status: agent-write-review-mode
-    pub oplog: Option<Arc<hiker_core::oplog::OpLog>>,
+    pub layered: Option<Arc<hiker_core::editing::LayeredDoc>>,
     /// status: mcp-tool-get-active-note, mcp-tool-get-open-notes,
     /// mcp-tool-get-selection
     ///
     /// Live UI-context snapshot the host populates each frame. The MCP
     /// handler only reads from it.
     pub ui_context: crate::ui_context::Shared,
+    /// status: mcp-registry-tools
+    /// The compiled kind registry (`docs/kinds.md`). Generates the typed
+    /// `create_<kind>` / `update_<kind>` tool pair per registered kind.
+    pub kinds: Arc<hiker_core::kinds::Registry>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -118,12 +121,6 @@ pub struct McpServerHandle {
     discovery_path: PathBuf,
     cancel: CancellationToken,
     join: Option<JoinHandle<()>>,
-    /// status: agent-tool-routing-via-mcp
-    /// In-process handler used by the basic agent loop's `ToolDispatcher`.
-    /// Shares the same `HikerState` (audit log, tool registry, error
-    /// model) as the rmcp-side handlers, so the basic agent and external
-    /// rmcp clients see one tool surface.
-    agent_handler: Arc<handler::App>,
 }
 
 impl McpServerHandle {
@@ -135,11 +132,6 @@ impl McpServerHandle {
     }
     pub fn url(&self) -> String {
         format!("http://{}/mcp", self.addr)
-    }
-    /// App for in-process tool dispatch (basic agent loop). Cheap to
-    /// clone — wraps an `Arc<HikerState>`.
-    pub fn agent_handler(&self) -> Arc<handler::App> {
-        self.agent_handler.clone()
     }
     /// Stop the listener and wait briefly for the task to finish. Removing
     /// the discovery file is part of shutdown so a stale file never lingers
@@ -224,20 +216,19 @@ pub async fn start(deps: McpDeps) -> Result<McpServerHandle, StartError> {
         embedder_provider: deps.embedder_provider,
         config: deps.config.clone(),
         tools: deps.tools.clone(),
-        oplog: deps.oplog.clone(),
+        layered: deps.layered.clone(),
         audit,
         tasks: deps.tasks,
         default_lease_secs: deps.tasks_config.lease.default_secs,
         max_lease_secs: deps.tasks_config.lease.max_secs,
-        expose_tasks_to_chat_agent: deps.tasks_config.expose_to_chat_agent,
         llm_enabled: deps.llm_enabled,
         boards_config: deps.boards_config,
         ui_context: deps.ui_context,
+        kinds: deps.kinds,
     });
-    let factory_state = handler_state.clone();
     let service: StreamableHttpService<handler::App, LocalSessionManager> =
         StreamableHttpService::new(
-            move || Ok(handler::App::new(factory_state.clone())),
+            move || Ok(handler::App::new(handler_state.clone())),
             std::sync::Arc::new(LocalSessionManager::default()),
             StreamableHttpServerConfig::default()
                 .with_stateful_mode(false)
@@ -263,13 +254,10 @@ pub async fn start(deps: McpDeps) -> Result<McpServerHandle, StartError> {
         "mcp: server bound",
     );
 
-    let agent_handler = Arc::new(handler::App::new(handler_state));
-
     Ok(McpServerHandle {
         addr,
         discovery_path,
         cancel,
         join: Some(join),
-        agent_handler,
     })
 }

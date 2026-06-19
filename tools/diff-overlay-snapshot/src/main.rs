@@ -1,14 +1,14 @@
 //! Headless diff-overlay repro / snapshot tool.
 //!
-//! Builds the *real* op-log accepted / working / pending buffers (via
-//! `hiker_core::oplog::OpLog`) for a matrix of user / agent / sync scenarios,
+//! Builds the *real* layered-doc accepted / working / pending buffers (via
+//! `hiker_core::editing::LayeredDoc`) for a matrix of user / agent / sync scenarios,
 //! then for each one:
 //!   1. Prints a text report of the agent-overlay geometry, using the SAME
 //!      functions the app's `attach_agent_hunk_widgets` uses:
 //!        - `editor_diff::overlay`  — hunk byte ranges + action-row anchor/side
 //!        - `editor_diff::conflict` — conflict (user-vs-agent) detection
 //!        - `op_writes::ops_in_hunk` — which pending ops a hunk covers
-//!        - `OpLog::is_pending_drifted` — whether Accept should be disabled
+//!        - `LayeredDoc::is_pending_drifted` — whether Accept should be disabled
 //!   2. Renders the editor (working buffer + `proposal_decorations` green/strike
 //!      + the per-hunk action rows, with Accept greyed on drift and verbs
 //!      skipped when no op covers the hunk) to a PNG via `egui_kittest`.
@@ -27,8 +27,8 @@ use editor_core::state::Editor;
 use editor_diff::conflict;
 use editor_diff::overlay as ov;
 use hiker_core::ops::op_writes;
-use hiker_core::oplog::shapes::Author;
-use hiker_core::oplog::{EditSpec, OpLog, ProducerCtx};
+use hiker_core::editing::shapes::Author;
+use hiker_core::editing::{EditSpec, LayeredDoc, ProducerCtx};
 
 // Screenshot-only imports (see Cargo `[features].screenshot`).
 #[cfg(feature = "screenshot")]
@@ -62,15 +62,14 @@ const VIEW_W: f32 = 760.0;
 #[cfg(feature = "screenshot")]
 const VIEW_H: f32 = 460.0;
 
-/// What a scenario builder leaves in the op log.
+/// What a scenario builder leaves in the layered doc.
 struct Built {
     doc_id: String,
     path: String,
     session: String,
-    op_ids: Vec<String>,
 }
 
-type Builder = fn(&OpLog) -> Result<Built>;
+type Builder = fn(&LayeredDoc) -> Result<Built>;
 
 const SCENARIOS: &[(&str, Builder)] = &[
     ("agent_insert_midfile", s_insert_midfile),
@@ -90,7 +89,7 @@ fn main() -> Result<()> {
     let mut wgpu_ok = true;
     for (name, build) in SCENARIOS {
         let tmp = tempfile::tempdir()?; // fresh vault per scenario
-        let log = OpLog::open(tmp.path())?;
+        let log = LayeredDoc::open(tmp.path())?;
         let built = build(&log)?;
 
         let accepted = log.materialize_accepted(&built.doc_id)?.text;
@@ -157,7 +156,7 @@ struct RowPlan {
 }
 
 fn overlay_plan(
-    log: &OpLog,
+    log: &LayeredDoc,
     built: &Built,
     working: &str,
     accepted: &str,
@@ -173,7 +172,7 @@ fn overlay_plan(
     let mut plans = Vec::new();
     for ah in &agent_hunks {
         let (anchor, side) = ov::anchor_and_side(rope, ah.byte_start, ah.byte_end);
-        // The exact op-log seam the app rides: which pending ops cover this hunk.
+        // The exact layered-doc seam the app rides: which pending ops cover this hunk.
         let op_ids = op_writes::ops_in_hunk(log, &built.path, session, ah.op_start, ah.op_end)
             .unwrap_or_default();
         let conflict =
@@ -392,11 +391,11 @@ fn render_png(working: &str, proposal: &str, plans: &[RowPlan], out: &Path) -> R
 // Scenario builders.
 // ----------------------------------------------------------------------------
 
-fn mkdoc(log: &OpLog, path: &str, text: &str) -> Result<String> {
+fn mkdoc(log: &LayeredDoc, path: &str, text: &str) -> Result<String> {
     Ok(log.create_document(path, "note", text, &Author::User)?)
 }
 
-fn agent(log: &OpLog, doc_id: &str, edits: &[(Option<&str>, &str)]) -> Result<Vec<String>> {
+fn agent(log: &LayeredDoc, doc_id: &str, edits: &[(Option<&str>, &str)]) -> Result<Vec<String>> {
     let specs: Vec<EditSpec> = edits
         .iter()
         .map(|(o, n)| EditSpec { old_str: o.map(str::to_string), new_str: (*n).to_string() })
@@ -409,57 +408,57 @@ fn agent(log: &OpLog, doc_id: &str, edits: &[(Option<&str>, &str)]) -> Result<Ve
     Ok(log.stage_pending(doc_id, &specs, &ctx)?.op_ids)
 }
 
-fn user_replace(log: &OpLog, doc_id: &str, needle: &str, repl: &str) -> Result<()> {
+fn user_replace(log: &LayeredDoc, doc_id: &str, needle: &str, repl: &str) -> Result<()> {
     let cur = log.materialize_working(doc_id)?.text;
     let off = cur.find(needle).unwrap_or_else(|| panic!("needle {needle:?} not found"));
     log.apply_working_edit(doc_id, off, needle.len(), repl)?;
     Ok(())
 }
 
-fn built(doc_id: String, path: &str, op_ids: Vec<String>) -> Built {
-    Built { doc_id, path: path.to_string(), session: SESSION.to_string(), op_ids }
+fn built(doc_id: String, path: &str, _op_ids: Vec<String>) -> Built {
+    Built { doc_id, path: path.to_string(), session: SESSION.to_string() }
 }
 
 const FM_NOTE: &str =
     "---\ncreated: '2025-01-23'\nstatus: draft\ntags:\n- test\n- example\nhiker:\n  author: human\n---\n# Another Test Note\n\nbody line one\n";
 const BODY_NOTE: &str = "alpha\nbravo\ncharlie\ndelta\n";
 
-fn s_insert_midfile(log: &OpLog) -> Result<Built> {
+fn s_insert_midfile(log: &LayeredDoc) -> Result<Built> {
     let p = "midfile.md";
     let d = mkdoc(log, p, FM_NOTE)?;
     let ops = agent(log, &d, &[(Some("- example\n"), "- example\n- demo-agent\n")])?;
     Ok(built(d, p, ops))
 }
 
-fn s_insert_top(log: &OpLog) -> Result<Built> {
+fn s_insert_top(log: &LayeredDoc) -> Result<Built> {
     let p = "top.md";
     let d = mkdoc(log, p, BODY_NOTE)?;
     let ops = agent(log, &d, &[(Some("alpha\n"), "# Title\nalpha\n")])?;
     Ok(built(d, p, ops))
 }
 
-fn s_append_end(log: &OpLog) -> Result<Built> {
+fn s_append_end(log: &LayeredDoc) -> Result<Built> {
     let p = "end.md";
     let d = mkdoc(log, p, BODY_NOTE)?;
     let ops = agent(log, &d, &[(Some("delta\n"), "delta\nomega\n")])?;
     Ok(built(d, p, ops))
 }
 
-fn s_modify_line(log: &OpLog) -> Result<Built> {
+fn s_modify_line(log: &LayeredDoc) -> Result<Built> {
     let p = "modify.md";
     let d = mkdoc(log, p, BODY_NOTE)?;
     let ops = agent(log, &d, &[(Some("bravo"), "bravo-EDITED")])?;
     Ok(built(d, p, ops))
 }
 
-fn s_delete_line(log: &OpLog) -> Result<Built> {
+fn s_delete_line(log: &LayeredDoc) -> Result<Built> {
     let p = "delete.md";
     let d = mkdoc(log, p, BODY_NOTE)?;
     let ops = agent(log, &d, &[(Some("bravo\n"), "")])?;
     Ok(built(d, p, ops))
 }
 
-fn s_multi_hunk(log: &OpLog) -> Result<Built> {
+fn s_multi_hunk(log: &LayeredDoc) -> Result<Built> {
     let p = "multi.md";
     let d = mkdoc(log, p, BODY_NOTE)?;
     let ops = agent(
@@ -470,7 +469,7 @@ fn s_multi_hunk(log: &OpLog) -> Result<Built> {
     Ok(built(d, p, ops))
 }
 
-fn s_user_agent_disjoint(log: &OpLog) -> Result<Built> {
+fn s_user_agent_disjoint(log: &LayeredDoc) -> Result<Built> {
     let p = "disjoint.md";
     let d = mkdoc(log, p, BODY_NOTE)?;
     let ops = agent(log, &d, &[(Some("charlie"), "charlie-AGENT")])?;
@@ -478,7 +477,7 @@ fn s_user_agent_disjoint(log: &OpLog) -> Result<Built> {
     Ok(built(d, p, ops))
 }
 
-fn s_user_agent_conflict(log: &OpLog) -> Result<Built> {
+fn s_user_agent_conflict(log: &LayeredDoc) -> Result<Built> {
     let p = "conflict.md";
     let d = mkdoc(log, p, BODY_NOTE)?;
     let ops = agent(log, &d, &[(Some("bravo"), "bravo-AGENT")])?;
@@ -486,7 +485,7 @@ fn s_user_agent_conflict(log: &OpLog) -> Result<Built> {
     Ok(built(d, p, ops))
 }
 
-fn s_sync_then_agent(log: &OpLog) -> Result<Built> {
+fn s_sync_then_agent(log: &LayeredDoc) -> Result<Built> {
     let p = "sync.md";
     let d = mkdoc(log, p, "# Notes\nalpha\nbravo\ncharlie\n")?;
     let ops = agent(log, &d, &[(Some("alpha"), "alpha-AGENT")])?;
@@ -494,7 +493,7 @@ fn s_sync_then_agent(log: &OpLog) -> Result<Built> {
     Ok(built(d, p, ops))
 }
 
-fn s_insert_drift(log: &OpLog) -> Result<Built> {
+fn s_insert_drift(log: &LayeredDoc) -> Result<Built> {
     let p = "drift.md";
     let d = mkdoc(log, p, "alpha\nbravo\ncharlie\n")?;
     let ops = agent(log, &d, &[(Some("bravo\n"), "bravo\nINSERTED\n")])?;

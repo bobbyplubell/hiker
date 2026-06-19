@@ -18,7 +18,7 @@ pub enum Error {
 
 impl From<Error> for HikerError {
     fn from(e: Error) -> Self {
-        // Mirror the op-log mapper's discipline (`ops/op_writes.rs::map_err`):
+        // Mirror the layered-doc mapper's discipline (`ops/op_writes.rs::map_err`):
         // preserve the variant shape the kind-tagged frontend keys on. A
         // store-side "note not found" must reach the UI as `not_found`, not be
         // flattened to `io`. `HikerError` has no schema/dimension variants, so

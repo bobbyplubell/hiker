@@ -342,6 +342,9 @@ impl Store {
         // A skipped file isn't indexed — drop any metadata from a prior
         // successful ingest so structured queries don't surface it.
         tx.execute("DELETE FROM note_meta WHERE note_id = ?1", params![rel_path])?;
+        tx.execute("DELETE FROM spec_anchors WHERE note_path = ?1", params![rel_path])?;
+        // status: kind-lenient-validation — a skipped file isn't validated.
+        tx.execute("DELETE FROM note_problems WHERE note_path = ?1", params![rel_path])?;
 
         tx.commit()?;
         Ok(())
@@ -366,6 +369,8 @@ impl Store {
         }
         let removed = tx.execute("DELETE FROM notes WHERE path = ?1", params![rel_path])?;
         tx.execute("DELETE FROM note_meta WHERE note_id = ?1", params![rel_path])?;
+        tx.execute("DELETE FROM spec_anchors WHERE note_path = ?1", params![rel_path])?;
+        tx.execute("DELETE FROM note_problems WHERE note_path = ?1", params![rel_path])?;
         tx.commit()?;
         Ok(removed > 0)
     }
@@ -391,6 +396,8 @@ impl Store {
             }
             let n = tx.execute("DELETE FROM notes WHERE path = ?1", params![rel])?;
             tx.execute("DELETE FROM note_meta WHERE note_id = ?1", params![rel])?;
+            tx.execute("DELETE FROM spec_anchors WHERE note_path = ?1", params![rel])?;
+            tx.execute("DELETE FROM note_problems WHERE note_path = ?1", params![rel])?;
             if n > 0 {
                 removed += 1;
             }
@@ -495,6 +502,16 @@ impl Store {
         // The derived metadata index keys on the note path too.
         tx.execute(
             "UPDATE note_meta SET note_id = ?1 WHERE note_id = ?2",
+            params![new_path, old_path],
+        )?;
+        // So does the spec-anchor index — anchors move with the note.
+        tx.execute(
+            "UPDATE spec_anchors SET note_path = ?1 WHERE note_path = ?2",
+            params![new_path, old_path],
+        )?;
+        // And the lenient-validation report (`kind-lenient-validation`).
+        tx.execute(
+            "UPDATE note_problems SET note_path = ?1 WHERE note_path = ?2",
             params![new_path, old_path],
         )?;
         Ok(true)

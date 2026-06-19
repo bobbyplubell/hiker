@@ -141,10 +141,13 @@ pub struct CanvasView {
     /// A queued "create a node of this kind at viewport center" request,
     /// consumed on the next `show`.
     pending_create: Option<CreateKind>,
-    /// A queued "insert this fully-built node at viewport center" request,
-    /// consumed on the next `show`. The host supplies a node with kind + fields
-    /// already filled (e.g. a file-node pointer or a link).
-    pending_insert: Option<Node>,
+    /// A queued "insert this fully-built node" request, consumed on the next
+    /// `show`. The host supplies a node with kind + fields already filled (e.g.
+    /// a file-node pointer or a link). The optional `Point` is the world-space
+    /// placement: `Some(p)` centers the node on `p` (e.g. a file dropped onto the
+    /// canvas at the cursor); `None` centers it on the viewport (toolbar / picker
+    /// insert). status: canvas-file-drop
+    pending_insert: Option<(Node, Option<Point>)>,
     /// An in-progress inline edit of an edge's label (opened by double-clicking
     /// an edge). The field is rendered above the interaction surface so it can
     /// receive input. status: canvas-edge-label
@@ -311,7 +314,18 @@ impl CanvasView {
     /// with the center; `width`/`height`/`color`/kind fields are kept as given.
     /// Supersedes any pending request.
     pub fn insert_node_centered(&mut self, node: Node) {
-        self.pending_insert = Some(node);
+        self.pending_insert = Some((node, None));
+        self.pending_create = None;
+    }
+
+    /// Like [`CanvasView::insert_node_centered`], but positions the node so its
+    /// center sits at the world point `at` instead of the viewport center — for a
+    /// file-tree row dropped onto the canvas, which carries a cursor position. The
+    /// node's `id` is reassigned and its `x`/`y` overwritten with `at`; everything
+    /// else (kind / size / color) is kept as given. Supersedes any pending
+    /// request. status: canvas-file-drop
+    pub fn insert_node_at(&mut self, node: Node, at: Point) {
+        self.pending_insert = Some((node, Some(at)));
         self.pending_create = None;
     }
 
@@ -434,11 +448,14 @@ impl CanvasView {
             let top_left = Point::new(center.x - w as f64 / 2.0, center.y - h as f64 / 2.0);
             self.commit_new_node(canvas, kind.add_op(id.clone(), top_left), id, out);
         }
-        if let Some(mut node) = self.pending_insert.take() {
+        if let Some((mut node, at)) = self.pending_insert.take() {
+            // `at` is the requested world-space center (a drop at the cursor);
+            // fall back to the viewport center for a toolbar / picker insert.
+            let target = at.unwrap_or(center);
             let id = self.mint_id(canvas);
             node.id = id.clone();
-            node.x = (center.x - node.width as f64 / 2.0).round() as i64;
-            node.y = (center.y - node.height as f64 / 2.0).round() as i64;
+            node.x = (target.x - node.width as f64 / 2.0).round() as i64;
+            node.y = (target.y - node.height as f64 / 2.0).round() as i64;
             let op = EditOp::AddNode { node: Box::new(node) };
             self.commit_new_node(canvas, op, id, out);
         }

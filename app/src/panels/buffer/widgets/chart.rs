@@ -18,7 +18,7 @@ use editor_md::diagrams::chart_spans;
 
 use super::disk_cache::DiagramCacheCtx;
 use super::render::{RenderedWidget, chart_widget_id, render_chart};
-use super::{cursor_inside, emit_block_widget, fit_block_height, selection_overlaps};
+use super::placement::{cursor_inside, emit_block_widget, fit_block_height, selection_overlaps};
 
 /// The canvas size inline ```` ```chart ```` widgets render at, in chart pixels.
 /// A wide chart is letterboxed down to the editor column by [`fit_block_height`]

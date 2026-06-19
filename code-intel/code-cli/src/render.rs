@@ -112,6 +112,7 @@ fn edge_color(kind: EdgeKind) -> &'static str {
         EdgeKind::Implements => "#e0922f",
         EdgeKind::TypeRef => "#5b8def",
         EdgeKind::Imports => "#5aa469",
+        EdgeKind::Link => "#9e9e9e",
     }
 }
 
@@ -121,6 +122,7 @@ fn edge_label(kind: EdgeKind) -> &'static str {
         EdgeKind::Implements => "implements",
         EdgeKind::TypeRef => "type",
         EdgeKind::Imports => "imports",
+        EdgeKind::Link => "link",
     }
 }
 

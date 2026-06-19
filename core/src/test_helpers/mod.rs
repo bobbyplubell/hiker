@@ -47,3 +47,31 @@ pub(crate) fn test_store() -> (TempDir, Store) {
     let store = Store::open(dir.path()).expect("store open");
     (dir, store)
 }
+
+/// Stub embedder so an indexer task starts immediately (ModelLoaded fires
+/// without real model files). Returns a 384-dim zero vector for any input.
+pub(crate) struct ZeroEmbedder;
+
+impl crate::embed::Embedder for ZeroEmbedder {
+    fn embed_batch(
+        &self,
+        batch: &[String],
+    ) -> Result<Vec<Vec<f32>>, crate::embed::Error> {
+        Ok(batch.iter().map(|_| vec![0.0; 384]).collect())
+    }
+    fn version(&self) -> &str {
+        "zero-test"
+    }
+    fn dim(&self) -> usize {
+        384
+    }
+}
+
+/// Start an indexer over `vault` with the stub embedder and its own writer
+/// `Store` — the harness board / pm op tests need a live `IndexJobTx` for.
+pub(crate) fn test_indexer(vault: &Vault) -> crate::indexer::Handle {
+    let store = Store::open(vault.root()).expect("indexer store");
+    crate::indexer::start(vault.clone(), store, || {
+        Ok(std::sync::Arc::new(ZeroEmbedder) as std::sync::Arc<dyn crate::embed::Embedder>)
+    })
+}

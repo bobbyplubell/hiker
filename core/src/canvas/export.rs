@@ -6,7 +6,7 @@
 //!
 //! This module is the egui-free CORE: pure builders that map a source
 //! structure to a [`hiker_canvas::model::Canvas`], plus disk-writing entry
-//! points that seed a new `.canvas` op-log document with the builder's
+//! points that seed a new `.canvas` layered-doc document with the builder's
 //! canonical JSON. Layout is deterministic (ids derived by walk order, never
 //! random / time) so the same source serializes byte-identically.
 //
@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use hiker_canvas::model::{Canvas, Edge, EndCap, Node, NodeKind};
 
 use crate::errors::HikerError;
-use crate::oplog::OpLog;
+use crate::editing::LayeredDoc;
 use crate::store::Store;
 use crate::trails::{ResolvedWaypoint, TrailDetail, get_trail};
 use crate::trees::types::{self, EditableNode};
@@ -628,17 +628,17 @@ fn link_edge(seq: usize, from: &str, to: &str) -> Edge {
 
 /// Export a trail to a fresh `.canvas` document beside the trail-doc. Loads
 /// via [`get_trail`], builds via [`trail_to_canvas`], seeds the new file with
-/// canonical JSON through the op-log path, and returns its vault-relative
+/// canonical JSON through the layered-doc save path, and returns its vault-relative
 /// path. The name is `<trail-basename>.canvas`, suffix-counted on collision.
 ///
 /// # Errors
-/// Propagates trail-load, path, or op-log write failures.
+/// Propagates trail-load, path, or layered-doc write failures.
 ///
 /// status: canvas-export-output
 pub fn write_trail_canvas(
     vault: &Vault,
     store: &Store,
-    log: &OpLog,
+    log: &LayeredDoc,
     trail_doc_rel: &str,
 ) -> Result<String, HikerError> {
     let detail = get_trail(vault, store, log, trail_doc_rel)?;
@@ -652,17 +652,17 @@ pub fn write_trail_canvas(
 /// Export a cluster tree (in its on-disk state) to a fresh `.canvas` document
 /// at the vault root in the chosen `style`. Loads the tree's name + nodes via
 /// `trees`, builds via [`tree_to_canvas`], seeds the new file through the
-/// op-log path, and returns its vault-relative path. The name is
+/// layered-doc save path, and returns its vault-relative path. The name is
 /// `<tree-name>.canvas`, suffix-counted.
 ///
 /// # Errors
-/// Propagates tree-not-found, path, or op-log write failures.
+/// Propagates tree-not-found, path, or layered-doc write failures.
 ///
 /// status: canvas-export-output
 pub fn write_tree_canvas(
     trees: &types::Db,
     vault: &Vault,
-    log: &OpLog,
+    log: &LayeredDoc,
     tree_id: &str,
     style: TreeCanvasStyle,
 ) -> Result<String, HikerError> {
@@ -726,9 +726,9 @@ fn pick_free_path(vault: &Vault, dir: &str, stem: &str) -> Result<String, HikerE
 }
 
 /// Seed a new `.canvas` document at `rel` with the canvas's canonical JSON
-/// through the op-log user-save path, mirroring the rename-rewrite write so
-/// the file is a first-class op-log document (`canvas-doc-kind`).
-fn write_canvas(log: &OpLog, vault: &Vault, rel: &str, canvas: &Canvas) -> Result<(), HikerError> {
+/// through the layered-doc user-save path, mirroring the rename-rewrite write so
+/// the file is a first-class layered-doc document (`canvas-doc-kind`).
+fn write_canvas(log: &LayeredDoc, vault: &Vault, rel: &str, canvas: &Canvas) -> Result<(), HikerError> {
     let json = canvas.to_canonical_json();
     crate::ops::op_writes::user_save(log, vault, rel, &json)
 }

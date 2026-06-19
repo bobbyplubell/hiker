@@ -63,10 +63,6 @@ pub enum TaskKind {
         tree_id: String,
         source_path: String,
     },
-    /// Background auto-tag-on-save.
-    AutoTag { source_path: String },
-    /// Background summary-on-save.
-    SummaryOnSave { source_path: String },
     /// Initial cluster-tree build from a scope. CPU + LLM-heavy; runs
     /// through the direct-worker non-LLM side-channel so the IPC thread
     /// can return immediately and the queue page surfaces progress.
@@ -119,8 +115,6 @@ impl TaskKind {
             TaskKind::NoteMutation { .. } => "note_mutation",
             TaskKind::RaptorSummarize { .. } => "raptor_summarize",
             TaskKind::RaptorTriageMatch { .. } => "raptor_triage_match",
-            TaskKind::AutoTag { .. } => "auto_tag",
-            TaskKind::SummaryOnSave { .. } => "summary_on_save",
             TaskKind::ClusterBuildTree { .. } => "cluster_build_tree",
             TaskKind::ClusterRebuildTree { .. } => "cluster_rebuild_tree",
             TaskKind::ClusterReclusterSubtree { .. } => "cluster_recluster_subtree",
@@ -142,8 +136,6 @@ impl TaskKind {
                 tree_id,
                 source_path,
             } => format!("tree {tree_id} ← {source_path}"),
-            TaskKind::AutoTag { source_path } => source_path.clone(),
-            TaskKind::SummaryOnSave { source_path } => source_path.clone(),
             TaskKind::ClusterBuildTree { name, .. } => format!("build {name}"),
             TaskKind::ClusterRebuildTree { tree_id, .. } => format!("rebuild {tree_id}"),
             TaskKind::ClusterReclusterSubtree { tree_id, node_id, .. } => {
@@ -227,8 +219,8 @@ pub enum CancelReason {
 pub enum WorkerKind {
     /// In-process direct-LLM background drain.
     DirectLlm,
-    /// Any rmcp caller. `via` discriminates the basic chat agent's
-    /// in-process dispatch from external HTTP rmcp clients.
+    /// Any rmcp caller. `via` records how the client reached the queue
+    /// (currently only external HTTP rmcp clients).
     McpClient { client_id: String, via: McpClientVia },
     /// Self-managed by the indexer task — used for non-LLM work that
     /// rides the queue purely for UI visibility (currently:
@@ -243,7 +235,6 @@ pub enum WorkerKind {
 #[serde(rename_all = "snake_case")]
 pub enum McpClientVia {
     External,
-    InProcessChatAgent,
 }
 
 impl WorkerKind {
@@ -251,7 +242,6 @@ impl WorkerKind {
         match self {
             WorkerKind::DirectLlm => "Direct LLM".to_string(),
             WorkerKind::McpClient { client_id, via } => match via {
-                McpClientVia::InProcessChatAgent => "Chat agent".to_string(),
                 McpClientVia::External => format!("External: {client_id}"),
             },
             WorkerKind::Indexer => "Indexer".to_string(),

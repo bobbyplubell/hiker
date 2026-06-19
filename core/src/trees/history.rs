@@ -1,7 +1,7 @@
 //! In-memory session undo/redo log for the cluster editor
 //! (`cluster-editor-edit-history`, `cluster-editor-undo-redo`).
 //!
-//! Edits ride the op-log on disk (each is a `SetFrontmatter` op on the tree
+//! Edits ride the layered doc on disk (each is a `SetFrontmatter` op on the tree
 //! doc); undo/redo is a *session* concept layered on top — a per-tree stack
 //! of `{ op, args, undo_args }` held in `Db.history`. It does **not** persist
 //! across restarts (there is no `cluster_tree_history` table anymore);

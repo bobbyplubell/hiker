@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 spec-engine = { path = "../spec-engine" }
 hiker-code = { path = "../hiker-code" }
+hiker-lsp = { path = "../hiker-lsp" }
 # hiker-projects now lives at the hiker repo root (decoupled from code-intel); reach it across the
 # workspace boundary by path. code-cli does the repo→adapter binding itself (hiker-projects yields
 # only descriptors).

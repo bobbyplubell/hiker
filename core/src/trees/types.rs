@@ -4,7 +4,7 @@
 //! Cluster trees are per-tree `.md` files at a visible vault path
 //! (`{new_cluster_tree_dir}/<tree-id>.md`, default `cluster-trees/`, per
 //! `trees-md-store` / `cluster-tree-visible-note`); the `Db` handle owns the
-//! op-log + vault references used to read and rewrite a tree's frontmatter,
+//! layered-doc + vault references used to read and rewrite a tree's frontmatter,
 //! plus the watcher/indexer handles for the visible-note write path.
 //! Frontmatter (de)serialization lives in `super::store`.
 
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cluster::{Algorithm, LeidenParams, SummarizeMode};
 use crate::indexer::IndexJobTx;
-use crate::oplog::OpLog;
+use crate::editing::LayeredDoc;
 use crate::store::Store;
 use crate::vault::Vault;
 use crate::watcher::Watcher;
@@ -29,7 +29,7 @@ pub enum Error {
     #[error("yaml: {0}")]
     Yaml(String),
     #[error("op-log: {0}")]
-    OpLog(String),
+    LayeredDoc(String),
     #[error("store: {0}")]
     Store(String),
     #[error("cluster: {0}")]
@@ -56,7 +56,7 @@ impl From<Error> for crate::errors::HikerError {
 
 impl From<crate::errors::HikerError> for Error {
     fn from(e: crate::errors::HikerError) -> Self {
-        Error::OpLog(e.to_string())
+        Error::LayeredDoc(e.to_string())
     }
 }
 
@@ -111,7 +111,7 @@ pub struct EditableNode {
     pub kind: NodeKind,
     /// Vault-relative path of the leaf's source note. Present only on leaves.
     /// Path-as-identity: this is the single carrier the renderer and the
-    /// apply/stage paths key on — no op-log doc-id is held in memory (the
+    /// apply/stage paths key on — no layered-doc doc-id is held in memory (the
     /// on-disk frontmatter still records both id + path as a double-link, but
     /// the id is not surfaced here). `#[serde(alias = "note_ref")]` keeps any
     /// older serialized tab-state loadable.
@@ -201,7 +201,7 @@ pub struct NodeInsert {
 
 /// One entry in the in-memory session undo/redo stack. Per
 /// `cluster-editor-edit-history` / `cluster-editor-undo-redo`: edits ride the
-/// op-log on disk, while undo/redo is an in-session concept — `args` and
+/// layered doc on disk, while undo/redo is an in-session concept — `args` and
 /// `undo_args` are caller-shaped JSON so this module stays neutral about the
 /// operation vocabulary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -319,13 +319,13 @@ pub enum RollupOutcome {
 /// Owner of the per-tree `.md` files at the visible `new_cluster_tree_dir`
 /// (default `cluster-trees/`, `trees-md-store` / `cluster-tree-visible-note`).
 /// Reads and rewrites a tree's frontmatter through the
-/// op-log working layer; tree edits land as `SetFrontmatter` ops
+/// layered-doc working layer; tree edits land as `SetFrontmatter` ops
 /// (`trees-edit-setfrontmatter`). The undo/redo session log
 /// (`cluster-editor-undo-redo`) is in-memory and per-process — it does not
 /// persist across restarts (cross-session revert rides the tree doc's
 /// version history instead).
 pub struct Db {
-    pub(super) oplog: Arc<OpLog>,
+    pub(super) layered: Arc<LayeredDoc>,
     pub(super) vault: Arc<Vault>,
     /// Dedicated `index.db` connection for the derived `cluster_centroids`
     /// table (`trees-centroids-index`). Separate from the app's shared

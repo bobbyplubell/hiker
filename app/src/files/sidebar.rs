@@ -23,6 +23,10 @@ use hiker_core::vault::{DirEntryDto, EntryKind};
 use crate::activity::SurfaceCtx;
 use crate::item_menu;
 use crate::state::{AppState, FileTreeState};
+use super::rename::{
+    commit_observed_rename, commit_rename, rename_draft_for, rename_text_edit,
+    repoint_open_buffer, start_rename,
+};
 use hiker_theme as theme;
 
 /// A context-menu verb picked on a file row. The menu render records one
@@ -139,6 +143,9 @@ impl FilesCtx<'_, '_> {
         // keeping the render path within the narrow `SurfaceCtx`.
         self.ctx.defer(refresh_deco);
         self.sort_header(ui);
+        // A transient "move to vault root" drop target, shown only while a row is
+        // being dragged (dropping onto a folder moves INTO it). [filetree-drag-root]
+        self.root_drop_strip(ui);
         let _g = crate::profiling::FrameProf::guard("files:tree");
 
         // Reuse the cached flattened row list, rebuilding it only when a
@@ -153,6 +160,15 @@ impl FilesCtx<'_, '_> {
             Some(rows) => rows,
             None => self.flatten_visible(),
         };
+
+        // Capture the visible render order (entry rows) so a Shift-click can
+        // resolve its contiguous selection range against it. Cheap — one clone
+        // of the rel-paths per frame. [filetree-multiselect]
+        let order: Vec<String> = rows
+            .iter()
+            .filter_map(|r| r.rel_path().map(str::to_string))
+            .collect();
+        self.st().flat_order = order;
 
         // Reveal-from-discovery (`reveal-in-sidebar-scroll`): a one-shot
         // scroll target arms a jump to a specific row. With virtualization
@@ -337,7 +353,8 @@ impl FilesCtx<'_, '_> {
         };
         let label = format!("{}{}", entry.name, count_suffix);
 
-        let resp = row_button_with_chevron(ui, &label, depth, false, Some(expanded));
+        let is_selected = self.st_ref().selection.contains(&entry.rel_path);
+        let resp = row_button_with_chevron(ui, &label, depth, is_selected, Some(expanded));
 
         // DnD: folder rows accept dropped paths and move them into this dir.
         if let Some(src) = resp.dnd_release_payload::<String>() {
@@ -350,6 +367,8 @@ impl FilesCtx<'_, '_> {
         if resp.clicked() {
             let rel = entry.rel_path.clone();
             let st = self.st();
+            // A folder click is a navigation action — clear the file selection.
+            st.selection.clear();
             if expanded {
                 st.expanded.remove(&rel);
             } else {
@@ -372,6 +391,7 @@ impl FilesCtx<'_, '_> {
         }
 
         let is_active = self.ctx.active_path.as_deref() == Some(entry.rel_path.as_str());
+        let is_selected = self.st_ref().selection.contains(&entry.rel_path);
         let label = format!(
             "{}{}{}{}",
             canvas_glyph_marker(&entry.rel_path),
@@ -379,7 +399,14 @@ impl FilesCtx<'_, '_> {
             self.dirty_marker(&entry.rel_path),
             self.index_state_marker(&entry.rel_path),
         );
-        let resp = row_button_with_chevron(ui, &label, depth, is_active, None);
+        let resp = row_button_with_chevron(ui, &label, depth, is_active || is_selected, None);
+
+        // Shared note hover-preview card, like every sibling note list
+        // (interaction.md [hover-preview-universal]). Note rows only —
+        // folders and non-note files have nothing to preview.
+        if resp.hovered() && hiker_core::indexer::is_indexable_path(&entry.rel_path) {
+            crate::widgets::preview::register_note_hover(ui, resp.rect, &entry.rel_path);
+        }
 
         // Drag payload: vault-relative source path.
         resp.clone()
@@ -387,7 +414,12 @@ impl FilesCtx<'_, '_> {
 
         let rel = entry.rel_path.clone();
         if resp.clicked() {
-            self.open_row(&rel);
+            // Cmd/Ctrl = toggle, Shift = range, plain = single-select + open.
+            let (shift, ctrl) = ui.input(|i| (i.modifiers.shift, i.modifiers.command));
+            self.handle_select_click(&rel, shift, ctrl);
+            if !shift && !ctrl {
+                self.open_row(&rel);
+            }
         }
         if resp.double_clicked() {
             // Per docs/editor.md: double-click enters inline rename mode.
@@ -398,6 +430,96 @@ impl FilesCtx<'_, '_> {
         // `&mut AppState` helpers without overlapping the `ui` borrow.
         if let Some(v) = self.file_row_menu(&resp, &rel) {
             self.run_file_verb(ui, v, &rel);
+        }
+    }
+
+    /// Update the multi-selection for a click on `rel` with the Shift / Cmd-Ctrl
+    /// modifiers. Shift selects the contiguous range from `selection_anchor` to
+    /// `rel` over the captured `flat_order`; Cmd/Ctrl toggles a single row; a
+    /// plain click selects just `rel` (and the caller opens it). [filetree-multiselect]
+    fn handle_select_click(&mut self, rel: &str, shift: bool, ctrl: bool) {
+        if shift {
+            let order = self.st_ref().flat_order.clone();
+            let anchor = self.st_ref().selection_anchor.clone();
+            let range = anchor
+                .as_deref()
+                .and_then(|a| order.iter().position(|p| p == a))
+                .zip(order.iter().position(|p| p == rel))
+                .map(|(ai, ti)| {
+                    let (lo, hi) = (ai.min(ti), ai.max(ti));
+                    order[lo..=hi]
+                        .iter()
+                        .cloned()
+                        .collect::<std::collections::HashSet<String>>()
+                });
+            let st = self.st();
+            match range {
+                // Shift-range replaces the selection; the anchor stays put so a
+                // further Shift-click re-pivots from the same origin.
+                Some(range) => st.selection = range,
+                // No usable anchor → behave like a plain single select.
+                None => {
+                    st.selection.clear();
+                    st.selection.insert(rel.to_string());
+                    st.selection_anchor = Some(rel.to_string());
+                }
+            }
+        } else if ctrl {
+            let st = self.st();
+            if !st.selection.remove(rel) {
+                st.selection.insert(rel.to_string());
+            }
+            st.selection_anchor = Some(rel.to_string());
+        } else {
+            let st = self.st();
+            st.selection.clear();
+            st.selection.insert(rel.to_string());
+            st.selection_anchor = Some(rel.to_string());
+        }
+    }
+
+    /// While a row is being dragged, paint a "move to vault root" drop target at
+    /// the top of the tree. Dropping a row onto a folder moves it INTO that
+    /// folder, so this strip is the only way to send an item back to the vault
+    /// root. Hidden when nothing is being dragged. [filetree-drag-root]
+    fn root_drop_strip(&mut self, ui: &mut egui::Ui) {
+        if !egui::DragAndDrop::has_payload_of_type::<String>(ui.ctx()) {
+            return;
+        }
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), ROW_HEIGHT),
+            egui::Sense::hover(),
+        );
+        // `contains_pointer` (not `hovered`, which is false mid-drag) lights the
+        // strip when the dragged row is over it.
+        let hot = resp.contains_pointer();
+        let bg = if hot {
+            theme::active_bg()
+        } else {
+            theme::hover_bg().gamma_multiply(0.5)
+        };
+        ui.painter().rect_filled(rect, 3.0, bg);
+        ui.painter().rect_stroke(
+            rect,
+            3.0,
+            egui::Stroke::new(1.0, theme::divider()),
+            egui::StrokeKind::Inside,
+        );
+        let color = ui.style().visuals.weak_text_color();
+        let galley = ui.fonts(|f| {
+            f.layout_no_wrap(
+                "\u{21A5}  Move to vault root".to_string(),
+                egui::FontId::proportional(12.0),
+                color,
+            )
+        });
+        let pos = egui::pos2(
+            rect.center().x - galley.size().x * 0.5,
+            rect.center().y - galley.size().y * 0.5,
+        );
+        ui.painter_at(rect).galley(pos, galley, color);
+        if let Some(src) = resp.dnd_release_payload::<String>() {
+            self.move_into_folder(&src, "");
         }
     }
 
@@ -420,10 +542,20 @@ impl FilesCtx<'_, '_> {
                 crate::panels::canvas::open(app, &rel);
             } else if is_board_doc(app, &rel) {
                 crate::panels::board::open(app, &rel);
+            } else if rel.ends_with(".scip") {
+                // A SCIP index opens directly as a code-entity graph — no project note needed.
+                // status: code-graph-view-source
+                crate::panels::code_graph::open(app, crate::tab::CodeSource::Index(rel));
             } else if crate::panels::code_graph::is_project_doc(app, &rel) {
                 // A `hiker.kind: project` note opens its repo source as a code-entity graph.
                 // status: code-graph-view-source
-                crate::panels::code_graph::open(app, &rel);
+                crate::panels::code_graph::open(app, crate::tab::CodeSource::Project(rel));
+            } else if is_code_file(&rel) {
+                // A code file (`.rs`, `.py`, …) opens as strictly read-only
+                // reference content — never editable, never written/committed.
+                // Comes AFTER `.scip`/`.canvas`/`.zim`/board/project-doc so
+                // those richer views win. status: code-read-only-view
+                crate::editor_pane::open_code_file(app, &rel);
             } else {
                 crate::editor_pane::open_file(app, &rel, /* sticky */ false);
             }
@@ -467,7 +599,7 @@ impl FilesCtx<'_, '_> {
         // eagerly per row per frame, which dominated the file tree's render time.
         resp.context_menu(|ui| {
             let (boards, membership, board_doc) =
-                crate::panels::board::picker_context_ctx(self.ctx, rel);
+                crate::panels::board_picker::picker_context_ctx(self.ctx, rel);
             let active_trail = active_trail_membership(self.ctx, rel);
             let canvases = crate::panels::canvas::list_canvases(self.ctx.vault);
             if let Some(v) = egui_workbench::menu::show(
@@ -498,8 +630,8 @@ impl FilesCtx<'_, '_> {
         self.ctx.defer(move |app| apply_file_verb(app, verb, &rel));
     }
 
-    /// Renders the inline rename TextEdit. On Enter, runs the move via the
-    /// indexer-driven op (deferred); on Esc, cancels.
+    /// Renders the inline rename TextEdit. On commit (Enter or focus loss),
+    /// runs the move via the indexer-driven op (deferred); Esc cancels.
     fn rename_row(&mut self, ui: &mut egui::Ui, entry: &DirEntryDto, depth: usize, draft: String) {
         let path = entry.rel_path.clone();
         if let Some(committed) = rename_text_edit(ui, &path, &entry.kind, depth, draft) {
@@ -510,7 +642,7 @@ impl FilesCtx<'_, '_> {
 
     /// Move a vault-relative path into `dest_dir` (deferred). A file moves
     /// via `move_note`; a folder via `move_folder` — both the full
-    /// indexer-driven ops (op-log rename + referrer rewrites + watcher
+    /// indexer-driven ops (layered-doc rename + referrer rewrites + watcher
     /// suppression), not the bare `vault::move_note`.
     fn move_into_folder(&mut self, src: &str, dest_dir: &str) {
         let src = src.to_string();
@@ -568,7 +700,7 @@ fn apply_file_verb(app: &mut AppState, verb: FileVerb, rel: &str) {
             crate::panels::canvas::open_as_json(app, rel);
         }
         FileVerb::AddToBoard { board_rel, column } => {
-            crate::panels::board::add_card(app, &board_rel, &column, rel);
+            crate::panels::board_picker::add_card(app, &board_rel, &column, rel);
         }
         FileVerb::AddToCanvas { canvas_rel } => {
             crate::panels::canvas::add_file_node(app, &canvas_rel, rel);
@@ -616,7 +748,7 @@ fn add_to_trail(app: &mut AppState, rel: &str, trail_name: &str) {
     };
     let watcher = app.vault_session.services.watcher.clone();
     let jobs = app.vault_session.services.indexer.job_sender();
-    let log = app.vault_session.services.oplog.clone();
+    let log = app.vault_session.services.layered.clone();
     let vault = app.vault_session.vault.clone();
     let (trail_rel_owned, rel_owned) = (trail_rel.clone(), rel.to_string());
     let result = match tokio::runtime::Handle::try_current() {
@@ -661,7 +793,7 @@ fn export_trail_to_canvas(app: &mut AppState, rel: &str) {
         hiker_core::canvas::export::write_trail_canvas(
             &app.vault_session.vault,
             &store,
-            &app.vault_session.services.oplog,
+            &app.vault_session.services.layered,
             rel,
         )
     };
@@ -880,76 +1012,16 @@ fn move_into_folder(app: &mut AppState, src: &str, dest_dir: &str) {
     let src_parent = src.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
     app.file_tree_state.invalidate_dir(src_parent);
     app.file_tree_state.invalidate_dir(dest_dir);
-    repoint_open_buffer(app, src, &dest);
+    let repoint = repoint_open_buffer(app, src, &dest);
     if !is_dir {
         commit_observed_rename(app, src, &dest);
     }
-    app.push_toast(format!("Moved -> {dest}"), crate::state::ToastLevel::Info);
-}
-
-fn commit_rename(app: &mut AppState, from: &str, draft: &str) {
-    let draft = draft.trim();
-    if draft.is_empty() || draft == basename_of(from) {
-        return;
-    }
-    let parent = from.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
-    let to = if parent.is_empty() {
-        draft.to_string()
-    } else {
-        format!("{parent}/{draft}")
-    };
-    // Route through the indexer-driven `move_note` (op-log rename +
-    // referrer rewrites + watcher suppression), not the bare
-    // `vault::move_note`.
-    let watcher = app.vault_session.services.watcher.clone();
-    let jobs = app.vault_session.services.indexer.job_sender();
-    let from_owned = from.to_string();
-    let to_owned = to.clone();
-    let result = match tokio::runtime::Handle::try_current() {
-        Ok(handle) => handle
-            .block_on(async { hiker_core::ops::file::move_note(&watcher, &jobs, &from_owned, &to_owned).await }),
-        Err(_) => Err(hiker_core::errors::HikerError::Io("no tokio runtime".into())),
-    };
-    if let Err(err) = result {
-        app.push_toast(
-            format!("Rename failed: {err}"),
+    match repoint {
+        Ok(()) => app.push_toast(format!("Moved -> {dest}"), crate::state::ToastLevel::Info),
+        Err(reason) => app.push_toast(
+            format!("Moved -> {dest}, but {reason}"),
             crate::state::ToastLevel::Error,
-        );
-        return;
-    }
-    app.file_tree_state.invalidate_dir(parent);
-    repoint_open_buffer(app, from, &to);
-    commit_observed_rename(app, from, &to);
-    app.push_toast(format!("Renamed -> {to}"), crate::state::ToastLevel::Info);
-}
-
-/// When the git transport is active, land a dedicated pure-rename commit for an
-/// observed move (`git-observed-rename-commit`) so `git log --follow` recovers
-/// it. A no-op when git sync isn't the active transport — the libp2p path and
-/// the no-transport path are untouched.
-fn commit_observed_rename(app: &AppState, from: &str, to: &str) {
-    if let Some(git) = &app.vault_session.services.git_sync {
-        git.commit_observed_rename(from, to);
-    }
-}
-
-/// Move any loaded buffer + open editor tabs from `from` to `to` after a
-/// move/rename so the open view keeps tracking the file.
-fn repoint_open_buffer(app: &mut AppState, from: &str, to: &str) {
-    if let Some(buf) = app.session.buffers.remove(from) {
-        let mut moved = buf;
-        moved.path = to.to_string();
-        app.session.buffers.insert(to.to_string(), moved);
-    }
-    for tab in &mut app.session.tabs {
-        if let crate::tab::TabKind::Editor {
-            buffer: crate::tab::BufferSource::Vault { path },
-            ..
-        } = &mut tab.kind
-            && path == from
-        {
-            *path = to.to_string();
-        }
+        ),
     }
 }
 
@@ -972,7 +1044,7 @@ struct MenuArgs<'a> {
 /// ctxmenu-target-builder).
 fn build_file_menu(
     args: MenuArgs<'_>,
-    boards: Vec<crate::panels::board::PickerEntry>,
+    boards: Vec<crate::panels::board_picker::PickerEntry>,
     membership: std::collections::HashSet<String>,
     canvases: Vec<(String, String)>,
 ) -> egui_workbench::menu::Menu<FileVerb> {
@@ -1039,7 +1111,7 @@ fn build_file_menu(
             let mut verb = None;
             ui.menu_button("Add to board…", |ui| {
                 let mut pick: Option<(String, String)> = None;
-                crate::panels::board::column_picker(ui, &boards, &membership, &mut pick);
+                crate::panels::board_picker::column_picker(ui, &boards, &membership, &mut pick);
                 if let Some((board_rel, column)) = pick {
                     verb = Some(FileVerb::AddToBoard { board_rel, column });
                 }
@@ -1085,7 +1157,7 @@ fn active_trail_membership(ctx: &SurfaceCtx<'_>, rel: &str) -> Option<(String, b
         .and_then(|c| c.vault.active_trail.clone())?;
     let store = ctx.services.read_store.lock().ok()?;
     let detail =
-        hiker_core::trails::get_trail(ctx.vault, &store, &ctx.services.oplog, &active_rel).ok()?;
+        hiker_core::trails::get_trail(ctx.vault, &store, &ctx.services.layered, &active_rel).ok()?;
     let mut members = std::collections::HashSet::new();
     collect_source_paths(&detail.waypoints, &mut members);
     Some((trail_title(&active_rel), members.contains(rel)))
@@ -1126,7 +1198,7 @@ const fn sort_label(s: hiker_core::config::sections::TreeSortBy, compact: bool) 
     }
 }
 
-fn basename_of(rel: &str) -> &str {
+pub(super) fn basename_of(rel: &str) -> &str {
     rel.rsplit('/').next().unwrap_or(rel)
 }
 
@@ -1140,8 +1212,10 @@ fn default_sort(
         .unwrap_or(hiker_core::config::sections::TreeSortBy::NameAsc)
 }
 
-/// True if the `.md` at `rel` is a board-doc (frontmatter `hiker.kind:
-/// board`). Reads + parses the file — called on click / menu open, never
+/// True if the `.md` at `rel` is a board-doc — frontmatter `hiker.kind:
+/// board` or a registered board-like kind like `sprint`
+/// (`sprint-board-subtype`), so sprint board-docs click-route to the board
+/// view too. Reads + parses the file — called on click / menu open, never
 /// per-frame.
 fn is_board_doc(app: &AppState, rel: &str) -> bool {
     if !rel.ends_with(".md") {
@@ -1151,7 +1225,14 @@ fn is_board_doc(app: &AppState, rel: &str) -> bool {
         .vault
         .read_file(rel)
         .ok()
-        .map(|src| hiker_core::boards::parse_board_for(rel, &src).is_ok())
+        .map(|src| {
+            hiker_core::boards::parse_board_for(
+                rel,
+                &src,
+                Some(app.vault_session.services.kinds.as_ref()),
+            )
+            .is_ok()
+        })
         .unwrap_or(false)
 }
 
@@ -1175,112 +1256,21 @@ fn is_canvas_doc(rel: &str) -> bool {
     rel.ends_with(".canvas")
 }
 
-// ----- inline-rename draft storage in egui memory -----
+/// Allowlist of code-file extensions that open as strictly read-only reference
+/// content (plain text, no syntax highlighting in this phase). Lowercase; the
+/// match is case-insensitive. Notes (`.md`) are intentionally absent — they're
+/// the only authored/editable content. status: code-read-only-view
+const CODE_EXTENSIONS: &[&str] = &[
+    "rs", "py", "js", "jsx", "ts", "tsx", "go", "java", "rb", "c", "h", "cpp",
+    "hpp", "cc", "cs", "php", "swift", "kt", "scala", "sh", "bash", "toml",
+    "yaml", "yml", "json", "sql", "lua", "ex", "exs", "hs", "ml",
+];
 
-#[derive(Clone, Default)]
-struct RenameMem {
-    path: String,
-    draft: String,
-    just_opened: bool,
-}
-
-fn mem_id() -> egui::Id {
-    egui::Id::new("sidebar-files-rename")
-}
-
-/// Active inline-rename draft for `path`, if any.
-fn rename_draft_for(ui: &egui::Ui, path: &str) -> Option<String> {
-    ui.ctx().memory(|m| {
-        m.data
-            .get_temp::<RenameMem>(mem_id())
-            .filter(|r| r.path == path)
-            .map(|r| r.draft.clone())
+/// True when `rel`'s extension is in the code allowlist (case-insensitive).
+fn is_code_file(rel: &str) -> bool {
+    rel.rsplit_once('.').is_some_and(|(_, ext)| {
+        CODE_EXTENSIONS.iter().any(|c| ext.eq_ignore_ascii_case(c))
     })
-}
-
-/// Enter inline-rename mode (egui-memory side): seed the draft + flag the
-/// row to grab focus next frame.
-fn start_rename(ui: &egui::Ui, path: &str) {
-    let draft = basename_of(path).to_string();
-    ui.ctx().memory_mut(|m| {
-        m.data.insert_temp(
-            mem_id(),
-            RenameMem {
-                path: path.to_string(),
-                draft,
-                just_opened: true,
-            },
-        );
-    });
-}
-
-/// Draw the inline-rename TextEdit row, returning the committed draft on
-/// Enter (otherwise `None`). Manages focus + egui-memory draft lifecycle.
-fn rename_text_edit(
-    ui: &mut egui::Ui,
-    path: &str,
-    kind: &EntryKind,
-    depth: usize,
-    mut draft: String,
-) -> Option<String> {
-    let outcome = ui.horizontal(|ui| {
-        ui.add_space((depth as f32) * 12.0);
-        ui.add(match kind {
-            EntryKind::Dir => crate::icons::ICONS.image(crate::icons::Icon::Folder),
-            EntryKind::File => crate::icons::ICONS.image(crate::icons::Icon::File),
-        });
-        let id = egui::Id::new(("rename-edit", path));
-        let resp = ui.add(
-            egui::TextEdit::singleline(&mut draft)
-                .id(id)
-                .desired_width(ui.available_width()),
-        );
-        // First frame: focus + clear the just-opened flag.
-        let just_opened = ui.ctx().memory(|m| {
-            m.data
-                .get_temp::<RenameMem>(mem_id())
-                .map(|r| r.path == path && r.just_opened)
-                .unwrap_or(false)
-        });
-        if just_opened {
-            resp.request_focus();
-            ui.ctx().memory_mut(|m| {
-                if let Some(mut r) = m.data.get_temp::<RenameMem>(mem_id())
-                    && r.path == path
-                {
-                    r.just_opened = false;
-                    m.data.insert_temp(mem_id(), r);
-                }
-            });
-        }
-        if resp.changed() {
-            ui.ctx().memory_mut(|m| {
-                m.data.insert_temp(
-                    mem_id(),
-                    RenameMem {
-                        path: path.to_string(),
-                        draft: draft.clone(),
-                        just_opened: false,
-                    },
-                );
-            });
-        }
-        let commit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        if commit || resp.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-            // Drop the draft if it still belongs to this row.
-            ui.ctx().memory_mut(|m| {
-                if m.data
-                    .get_temp::<RenameMem>(mem_id())
-                    .map(|r| r.path == path)
-                    .unwrap_or(false)
-                {
-                    m.data.remove::<RenameMem>(mem_id());
-                }
-            });
-        }
-        commit.then(|| draft.clone())
-    });
-    outcome.inner
 }
 
 /// Renders a sidebar row button. Optionally draws an SVG chevron in the
@@ -1296,17 +1286,18 @@ fn row_button_with_chevron(
     let indent = (depth as f32) * 12.0;
     let row_height = ROW_HEIGHT;
     let total_width = ui.available_width();
+    // `click_and_drag`, not just `click`: the row is both clickable (open /
+    // expand) AND a drag SOURCE — `Response::dnd_set_drag_payload` only sets a
+    // payload when `drag_started()` fires, which requires the widget to sense
+    // drag. Without this the filetree drag (reparent into a folder) and the
+    // canvas drag-to-add never produce a payload at all. A click vs a drag is
+    // still disambiguated by egui's drag threshold, so `clicked()` is unaffected.
     let (rect, resp) =
-        ui.allocate_exact_size(egui::vec2(total_width, row_height), egui::Sense::click());
-    // Active or hover background.
-    let bg = if active {
-        Some(theme::active_bg())
-    } else if resp.hovered() {
-        Some(theme::hover_bg())
-    } else {
-        None
-    };
-    if let Some(c) = bg {
+        ui.allocate_exact_size(egui::vec2(total_width, row_height), egui::Sense::click_and_drag());
+    // The shared "click acts here" signal (`interaction.md` [hover-open-signal]):
+    // active/hover wash through the one canonical policy, plus the pointer cursor.
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    if let Some(c) = theme::open_signal_wash(active, resp.hovered()) {
         ui.painter().rect_filled(rect, 2.0, c);
     }
     // Chevron icon (folders only), painted into a fixed leading slot so the
@@ -1337,6 +1328,13 @@ fn row_button_with_chevron(
     );
     // Clip to the row rect so long names don't paint over neighbours.
     ui.painter_at(rect).galley(text_pos, galley, color);
+
+    // Drag ghost: while this row is being dragged, paint the shared floating
+    // chip of its label at the cursor (`widgets::note_row`) so the item
+    // visibly "follows" the pointer.
+    if resp.dragged() {
+        crate::widgets::note_row::drag_ghost(ui, label);
+    }
     resp
 }
 

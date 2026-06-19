@@ -9,7 +9,7 @@
 //! default — the user can opt in via the "Name clusters with LLM after
 //! confirm" toggle, or defer to the cluster pane's Name-clusters CTA.
 //!
-//! Implements the following slugs (see `docs/status.md`):
+//! Implements the following slugs (see `docs/cluster-editor.md`):
 //!
 //! - `cluster-review-tab-method-dropdown`
 //! - `cluster-review-tab-confirm-single-path`
@@ -1235,7 +1235,7 @@ fn confirm(
     let method_json = serde_json::to_string(&build.method).unwrap_or_else(|_| "null".into());
     // Build the node rows up front and persist them WITH the tree in one
     // atomic write. The old `insert_tree` (empty) → `insert_nodes` two-step
-    // landed the nodes as an op-log diff of the empty→full frontmatter, which
+    // landed the nodes as a layered-doc diff of the empty→full frontmatter, which
     // could corrupt the `nodes:` block for some node sets — a confirmed tree
     // would then reload empty (empty graph view / empty canvas export). Writing
     // the doc whole avoids the diff and the momentary empty-nodes file.

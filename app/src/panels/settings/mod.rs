@@ -11,8 +11,8 @@ use std::sync::{Arc, RwLock};
 use eframe::egui;
 
 use hiker_core::config::{Config, SettingsScope};
-use hiker_core::config::vcs::{GitMode, SyncTransport};
-use hiker_core::config::sections::{RecencyBias, SyncMode, TreeSortBy, WorkerPreferenceCfg};
+use hiker_core::config::vcs::GitMode;
+use hiker_core::config::sections::{RecencyBias, TreeSortBy, WorkerPreferenceCfg};
 
 use crate::state::{AppState, ToastLevel};
 use hiker_theme as theme;
@@ -156,9 +156,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
                 ctx.render_section();
                 ctx.search_section();
                 ctx.tasks_section();
-                ctx.acp_section();
                 ctx.trails_section();
-                ctx.sync_section();
                 ctx.git_section();
                 ctx.suggestions_section();
             }
@@ -353,7 +351,7 @@ fn indexing_section(&mut self) {
 
             // Note-ID-stamping setting retired with `note-id-stamping` —
             // under path-as-identity (`store-path-is-identity`), notes are
-            // addressed by their vault path and the op-log keeps an
+            // addressed by their vault path and the layered doc keeps an
             // internal `path → doc_id` map. There's nothing to stamp.
         });
 }
@@ -380,10 +378,6 @@ fn llm_section(&mut self) {
             int_row(ui, app, st, "Timeout (s)", "llm.limits.timeout_secs", &IntField { current: snap.llm.limits.timeout_secs, min: 1, max: u32::MAX as u64 });
 
             ui.add_space(4.0);
-            ui.label(egui::RichText::new("Agent").color(theme::muted()).small());
-            int_row(ui, app, st, "Iteration cap", "llm.agent.iteration_cap", &IntField { current: snap.llm.agent.iteration_cap as u64, min: 1, max: u32::MAX as u64 });
-            int_row(ui, app, st, "Tool timeout (s)", "llm.agent.tool_timeout_secs", &IntField { current: snap.llm.agent.tool_timeout_secs, min: 1, max: u32::MAX as u64 });
-
             bool_row(ui, app, st, "Audit: log full prompt", "llm.audit.log_full_prompt", snap.llm.audit.log_full_prompt);
             bool_row(ui, app, st, "Background writes need review", "llm.background.review_required", snap.llm.background.review_required);
         });
@@ -395,6 +389,14 @@ fn mcp_section(&mut self) {
         .default_open(true)
         .show(ui, |ui| {
             bool_row(ui, app, st, "Enabled", "mcp.enabled", snap.mcp.enabled);
+            ui.label(
+                egui::RichText::new(
+                    "Off by default — binds a write-capable localhost listener. \
+                     Enable to let an external agent (e.g. Claude Code) reach this vault.",
+                )
+                .color(theme::muted())
+                .small(),
+            );
             string_row(ui, app, st, "Bind host", "mcp.host", &snap.mcp.host);
             if snap.mcp.host != "127.0.0.1" && snap.mcp.host != "localhost" {
                 ui.horizontal(|ui| {
@@ -426,6 +428,9 @@ fn mcp_section(&mut self) {
                 bool_row(ui, app, st, "set_frontmatter", "mcp.tools.set_frontmatter_enabled", t.set_frontmatter_enabled);
                 bool_row(ui, app, st, "apply_tag", "mcp.tools.apply_tag_enabled", t.apply_tag_enabled);
                 bool_row(ui, app, st, "remove_tag", "mcp.tools.remove_tag_enabled", t.remove_tag_enabled);
+                // status: mcp-registry-tools — one family toggle for every
+                // generated create_<kind> / update_<kind> pair.
+                bool_row(ui, app, st, "kind tools (create_*/update_*)", "mcp.tools.kind_tools_enabled", t.kind_tools_enabled);
                 bool_row(ui, app, st, "task_checkout", "mcp.tools.task_checkout_enabled", t.task_checkout_enabled);
                 bool_row(ui, app, st, "task_submit", "mcp.tools.task_submit_enabled", t.task_submit_enabled);
                 bool_row(ui, app, st, "task_fail", "mcp.tools.task_fail_enabled", t.task_fail_enabled);
@@ -638,20 +643,9 @@ fn tasks_section(&mut self) {
                 int_row(ui, app, st, "Terminal retention (s)", "tasks.terminal_retention_secs", &IntField { current: snap.tasks.terminal_retention_secs, min: 1, max: u32::MAX as u64 });
                 bool_row(ui, app, st, "Direct worker enabled", "tasks.direct_worker.enabled", snap.tasks.direct_worker.enabled);
                 int_row(ui, app, st, "Direct worker parallelism", "tasks.direct_worker.parallelism", &IntField { current: snap.tasks.direct_worker.parallelism as u64, min: 1, max: u32::MAX as u64 });
-                bool_row(ui, app, st, "Expose to chat agent", "tasks.expose_to_chat_agent", snap.tasks.expose_to_chat_agent);
                 int_row(ui, app, st, "Lease default (s)", "tasks.lease.default_secs", &IntField { current: snap.tasks.lease.default_secs, min: 1, max: u32::MAX as u64 });
                 int_row(ui, app, st, "Lease max (s)", "tasks.lease.max_secs", &IntField { current: snap.tasks.lease.max_secs, min: 1, max: u32::MAX as u64 });
             }
-        });
-}
-
-fn acp_section(&mut self) {
-    let (ui, app, snap, st) = (&mut *self.ui, &mut *self.app, self.snap, &mut *self.st);
-    egui::CollapsingHeader::new("ACP")
-        .default_open(false)
-        .show(ui, |ui| {
-            string_row(ui, app, st, "Command", "acp.command", &snap.acp.command);
-            help(ui, "Full command line (e.g. `auggie --acp`). Empty = built-in basic agent.");
         });
 }
 
@@ -667,105 +661,30 @@ fn trails_section(&mut self) {
         });
 }
 
-fn sync_section(&mut self) {
-    // status: sync-config-section
-    let (ui, app, snap, st) = (&mut *self.ui, &mut *self.app, self.snap, &mut *self.st);
-    if matches!(st.scope, Scope::User) {
-        // [sync] is per-vault (the config lives in the vault TOML). Show a
-        // hint instead of the form, mirroring the editor/search sections.
-        egui::CollapsingHeader::new("Sync")
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new("Sync settings live in vault scope.")
-                        .color(theme::muted())
-                        .small(),
-                );
-            });
-        return;
-    }
-    egui::CollapsingHeader::new("Sync")
-        .default_open(false)
-        .show(ui, |ui| {
-            let s = &snap.sync;
-            bool_row(ui, app, st, "Enabled", "sync.enabled", s.enabled);
-            // status: sync-transport-seam
-            enum_combo(
-                ui, app, st,
-                "Transport",
-                "sync.transport",
-                s.transport,
-                &[
-                    (SyncTransport::Libp2p, "libp2p (P2P file blobs)", "libp2p"),
-                    (SyncTransport::Git, "git (commit + push/pull)", "git"),
-                    (SyncTransport::None, "None (local only)", "none"),
-                ],
-            );
-            // libp2p-only rows. They still serialize for git/none, but the
-            // active engine ignores them — keep them visible so a user
-            // switching transports doesn't lose their values.
-            enum_combo(
-                ui, app, st,
-                "Mode (libp2p)",
-                "sync.mode",
-                s.mode,
-                &[
-                    (SyncMode::Peer, "Peer (P2P/LAN)", "peer"),
-                    (SyncMode::Server, "Server relay", "server"),
-                    (SyncMode::Both, "Both", "both"),
-                ],
-            );
-            string_row(ui, app, st, "Server URL (libp2p)", "sync.server_url", &s.server_url);
-            bool_row(ui, app, st, "Discovery (libp2p)", "sync.discovery", s.discovery);
-
-            // Enrolled devices are read-only here — enrollment (the
-            // fingerprint swap) happens on the Sync page, not in settings.
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new(format!("Enrolled devices ({})", s.devices.len()))
-                    .color(theme::muted())
-                    .small(),
-            );
-            if s.devices.is_empty() {
-                help(ui, "No devices enrolled yet.");
-            } else {
-                for fp in &s.devices {
-                    ui.label(egui::RichText::new(fp).monospace().small());
-                }
-            }
-            help(ui, "Enroll devices on the Sync page; this list is read-only.");
-
-            ui.add_space(4.0);
-            help(
-                ui,
-                "Secrets (device key + per-vault content key) live in user scope and never travel with the synced vault.",
-            );
-        });
-}
-
 // status: git-config-section
 fn git_section(&mut self) {
     let (ui, app, snap, st) = (&mut *self.ui, &mut *self.app, self.snap, &mut *self.st);
     if matches!(st.scope, Scope::User) {
-        // [git] is per-vault, like [sync].
-        egui::CollapsingHeader::new("Git transport")
+        // [git] is per-vault.
+        egui::CollapsingHeader::new("Git")
             .default_open(false)
             .show(ui, |ui| {
                 ui.label(
-                    egui::RichText::new("Git transport settings live in vault scope.")
+                    egui::RichText::new("Git settings live in vault scope.")
                         .color(theme::muted())
                         .small(),
                 );
             });
         return;
     }
-    egui::CollapsingHeader::new("Git transport")
+    egui::CollapsingHeader::new("Git")
         .default_open(false)
         .show(ui, |ui| {
             let g = &snap.git;
+            bool_row(ui, app, st, "Enabled", "git.enabled", g.enabled);
             help(
                 ui,
-                "Active only when Sync transport is set to git. The .md files are canonical; .hiker/ is gitignored.",
+                "Optional, user-driven git (the VSCode model): opt in over a vault that is already a git repo. The .md files are canonical; .hiker/ is gitignored. Hiker never pushes/pulls automatically.",
             );
             enum_combo(
                 ui, app, st,
@@ -778,19 +697,13 @@ fn git_section(&mut self) {
                 ],
             );
             string_row(ui, app, st, "Remote (push/pull URL)", "git.remote", &g.remote);
-            help(ui, "Empty remote = commit-only local versioning (no push/pull).");
+            help(ui, "Empty remote = commit-only local versioning. Push/pull is user-driven.");
             bool_row(ui, app, st, "Commit on save", "git.auto_commit", g.auto_commit);
             int_row(
                 ui, app, st,
                 "Commit debounce (ms)",
                 "git.commit_debounce_ms",
                 &IntField { current: u64::from(g.commit_debounce_ms), min: 0, max: u32::MAX as u64 },
-            );
-            int_row(
-                ui, app, st,
-                "git gc interval (days)",
-                "git.gc_interval_days",
-                &IntField { current: u64::from(g.gc_interval_days), min: 0, max: u32::MAX as u64 },
             );
             help(
                 ui,

@@ -1,6 +1,6 @@
-//! The producer-facing seam over the op-log substrate. Every write path
+//! The producer-facing seam over the layered editing model. Every write path
 //! routes through this module: user saves apply to `accepted`
-//! and ride the op-log atomic-write path, agent edits queue as pending ops,
+//! and ride the atomic-write path, agent edits queue as pending ops,
 //! and per-op accept/reject flips a pending op's status. Producers (the app
 //! buffer-save command, the MCP write tools, the cluster/triage automations)
 //! call these helpers and never reach into the substrate themselves — keeping
@@ -19,8 +19,7 @@
 use std::sync::Arc;
 
 use crate::errors::HikerError;
-use crate::oplog::{shapes::Author, error::Error as SubstrateError, EditSpec, OpLog, ProducerCtx, StageOutcome};
-use crate::trash::Trash;
+use crate::editing::{shapes::Author, error::Error as SubstrateError, EditSpec, LayeredDoc, ProducerCtx, StageOutcome};
 use crate::vault::Vault;
 
 /// Translate a substrate error into the vault-wide [`HikerError`] so
@@ -30,15 +29,15 @@ use crate::vault::Vault;
 fn map_err(e: SubstrateError) -> HikerError {
     use SubstrateError as E;
     match e {
-        E::UnknownDoc(d) => HikerError::NotFound(format!("op-log doc {d}")),
-        E::UnknownPath(p) => HikerError::NotFound(format!("op-log path {p}")),
-        E::UnknownPendingOp(op) => HikerError::NotFound(format!("op-log pending op {op}")),
-        E::Anchor(msg) => HikerError::NotFound(format!("op-log anchor: {msg}")),
+        E::UnknownDoc(d) => HikerError::NotFound(format!("layered doc {d}")),
+        E::UnknownPath(p) => HikerError::NotFound(format!("layered-doc path {p}")),
+        E::UnknownPendingOp(op) => HikerError::NotFound(format!("layered-doc pending op {op}")),
+        E::Anchor(msg) => HikerError::NotFound(format!("layered-doc anchor: {msg}")),
         other => HikerError::Io(other.to_string()),
     }
 }
 
-/// The op-log document `kind` for a vault-relative path. Native vault
+/// The layered document `kind` for a vault-relative path. Native vault
 /// markdown is `"markdown"`; a `*.<ext>.md` next to a non-md source is a
 /// `"sidecar"` per `design.md`'s storage-mode table; a `.canvas` file is a
 /// `"canvas"` JSON Canvas document. Under path-identity the kind is derived
@@ -48,8 +47,8 @@ fn map_err(e: SubstrateError) -> HikerError {
 // status: canvas-doc-kind
 fn kind_for(rel: &str) -> &'static str {
     let name = rel.rsplit('/').next().unwrap_or(rel);
-    // A `.canvas` file is a first-class JSON Canvas op-log document — its
-    // JSON text rides op-log exactly like a note, under the `canvas` kind.
+    // A `.canvas` file is a first-class JSON Canvas layered document — its
+    // JSON text rides the layered editing model exactly like a note, under the `canvas` kind.
     if name.ends_with(".canvas") {
         return "canvas";
     }
@@ -63,20 +62,20 @@ fn kind_for(rel: &str) -> &'static str {
     }
 }
 
-/// Seed the op log from the on-disk vault. For every existing indexable
-/// document (`.md` notes and sidecars) with no persisted `.ops` history yet,
-/// seed the document from the file's current bytes authored as
-/// `user` (the path IS the doc id under path-identity).
+/// Seed the layered editing model from the on-disk vault. For every existing
+/// indexable document (`.md` notes and sidecars) not already mapped into the
+/// model this session, seed the document from the file's current bytes
+/// authored as `user` (the path IS the doc id under path-identity).
 /// Returns the number of documents freshly seeded.
 ///
-/// Idempotent: a path that already has `.ops` history is skipped, so a
+/// Idempotent: a path already mapped this session is skipped, so a
 /// second open is a no-op walk. The on-disk `.md` already equals
 /// `materialize(accepted)` by construction, so seeding goes through
-/// [`OpLog::seed_document`], which verifies the bytes against disk instead of
+/// [`LayeredDoc::seed_document`], which verifies the bytes against disk instead of
 /// rewriting the user's file — a first open never touches any note's mtime.
 ///
 /// status: op-log-doc-id-bootstrap
-pub fn bootstrap(vault: &Vault, log: &OpLog) -> Result<usize, HikerError> {
+pub fn bootstrap(vault: &Vault, log: &LayeredDoc) -> Result<usize, HikerError> {
     let mut seeded = 0usize;
     // Main pass: the user-visible vault. `walk_indexable_files` prunes at
     // `.hiker/` (the watcher-ignore rule applies in filter_entry), so the
@@ -87,7 +86,7 @@ pub fn bootstrap(vault: &Vault, log: &OpLog) -> Result<usize, HikerError> {
     // Second pass: `.hiker/trails/` carve-out — trail-docs at
     // `.hiker/trails/drafts/` and waypoint-notes at
     // `.hiker/trails/<id>/waypoints/`. Pre-existing waypoint files arriving
-    // via sync (or a fresh open against an existing vault) need op-log
+    // against an existing vault need layered-doc
     // `doc_id`s exactly like vault-root notes so trail integrity holds
     // without waiting for an individual ingest event. status: op-log-doc-id-bootstrap
     for rel in walk_hidden_md_subtree(vault, &crate::trails::dir())? {
@@ -100,25 +99,25 @@ pub fn bootstrap(vault: &Vault, log: &OpLog) -> Result<usize, HikerError> {
     Ok(seeded)
 }
 
-/// Seed one path into the op-log if it isn't already mapped. Returns `true`
-/// when a new doc was created, `false` when the path was skipped (already
-/// mapped, or marked unreadable on a prior run, or unreadable now). Read
-/// failures log and persist a skip marker but never abort the caller —
+/// Seed one path into the layered editing model if it isn't already mapped.
+/// Returns `true` when a new doc was created, `false` when the path was
+/// skipped (already mapped this session, or unreadable now). Read
+/// failures log but never abort the caller —
 /// matching the original bootstrap loop's posture.
-fn seed_one(vault: &Vault, log: &OpLog, rel: &str) -> Result<bool, HikerError> {
-    if log.doc_id_for_path(rel).map_err(map_err)?.is_some() {
-        return Ok(false);
-    }
-    if log.is_bootstrap_skipped(rel).map_err(map_err)? {
+fn seed_one(vault: &Vault, log: &LayeredDoc, rel: &str) -> Result<bool, HikerError> {
+    // Idempotency key is in-memory registration, not on-disk presence: under
+    // the disk-canonical model every existing `.md` "exists" as a doc, so the
+    // skip condition is "already loaded this session" (`op-log-doc-id-bootstrap`).
+    if log.is_loaded(rel) {
         return Ok(false);
     }
     let text = match vault.read_file(rel) {
         Ok(t) => t,
         Err(e) => {
-            tracing::warn!(path = %rel, error = %e, "op-log bootstrap: skipping unreadable note");
-            if let Err(mark_err) = log.mark_bootstrap_skipped(rel, &e.to_string()) {
-                tracing::debug!(path = %rel, error = %mark_err, "op-log bootstrap: could not persist skip marker");
-            }
+            // An unreadable note (non-UTF-8, permission error) is skipped for
+            // this open; the bootstrap-skip marker rode the deleted `op_history`
+            // index, so a future open simply re-reads and re-skips (cheap, rare).
+            tracing::warn!(path = %rel, error = %e, "layered-doc bootstrap: skipping unreadable note");
             return Ok(false);
         }
     };
@@ -132,10 +131,9 @@ fn seed_one(vault: &Vault, log: &OpLog, rel: &str) -> Result<bool, HikerError> {
 }
 
 /// Walk a hidden vault subtree (e.g. `.hiker/trails`) returning every `.md`
-/// file as a vault-relative path. Used by [`bootstrap`] (and the trails
-/// storage-layout migration) to reach files the main
-/// [`Vault::walk_indexable_files`] pass prunes at `.hiker/`. Symlinks are not
-/// followed, mirroring the main walker's policy.
+/// file as a vault-relative path. Used by [`bootstrap`] to reach files the
+/// main [`Vault::walk_indexable_files`] pass prunes at `.hiker/`. Symlinks
+/// are not followed, mirroring the main walker's policy.
 pub(crate) fn walk_hidden_md_subtree(
     vault: &Vault,
     rel_subtree: &str,
@@ -169,7 +167,7 @@ pub(crate) fn walk_hidden_md_subtree(
 /// that was created after the bootstrap walk — or never seen by it — still
 /// gets a doc before its first op is recorded.
 pub(crate) fn doc_id_or_seed(
-    log: &OpLog,
+    log: &LayeredDoc,
     vault: &Vault,
     rel: &str,
     initial_text: &str,
@@ -182,7 +180,7 @@ pub(crate) fn doc_id_or_seed(
         .map_err(map_err)
 }
 
-/// Ensure an op-log document exists for `rel`, seeding one from the file's
+/// Ensure a layered document exists for `rel`, seeding one from the file's
 /// current bytes when none is registered yet — a note created after the
 /// bootstrap walk (the New Note button, the tree's new-file verb, the
 /// wikilink "create missing note" jump). Returns the doc_id. Idempotent: a
@@ -194,122 +192,63 @@ pub(crate) fn doc_id_or_seed(
 /// too late — the user's typing would never have reached the `working` layer.
 ///
 /// status: op-log-ops-producer-helpers
-pub fn ensure_doc(log: &OpLog, vault: &Vault, rel: &str) -> Result<String, HikerError> {
+pub fn ensure_doc(log: &LayeredDoc, vault: &Vault, rel: &str) -> Result<String, HikerError> {
     doc_id_or_seed(log, vault, rel, "")
 }
 
-/// Route a user save through the op log: resolve `rel` to its doc_id (seeding
-/// one if necessary), then commit the buffer's full text as a `user` edit on
-/// `accepted`. The op log diffs `new_text` against the current accepted state
-/// into minimal localized spans, so a save lands as a text edit over
-/// only the bytes that actually changed — never a whole-document rewrite. It
-/// persists the `.ops` frame and atomically writes the materialized `.md` (the
+/// Route a user save through the layered editing model: resolve `rel` to its
+/// doc_id (seeding one if necessary), then commit the buffer's full text as a
+/// `user` edit on `accepted`. The model diffs `new_text` against the current
+/// accepted state into minimal localized spans, so a save lands as a text edit
+/// over only the bytes that actually changed — never a whole-document rewrite.
+/// It atomically writes the materialized `.md` (the
 /// `op-log-atomic-write` / `op-log-disk-canonical` path), so the caller does
 /// **not** also write the file itself. A save that changes nothing is a no-op.
 ///
 /// status: op-log-ops-producer-helpers
-pub fn user_save(log: &OpLog, vault: &Vault, rel: &str, new_text: &str) -> Result<(), HikerError> {
+pub fn user_save(log: &LayeredDoc, vault: &Vault, rel: &str, new_text: &str) -> Result<(), HikerError> {
     let doc_id = doc_id_or_seed(log, vault, rel, "")?;
     log.apply_user_text(&doc_id, new_text).map_err(map_err)?;
     Ok(())
 }
 
-/// The outcome of a re-extraction routed through [`reextract`]: which policy
-/// fired and whether a new version landed. The host surfaces this to decide
-/// whether to re-index the sidecar / report "no change".
+/// The outcome of a re-extraction routed through [`reextract`].
 ///
-/// status: op-log-reextract-replace
-/// status: op-log-reextract-skip
+/// In-process extraction has been removed: hiker does **zero** content
+/// extraction. All extraction/crawl/retrieval lives in a separate producer tool
+/// (working name *trailblazer*) that emits a manifest hiker imports (see
+/// `docs/import.md`). [`reextract`] is therefore a no-op stub that always
+/// reports `Skipped`; the enum is retained only so any residual caller still
+/// compiles. status: manifest-only-ingest
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReextractOutcome {
-    /// A previously-LINKED sidecar: the new body was applied as an `extractor`
-    /// op on `accepted` and a new version landed.
+    /// A re-extraction landed a new version. No longer produced — hiker does no
+    /// in-process extraction — retained only for the enum's stable shape.
     Replaced,
-    /// A previously-LINKED sidecar whose re-extraction produced *identical*
-    /// content — no op, no version (the no-op-on-identical contract).
+    /// A re-extraction produced identical content. No longer produced.
     Unchanged,
-    /// A previously-UNLINKED sidecar (the user unlinked to hand-edit): the
-    /// extractor did not overwrite the body (`op-log-reextract-skip`).
+    /// Re-extraction did nothing. The only outcome [`reextract`] ever returns:
+    /// hiker performs no in-process extraction, so there is nothing to re-run.
     Skipped,
 }
 
-/// Route a re-extraction's new body onto an existing LINKED sidecar as an
-/// `extractor`-authored op (`op-log-reextract-replace`), or skip it when the
-/// sidecar is UNLINKED (`op-log-reextract-skip`). The policy is selected from
-/// the sidecar's *current* on-disk link state: a `fill_body: false` /
-/// `link_state: unlinked` sidecar means the user took the body over by hand, so
-/// re-extraction must not clobber it; anything else (the linked default) lands
-/// the new body in place, leaving prior bodies in op-log history rather than a
-/// blind overwrite.
+/// No-op re-extraction stub. In-process extraction was removed under the
+/// manifest-only ingest decision (`hiker-core-rework-plan.md` WS6): hiker does
+/// no content extraction at all — an external producer (*trailblazer*) emits a
+/// manifest hiker imports, and re-importing a changed source is an import-path
+/// concern, not an in-process re-extraction. This always returns
+/// [`ReextractOutcome::Skipped`] and touches nothing.
 ///
-/// `rel` is the sidecar's vault-relative path; `new_body` is the freshly
-/// extracted body (the `Extracted.markdown` the leaf crate produced);
-/// `extractor_id` is the producing extractor's name (the `extractor:<id>`
-/// author identity). The doc must already exist (a first-time extraction of a
-/// brand-new sidecar uses the direct write path, not this) — an unmapped path
-/// resolves no policy and is reported `Skipped`.
-///
-/// This is the seam between `hiker-extract`'s output and `core::oplog`: the
-/// leaf crate produces the body; the host calls here to apply it as an op so
-/// the sidecar's version history, diff, per-hunk restore, and the status-bar
-/// version dropdown all come from the existing op-log / `core::changes`
-/// surfaces — no bespoke version store.
-///
-/// status: op-log-reextract-replace
-/// status: op-log-reextract-skip
-/// status: extract-version-oplog
-pub fn reextract(
-    log: &OpLog,
-    vault: &Vault,
-    rel: &str,
-    new_body: &str,
-    extractor_id: &str,
+/// status: manifest-only-ingest
+#[allow(clippy::unnecessary_wraps)]
+pub const fn reextract(
+    _log: &LayeredDoc,
+    _vault: &Vault,
+    _rel: &str,
+    _new_body: &str,
+    _extractor_id: &str,
 ) -> Result<ReextractOutcome, HikerError> {
-    let Some(doc_id) = log.doc_id_for_path(rel).map_err(map_err)? else {
-        // No op-log document: not a previously-extracted linked sidecar. The
-        // first-time-extraction direct write path owns this case.
-        return Ok(ReextractOutcome::Skipped);
-    };
-    if sidecar_is_unlinked(vault, rel) {
-        return Ok(ReextractOutcome::Skipped);
-    }
-    if log.reextract_replace(&doc_id, new_body, extractor_id).map_err(map_err)? {
-        Ok(ReextractOutcome::Replaced)
-    } else {
-        Ok(ReextractOutcome::Unchanged)
-    }
-}
-
-/// Whether the sidecar at `rel` is UNLINKED — the user-unlinked-to-hand-edit
-/// escape hatch (`capture-fill-body-toggle` / `extract-sidecar-linked-state`).
-/// Reads the on-disk frontmatter: a sidecar is unlinked when `hiker.link_state`
-/// is `unlinked` *or* `hiker.fill_body` is `false`. Anything else (linked
-/// default, missing fields, unreadable file) is treated as LINKED so the
-/// re-extraction replaces in place — the conservative default that keeps
-/// extraction working for the source-type.
-fn sidecar_is_unlinked(vault: &Vault, rel: &str) -> bool {
-    let Ok(source) = vault.read_file(rel) else {
-        return false;
-    };
-    let Some(fm) = crate::frontmatter::split(&source).frontmatter else {
-        return false;
-    };
-    let Some(hiker) = fm.get("hiker") else {
-        return false;
-    };
-    if hiker
-        .get("link_state")
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| s.eq_ignore_ascii_case("unlinked"))
-    {
-        return true;
-    }
-    // `fill_body: false` is the capture-spec note's body-link switch — an
-    // explicit "don't fill the body" is the same as unlinked for re-extraction.
-    hiker
-        .get("fill_body")
-        .and_then(serde_yml::Value::as_bool)
-        == Some(false)
+    Ok(ReextractOutcome::Skipped)
 }
 
 /// One anchored or whole-body edit handed to [`stage_agent_edits`]. Mirrors
@@ -323,13 +262,13 @@ pub struct AgentEdit {
 
 /// Stage a batch of agent edits as pending ops against the document at `rel`.
 /// Resolves (or seeds) the doc_id, then queues each edit via
-/// [`OpLog::stage_pending`] tagged `agent:<client_id>`. The ops do not reach
+/// [`LayeredDoc::stage_pending`] tagged `agent:<client_id>`. The ops do not reach
 /// disk until accepted; the returned op ids let the caller surface them for
 /// review and later flip each via [`flip_op_status`].
 ///
 /// status: op-log-ops-producer-helpers
 pub fn stage_agent_edits(
-    log: &OpLog,
+    log: &LayeredDoc,
     vault: &Vault,
     client_id: &str,
     surface: &str,
@@ -373,7 +312,7 @@ pub struct ReorgMove {
 ///
 /// status: op-log-reorg-batch
 pub fn stage_reorg_batch(
-    log: &OpLog,
+    log: &LayeredDoc,
     vault: &Vault,
     producer: &str,
     surface: &str,
@@ -396,7 +335,7 @@ pub fn stage_reorg_batch(
 }
 
 /// Stage a single pending content edit at `rel` from a *whole new document
-/// text*, tagged `auto:<producer>`. The op-log diffs the new text against the
+/// text*, tagged `auto:<producer>`. The layered editing model diffs the new text against the
 /// current accepted state and queues one pending op (labeled `SetFrontmatter`
 /// when the change lands in the frontmatter fence — the cluster-editor tag
 /// shape — else `Replace`). Returns the minted batch id + op ids; the batch
@@ -404,7 +343,7 @@ pub fn stage_reorg_batch(
 ///
 /// status: op-log-reorg-batch
 pub fn stage_auto_content(
-    log: &OpLog,
+    log: &LayeredDoc,
     vault: &Vault,
     producer: &str,
     surface: &str,
@@ -421,6 +360,109 @@ pub fn stage_auto_content(
         .map_err(map_err)
 }
 
+/// One whole-document text in a [`stage_auto_content_batch`] call: the
+/// vault-relative path and the full new file the producer computed.
+#[derive(Debug, Clone)]
+pub struct ContentStage {
+    pub rel: String,
+    pub new_text: String,
+}
+
+/// One automation firing's in-flight overlay of computed whole-document
+/// texts. A multi-step producer (a rules firing applying several actions)
+/// writes each step's output here instead of committing per step: later
+/// steps read earlier steps' output through [`Draft::read`], and the
+/// producer stages the collected texts as ONE cross-document batch via
+/// [`stage_auto_content_batch`] — the one-batch-per-firing property. The
+/// board write ops land into this overlay in their `AutoStaged` mode
+/// (`boards::ops::BoardWriteMode`), so automation and the direct user
+/// path share one mutation body and only the landing differs.
+///
+/// status: rule-attribution
+/// status: rule-closed-verbs
+#[derive(Default)]
+pub struct Draft {
+    texts: std::collections::BTreeMap<String, String>,
+    /// First-touch order, so the staged batch is deterministic.
+    order: Vec<String>,
+}
+
+impl Draft {
+    /// Read `rel` through the overlay: the draft's computed text when one
+    /// was already produced this firing, else the current disk bytes.
+    pub fn read(&self, vault: &Vault, rel: &str) -> Result<String, HikerError> {
+        if let Some(text) = self.texts.get(rel) {
+            return Ok(text.clone());
+        }
+        vault.read_file(rel)
+    }
+
+    /// Record `rel`'s new whole-document text. The first touch fixes the
+    /// path's position in the staged-batch order.
+    pub fn put(&mut self, rel: &str, text: String) {
+        if !self.texts.contains_key(rel) {
+            self.order.push(rel.to_string());
+        }
+        self.texts.insert(rel.to_string(), text);
+    }
+
+    /// Whether the draft already holds a text for `rel`.
+    #[must_use]
+    pub fn contains(&self, rel: &str) -> bool {
+        self.texts.contains_key(rel)
+    }
+
+    /// The drafted paths in first-touch order.
+    #[must_use]
+    pub fn paths(&self) -> &[String] {
+        &self.order
+    }
+
+    /// The drafted texts as [`ContentStage`] items, in first-touch order —
+    /// the exact shape [`stage_auto_content_batch`] takes.
+    #[must_use]
+    pub fn stages(&self) -> Vec<ContentStage> {
+        self.order
+            .iter()
+            .map(|rel| ContentStage {
+                rel: rel.clone(),
+                new_text: self.texts[rel].clone(),
+            })
+            .collect()
+    }
+}
+
+/// Stage several whole-document texts as pending content ops sharing ONE
+/// cross-document batch id — the multi-doc sibling of [`stage_auto_content`]
+/// (which mints a batch per call), in the `op-log-reorg-batch` shape. Built
+/// for `sprint-rollover`'s close batch: N board-doc rewrites authored
+/// `auto:<producer>` (`auto:sprint-close`), reviewed and flipped as one unit
+/// through [`flip_batch_status`] and the standard staging surfaces, with the
+/// usual per-item partial-apply semantics on accept. Docs whose new text
+/// equals the current accepted state stage nothing.
+///
+/// status: sprint-rollover
+/// status: op-log-reorg-batch
+pub fn stage_auto_content_batch(
+    log: &LayeredDoc,
+    vault: &Vault,
+    producer: &str,
+    surface: &str,
+    items: &[ContentStage],
+) -> Result<StageOutcome, HikerError> {
+    let mut resolved: Vec<(String, String)> = Vec::with_capacity(items.len());
+    for item in items {
+        let doc_id = doc_id_or_seed(log, vault, &item.rel, "")?;
+        resolved.push((doc_id, item.new_text.clone()));
+    }
+    let ctx = ProducerCtx {
+        author: Author::Auto(producer.to_string()),
+        surface: surface.to_string(),
+        session_id: None,
+    };
+    log.stage_pending_contents(&resolved, &ctx).map_err(map_err)
+}
+
 /// Accept or reject every pending op in a reorg `batch_id` (`op-log-reorg-batch`).
 /// Accept applies each contributing `Rename` independently, skipping any that
 /// fail (a target collision on one move does not block the rest — partial
@@ -429,7 +471,7 @@ pub fn stage_auto_content(
 ///
 /// status: op-log-reorg-batch
 pub fn flip_batch_status(
-    log: &OpLog,
+    log: &LayeredDoc,
     batch_id: &str,
     accept: bool,
 ) -> Result<Vec<String>, HikerError> {
@@ -440,6 +482,73 @@ pub fn flip_batch_status(
     }
 }
 
+/// Registry + store + vault handles for the apply-time invariant re-check
+/// at the flip seam. Layering decided with `derived-status-rule`'s
+/// apply-time fix: the layered editing model stays pure — it knows nothing of
+/// kinds, boards, or membership — so the check lives HERE in the ops
+/// layer, where producers already hold these handles, as a wrapper over
+/// the raw flip primitives. Surfaces that can accept a board-doc content
+/// op (the review tabs, the in-buffer hunk verbs, the rules / sprint-close
+/// auto-flips) flip through [`flip_op_status_checked`] /
+/// [`flip_batch_status_checked`]; producers whose ops can never add a
+/// board card (triage renames, agent note edits without a store handle)
+/// stay on the raw primitives.
+pub struct FlipCtx<'a> {
+    pub vault: &'a Vault,
+    pub store: &'a crate::store::Store,
+    pub kinds: &'a crate::kinds::Registry,
+}
+
+/// [`flip_batch_status`] with the apply-time one-sprint re-check
+/// (`derived-status-rule`): before accepting, every op in the batch that
+/// adds a note card to a sprint-kind board is re-verified against the
+/// accepted state at THIS moment (`pm::verify_flip_single_sprint`) — the
+/// stage-time check can be hours stale under review mode. A violation
+/// refuses the whole flip with the typed [`HikerError::SprintConflict`],
+/// leaving the batch pending. Rejects are never checked.
+///
+/// status: derived-status-rule
+pub fn flip_batch_status_checked(
+    log: &LayeredDoc,
+    ctx: &FlipCtx<'_>,
+    batch_id: &str,
+    accept: bool,
+) -> Result<Vec<String>, HikerError> {
+    if accept {
+        let ops = log.pending_ops_in_batch(batch_id).map_err(map_err)?;
+        crate::pm::verify_flip_single_sprint(log, ctx.vault, ctx.store, ctx.kinds, &ops)?;
+    }
+    flip_batch_status(log, batch_id, accept)
+}
+
+/// [`flip_op_status`] with the apply-time one-sprint re-check — the per-op
+/// sibling of [`flip_batch_status_checked`]. Each op is verified alone
+/// (accepted state + just that op), so accepting half a multi-doc batch
+/// (the destination board of a sprint close without its closing half) is
+/// refused exactly when it would land a note on two sprints.
+///
+/// status: derived-status-rule
+pub fn flip_op_status_checked(
+    log: &LayeredDoc,
+    ctx: &FlipCtx<'_>,
+    rel: &str,
+    op_ids: &[String],
+    accept: bool,
+) -> Result<(), HikerError> {
+    if accept {
+        let doc_id = log
+            .doc_id_for_path(rel)
+            .map_err(map_err)?
+            .ok_or_else(|| HikerError::NotFound(format!("op-log path {rel}")))?;
+        let ops: Vec<(String, String)> = op_ids
+            .iter()
+            .map(|op_id| (doc_id.clone(), op_id.clone()))
+            .collect();
+        crate::pm::verify_flip_single_sprint(log, ctx.vault, ctx.store, ctx.kinds, &ops)?;
+    }
+    flip_op_status(log, rel, op_ids, accept)
+}
+
 /// Accept or reject pending ops by id. The single per-op primitive both the
 /// per-hunk verbs and the patch-review bulk actions ride on: accept applies
 /// the op's text edit to `accepted` (and atomically rewrites the `.md`),
@@ -448,7 +557,7 @@ pub fn flip_batch_status(
 ///
 /// status: op-log-ops-producer-helpers
 pub fn flip_op_status(
-    log: &OpLog,
+    log: &LayeredDoc,
     rel: &str,
     op_ids: &[String],
     accept: bool,
@@ -477,7 +586,7 @@ pub fn flip_op_status(
 ///
 /// status: op-log-per-hunk-accept-reject
 pub fn ops_in_hunk(
-    log: &OpLog,
+    log: &LayeredDoc,
     rel: &str,
     session: Option<&str>,
     start: usize,
@@ -494,13 +603,13 @@ pub fn ops_in_hunk(
 /// and its pending-view state (accepted + the session's queued pending ops).
 /// Returns `(accepted_text, pending_view_text)` — the two ropes the inline
 /// patch-review `DiffLayer` diffs (`op-log-hunk-view`). Per `op-log.md`'s
-/// module placement the app may also read these straight off the `OpLog`
+/// module placement the app may also read these straight off the `LayeredDoc`
 /// handle; this seam keeps the path→doc_id resolution in `core::ops` for
 /// callers that only hold a path.
 ///
 /// status: op-log-hunk-view
 pub fn review_materializations(
-    log: &OpLog,
+    log: &LayeredDoc,
     rel: &str,
     session: Option<&str>,
 ) -> Result<Option<(String, String)>, HikerError> {
@@ -526,7 +635,7 @@ pub struct WholeFileProposal {
     /// The pending op id — the handle Accept / Reject flip through
     /// [`flip_op_status`], and the key the preview tab is keyed on.
     pub op_id: String,
-    /// The op log document id the op lives on.
+    /// The layered document id the op lives on.
     pub doc_id: String,
     /// Vault-relative path the proposal targets.
     pub target_path: String,
@@ -548,8 +657,8 @@ pub struct WholeFileProposal {
 /// rewrite is an anchorless `Replace`; a new-note proposal is a `Create`.
 /// Frontmatter patches (`SetFrontmatter`), anchored `Replace`, `Rename`, and
 /// `Tombstone` are *not* whole-file — they ride the inline / confirm surfaces.
-const fn whole_file_action(op_kind: &crate::oplog::shapes::OpKind) -> Option<&'static str> {
-    use crate::oplog::shapes::OpKind;
+const fn whole_file_action(op_kind: &crate::editing::shapes::OpKind) -> Option<&'static str> {
+    use crate::editing::shapes::OpKind;
     match op_kind {
         OpKind::Replace { anchor: None } => Some("write_note"),
         OpKind::Create => Some("create"),
@@ -561,7 +670,7 @@ const fn whole_file_action(op_kind: &crate::oplog::shapes::OpKind) -> Option<&'s
 }
 
 /// List every pending whole-file proposal across the vault, resolved to its
-/// target path. Walks `OpLog::all_pending_ops`, keeps only the whole-file
+/// target path. Walks `LayeredDoc::all_pending_ops`, keeps only the whole-file
 /// shapes (per [`whole_file_action`]), and resolves each op's `doc_id` to a
 /// vault-relative path. Feeds the buffer review surface (version dropdown,
 /// pending-rewrite banner, agent-diff toggle). Sorted newest-first so the
@@ -569,7 +678,7 @@ const fn whole_file_action(op_kind: &crate::oplog::shapes::OpKind) -> Option<&'s
 /// (`note-open-routes-to-pending-review`).
 ///
 /// status: write-note-review-surface
-pub fn list_whole_file_proposals(log: &OpLog) -> Result<Vec<WholeFileProposal>, HikerError> {
+pub fn list_whole_file_proposals(log: &LayeredDoc) -> Result<Vec<WholeFileProposal>, HikerError> {
     let pending = log.all_pending_ops().map_err(map_err)?;
     let mut out = Vec::new();
     for (doc_id, op) in pending {
@@ -623,13 +732,18 @@ pub struct PendingProposal {
     /// Whether the op has drifted against current `accepted` — Accept is
     /// disabled for drifted proposals per `patch-review-conflicted-accept-disabled`.
     pub drifted: bool,
+    /// The op's staging batch id. Ops sharing a batch id across documents
+    /// (the `op-log-reorg-batch` / sprint-close shape) review as ONE unit:
+    /// the review tab groups them into a single row flipped through
+    /// [`flip_batch_status`], never per-doc.
+    pub batch_id: Option<String>,
 }
 
 /// Coarse action label for a pending op's kind, used in the cross-vault
 /// review tab's per-row header. Distinct from [`whole_file_action`], which
 /// filters to *only* the whole-file shapes; this names every kind.
-const fn action_label(op_kind: &crate::oplog::shapes::OpKind) -> &'static str {
-    use crate::oplog::shapes::OpKind;
+const fn action_label(op_kind: &crate::editing::shapes::OpKind) -> &'static str {
+    use crate::editing::shapes::OpKind;
     match op_kind {
         OpKind::Replace { anchor: Some(_) } => "edit_note",
         OpKind::Replace { anchor: None } => "write_note",
@@ -642,13 +756,13 @@ const fn action_label(op_kind: &crate::oplog::shapes::OpKind) -> &'static str {
 
 /// List every pending op across the vault, resolved to its target path and
 /// drift status — the cross-vault `PatchReview` tab's feed. Walks
-/// `OpLog::all_pending_ops`, resolves each op's `doc_id` to a vault-relative
+/// `LayeredDoc::all_pending_ops`, resolves each op's `doc_id` to a vault-relative
 /// path (`path_for_doc`), and checks drift (`is_pending_drifted`). Sorted
 /// newest-first so the tab opens with the most recent proposals on top. Ops
 /// whose document has no path mapping are skipped (they can't surface a row).
 ///
 /// status: write-note-review-surface
-pub fn list_pending_proposals(log: &OpLog) -> Result<Vec<PendingProposal>, HikerError> {
+pub fn list_pending_proposals(log: &LayeredDoc) -> Result<Vec<PendingProposal>, HikerError> {
     let pending = log.all_pending_ops().map_err(map_err)?;
     let mut out = Vec::new();
     for (doc_id, op) in pending {
@@ -663,9 +777,38 @@ pub fn list_pending_proposals(log: &OpLog) -> Result<Vec<PendingProposal>, Hiker
             action: action_label(&op.op_kind),
             created_at_ms: op.created_at_ms,
             drifted,
+            batch_id: op.batch_id,
         });
     }
     out.sort_by_key(|b| std::cmp::Reverse(b.created_at_ms));
+    Ok(out)
+}
+
+/// The target paths of the OTHER still-pending ops sharing `op_id`'s batch
+/// — the per-doc-accept guard's read: a nonempty result means accepting
+/// just this op splits a multi-doc batch (the sprint-close shape), so the
+/// caller warns and names what's left pending. Empty when the op has no
+/// batch, the batch has no other pending members, or the op isn't pending.
+///
+/// status: op-log-reorg-batch
+pub fn pending_batch_siblings(log: &LayeredDoc, op_id: &str) -> Result<Vec<String>, HikerError> {
+    let pending = log.all_pending_ops().map_err(map_err)?;
+    let Some(batch_id) = pending
+        .iter()
+        .find(|(_, op)| op.op_id == op_id)
+        .and_then(|(_, op)| op.batch_id.clone())
+    else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for (doc_id, op) in pending {
+        if op.op_id != op_id
+            && op.batch_id.as_deref() == Some(batch_id.as_str())
+            && let Some(path) = log.path_for_doc(&doc_id).map_err(map_err)?
+        {
+            out.push(path);
+        }
+    }
     Ok(out)
 }
 
@@ -675,7 +818,7 @@ pub fn list_pending_proposals(log: &OpLog) -> Result<Vec<PendingProposal>, Hiker
 /// review surfaces have nothing to show.
 ///
 /// status: write-note-review-surface
-pub fn pending_op_count(log: &OpLog) -> Result<usize, HikerError> {
+pub fn pending_op_count(log: &LayeredDoc) -> Result<usize, HikerError> {
     Ok(log.all_pending_ops().map_err(map_err)?.len())
 }
 
@@ -683,13 +826,13 @@ pub fn pending_op_count(log: &OpLog) -> Result<usize, HikerError> {
 /// current accepted (= on-disk) content — the two ropes the whole-file review
 /// surface's `DiffLayer` compares. Returns `(accepted_text, proposed_text)`.
 /// `proposed_text` is `materialize(accepted + just this op)`; `accepted_text`
-/// is `materialize(accepted)`. `Ok(None)` when the path has no doc. The op-log
+/// is `materialize(accepted)`. `Ok(None)` when the path has no doc. The layered-doc
 /// preview path reads through here so the buffer never reaches into the
 /// substrate's internal state itself.
 ///
 /// status: write-note-review-surface
 pub fn proposal_materializations(
-    log: &OpLog,
+    log: &LayeredDoc,
     rel: &str,
     op_id: &str,
 ) -> Result<Option<(String, String)>, HikerError> {
@@ -703,331 +846,89 @@ pub fn proposal_materializations(
     Ok(Some((accepted.text, proposed.text)))
 }
 
-/// A path's accepted-op history, newest-first — the version list behind the
-/// snapshot dropdown, per-file history, and recent activity. Resolves
-/// `rel` → doc_id; empty `Vec` when the path has no doc.
+/// One version in a note's plain-file snapshot history (`core::snapshot`).
+/// The `snapshot_id` is the snapshot's millisecond timestamp rendered as a
+/// string — a stable, restart-safe handle the version dropdown / diff
+/// surfaces carry (it replaces the retired op-log `op_id`). `timestamp_ms`
+/// is the same instant as an `i64` for display ordering.
 ///
-/// status: op-log-history-materialization
-pub fn path_history(
-    log: &OpLog,
+/// status: plain-file-snapshots
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotVersion {
+    pub snapshot_id: String,
+    pub timestamp_ms: i64,
+}
+
+/// A path's version history, newest-first — the list behind the version
+/// dropdown, per-file history, and the home version-browser. Sourced from
+/// the plain-file snapshot tree under `.hiker/history/<rel>/` (the op-log
+/// history engine is retired). Empty `Vec` when the note has no snapshots.
+///
+/// status: plain-file-snapshots
+pub fn snapshot_history(
+    log: &LayeredDoc,
     rel: &str,
     limit: usize,
-) -> Result<Vec<crate::oplog::meta::OpMetadata>, HikerError> {
-    let Some(doc_id) = log.doc_id_for_path(rel).map_err(map_err)? else {
-        return Ok(Vec::new());
-    };
-    log.doc_history(&doc_id, limit).map_err(map_err)
+) -> Result<Vec<SnapshotVersion>, HikerError> {
+    let snaps = crate::snapshot::list_snapshots(log.vault_root(), rel)
+        .map_err(|e| HikerError::Io(e.to_string()))?;
+    Ok(snaps
+        .into_iter()
+        .take(limit)
+        .map(|s| SnapshotVersion {
+            snapshot_id: s.timestamp_ms.to_string(),
+            timestamp_ms: s.timestamp_ms as i64,
+        })
+        .collect())
 }
 
-/// The accepted content of `rel` as of accepted op `op_id` — the content
-/// behind a version-dropdown preview / snapshot diff. `Ok(None)` when the path
-/// has no doc or no retained history frame matches the op (pre-retention /
-/// lifecycle marker). Reconstructed from the per-op snapshot, never the live doc.
+/// The content of `rel` at snapshot `snapshot_id` (the snapshot's
+/// millisecond timestamp as a string) — the content behind a version-
+/// dropdown preview / diff. `Ok(None)` when no snapshot with that id exists.
+/// Read straight off the plain `.md` snapshot file, never the live doc.
 ///
-/// status: op-log-history-materialization
-pub fn content_at_op(log: &OpLog, rel: &str, op_id: &str) -> Result<Option<String>, HikerError> {
-    let Some(doc_id) = log.doc_id_for_path(rel).map_err(map_err)? else {
+/// status: plain-file-snapshots
+pub fn content_at_snapshot(
+    log: &LayeredDoc,
+    rel: &str,
+    snapshot_id: &str,
+) -> Result<Option<String>, HikerError> {
+    let snaps = crate::snapshot::list_snapshots(log.vault_root(), rel)
+        .map_err(|e| HikerError::Io(e.to_string()))?;
+    let Some(snap) = snaps
+        .into_iter()
+        .find(|s| s.timestamp_ms.to_string() == snapshot_id)
+    else {
         return Ok(None);
     };
-    Ok(log
-        .materialize_at(&doc_id, op_id)
-        .map_err(map_err)?
-        .map(|c| c.text))
+    crate::snapshot::read(&snap.path)
+        .map(Some)
+        .map_err(|e| HikerError::Io(e.to_string()))
 }
 
-/// The accepted content of `rel` as of the op immediately *before* its newest
-/// accepted op — the "restore previous" rollback source. Returns
-/// `(prior_op_id, content)`, or `None` when the path has no doc, no prior
-/// version, or that version predates retention.
+/// The content of `rel` at the snapshot immediately *before* its newest one
+/// — the "restore previous" rollback source. Returns `(prior_snapshot_id,
+/// content)`, or `None` when the note has fewer than two snapshots. The
+/// newest snapshot mirrors the current on-disk content, so index 1 is the
+/// prior version.
 ///
-/// status: op-log-history-materialization
-pub fn previous_accepted_content(
-    log: &OpLog,
+/// status: plain-file-snapshots
+pub fn previous_snapshot_content(
+    log: &LayeredDoc,
     rel: &str,
 ) -> Result<Option<(String, String)>, HikerError> {
-    let Some(doc_id) = log.doc_id_for_path(rel).map_err(map_err)? else {
+    let snaps = crate::snapshot::list_snapshots(log.vault_root(), rel)
+        .map_err(|e| HikerError::Io(e.to_string()))?;
+    let Some(prev) = snaps.get(1) else {
         return Ok(None);
     };
-    let hist = log.doc_history(&doc_id, 2).map_err(map_err)?;
-    let Some(prev) = hist.get(1) else {
-        return Ok(None);
-    };
-    match log.materialize_at(&doc_id, &prev.op_id).map_err(map_err)? {
-        Some(content) => Ok(Some((prev.op_id.clone(), content.text))),
-        None => Ok(None),
-    }
+    crate::snapshot::read(&prev.path)
+        .map(|content| Some((prev.timestamp_ms.to_string(), content)))
+        .map_err(|e| HikerError::Io(e.to_string()))
 }
-
-/// Reconcile an external `.md` edit into the op log. The watcher reports a
-/// change hiker didn't initiate (after `watcher-suppress-self-writes` has
-/// already dropped self-write echoes); this reads the new disk bytes and
-/// hands them to the substrate, which compares against
-/// `materialize(accepted)`: equal → ignored as a self-write echo (the safety
-/// net); different → the text delta is applied to `accepted`'s `text`
-/// tagged `author=external`. Producers / the watcher bridge never touch
-/// `OpLog` directly — this is the seam.
-///
-/// No-op (`Ok(false)`) when the path has no doc yet (the bootstrap / create
-/// path adopts it instead) or when disk already equals accepted. Returns
-/// `Ok(true)` when a delta was applied.
-///
-/// status: op-log-external-edit-sync
-pub fn external_edit(log: &OpLog, vault: &Vault, rel: &str) -> Result<bool, HikerError> {
-    let Some(doc_id) = log.doc_id_for_path(rel).map_err(map_err)? else {
-        return Ok(false);
-    };
-    // Read the current disk bytes. A vanished/unreadable file is left for
-    // the delete path to handle; reconciliation only covers content edits.
-    let disk_text = match vault.read_file(rel) {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::warn!(path = %rel, error = %e, "external-edit-sync: unreadable, skipping");
-            return Ok(false);
-        }
-    };
-    log.apply_external_edit(&doc_id, &disk_text).map_err(map_err)
-}
-
-/// Reconcile every tracked document's disk bytes against its
-/// `materialize(accepted)`, folding any drift in as one `author=external` op
-/// per doc — the **startup reconcile** trigger of `op-log.md`'s
-/// External-edit sync (after bootstrap seeding, before the first sync round).
-/// It closes the gap the live watcher can't: edits made to the `.md` while
-/// hiker was closed (a Syncthing receive, a manual edit in another tool) are
-/// never replayed by the watcher, so this walks the tracked docs and reconciles
-/// them once at open.
-///
-/// **Hash-gated, not mtime-gated.** For each tracked doc that still has a file
-/// on disk, the byte hash of the disk text is compared against the hash of
-/// `materialize(accepted)`. A match produces no op and no disk rewrite, so a
-/// clean reopen reconciles nothing — even if the file's mtime changed
-/// (`op-log-disk-canonical`). On mismatch the disk text is folded in by
-/// reusing the same [`external_edit`] / [`OpLog::apply_external_edit`] path the
-/// live watcher uses, authored `external`.
-///
-/// **Offline delete and rename** (per `op-log.md`'s "Offline delete and
-/// rename") are reconciled too. A tracked path *gone* from disk is first
-/// probed as an offline rename: if a new untracked path on disk carries
-/// content whose hash matches the gone doc's current or recent history hashes,
-/// it is recognized as the same lineage — `path → doc_id` is rebound and an
-/// `OpKind::Rename { from }` is recorded (`author=external`), preserving
-/// history. No match → the gone path is an offline delete: tombstone the doc
-/// (`author=external`) and capture `materialize(accepted)` — the last known
-/// content, since the disk bytes are gone — as a recoverable trash entry that
-/// references the `doc_id`. The document's history (`<doc-id>.ops` + the
-/// metadata rows) is RETAINED keyed by `doc_id`, not purged, so a later
-/// restore rebinds and recovers full history. The new path of a rename, and
-/// any other untracked file, is seeded by `bootstrap` separately.
-///
-/// Returns the count of docs that were actually reconciled (a delta applied, a
-/// rename rebound, or a delete tombstoned) — not the number walked.
-///
-/// status: op-log-startup-disk-reconcile
-pub fn reconcile_disk(
-    vault: &Vault,
-    log: &OpLog,
-    trash: &Trash,
-) -> Result<usize, HikerError> {
-    let mut reconciled = 0usize;
-    // TODO(op-log-startup-disk-reconcile): mtime/size pre-filter. The op-log
-    // stores no per-doc mtime to compare against, so adding one would mean new
-    // persisted state; at personal-vault scale hashing every tracked doc is
-    // fine. The byte hash below remains the commit decision regardless.
-
-    // Untracked disk paths (present on disk, no doc-index row) are the only
-    // candidates for an offline-rename target. Resolve them once, lazily
-    // hashing each only when a gone doc actually needs a rename probe — an
-    // all-content-drift vault never reads a single one.
-    let untracked = UntrackedDiskPaths::scan(vault, log)?;
-
-    // Best-effort per doc: a single doc that can't be reconciled (a file that
-    // exists but won't read — a permission error, a transient lock, non-UTF-8)
-    // must not abort the pass for every other doc. Log and carry on, mirroring
-    // `bootstrap`'s `seed_one` posture.
-    for doc_id in log.list_doc_ids().map_err(map_err)? {
-        match reconcile_one_doc(vault, log, trash, &untracked, &doc_id) {
-            Ok(true) => reconciled += 1,
-            Ok(false) => {}
-            Err(e) => tracing::warn!(
-                doc_id = %doc_id, error = %e,
-                "startup-disk-reconcile: skipping doc (non-fatal)",
-            ),
-        }
-    }
-    Ok(reconciled)
-}
-
-/// Reconcile one tracked doc against its on-disk file. `Ok(true)` when a change
-/// was applied (edit fold, rename rebind, delete-to-trash, or a resurrect),
-/// `Ok(false)` on a clean no-op, `Err` when the doc couldn't be reconciled
-/// (the caller logs and skips it — never fatal to the whole pass).
-///
-/// Presence is decided by whether the file EXISTS, not by whether it READS. A
-/// path with no file is an offline delete/rename; a file that exists but fails
-/// to read (non-UTF-8, a permission error, a transient lock) is NOT a delete —
-/// the read error is surfaced so the doc and its file are left untouched rather
-/// than tombstoned and trashed.
-fn reconcile_one_doc(
-    vault: &Vault,
-    log: &OpLog,
-    trash: &Trash,
-    untracked: &UntrackedDiskPaths,
-    doc_id: &str,
-) -> Result<bool, HikerError> {
-    let Some(rel) = log.path_for_doc(doc_id).map_err(map_err)? else {
-        // No path mapping (e.g. an already-tombstoned lineage whose file is
-        // gone) — nothing on disk to reconcile against.
-        return Ok(false);
-    };
-    let present = vault.abs_path(&rel).map(|p| p.exists()).unwrap_or(false);
-
-    if !present {
-        // The file is genuinely gone. Probe for an offline rename before
-        // treating it as a delete.
-        let accepted = log.materialize_accepted(doc_id).map_err(map_err)?;
-        if accepted.tombstone {
-            // Already tombstoned (e.g. a prior reconcile) — the absent file is
-            // the expected state; nothing to re-delete.
-            return Ok(false);
-        }
-        if let Some(new_path) = find_rename_target(vault, log, doc_id, untracked)? {
-            // Same lineage at a new path: rebind + record the rename, authored
-            // external. The new path is consumed so no other gone doc claims it.
-            log.rename_document(doc_id, &new_path, &Author::External)
-                .map_err(map_err)?;
-            untracked.consume(&new_path);
-            tracing::debug!(from = %rel, to = %new_path, "startup-disk-reconcile: folded offline rename");
-            return Ok(true);
-        }
-        // No rename match → offline delete. Tombstone (external) and route the
-        // last known content through the trash so it stays recoverable; the
-        // op-log files stay put keyed by doc_id.
-        log.tombstone_document(doc_id, &Author::External)
-            .map_err(map_err)?;
-        let entry = trash.capture_content_in(&rel, &accepted.text, Some(doc_id.to_string()))?;
-        trash.append(&entry)?;
-        tracing::debug!(path = %rel, "startup-disk-reconcile: offline delete → trash, history retained");
-        return Ok(true);
-    }
-
-    // The file exists. A read failure now is present-but-unreadable (non-UTF-8,
-    // a permission error) — surfaced via `?` so the caller logs and skips,
-    // never mistaking it for a delete.
-    let disk_text = vault.read_file(&rel)?;
-    let accepted = log.materialize_accepted(doc_id).map_err(map_err)?;
-
-    let mut changed = false;
-    if accepted.tombstone {
-        // The file is back on disk under a tombstoned doc — an un-delete (a
-        // restore from a backup, a sync re-create). Clear the tombstone (the
-        // rebind to the unchanged path is a no-op) before folding any content
-        // drift, so a resurrected file isn't left a ghost the tree won't show.
-        log.restore_document(doc_id, &rel, &Author::External)
-            .map_err(map_err)?;
-        tracing::debug!(path = %rel, "startup-disk-reconcile: resurrected tombstoned doc whose file reappeared");
-        changed = true;
-    }
-
-    // Hash gate: a byte-identical file mints no op and rewrites nothing
-    // (`op-log-disk-canonical`), even if its mtime moved.
-    if crate::hash_string(&disk_text) != crate::hash_string(&accepted.text)
-        && log.apply_external_edit(doc_id, &disk_text).map_err(map_err)?
-    {
-        tracing::debug!(path = %rel, "startup-disk-reconcile: folded offline edit");
-        changed = true;
-    }
-    Ok(changed)
-}
-
-/// Untracked disk paths — present in the vault but with no `doc-index.db`
-/// mapping — and their lazily-computed content hashes. These are the only
-/// candidates an offline rename's source can match against. Hashes are read
-/// on first probe and cached, and a matched path is `consume`d so two gone
-/// docs can't both claim the same new file.
-struct UntrackedDiskPaths {
-    /// Vault-relative path → its content hash, computed on demand.
-    hashes: std::cell::RefCell<std::collections::HashMap<String, Option<String>>>,
-}
-
-impl UntrackedDiskPaths {
-    fn scan(vault: &Vault, log: &OpLog) -> Result<Self, HikerError> {
-        let mut hashes = std::collections::HashMap::new();
-        for rel in vault.walk_indexable_files("")? {
-            if log.doc_id_for_path(&rel).map_err(map_err)?.is_none() {
-                hashes.insert(rel, None);
-            }
-        }
-        Ok(Self {
-            hashes: std::cell::RefCell::new(hashes),
-        })
-    }
-
-    /// Hash of an untracked path's current disk bytes, computed once and
-    /// cached. `None` when the path isn't an untracked candidate or is
-    /// unreadable.
-    fn hash_of(&self, vault: &Vault, rel: &str) -> Option<String> {
-        let mut map = self.hashes.borrow_mut();
-        let slot = map.get_mut(rel)?;
-        if slot.is_none() {
-            *slot = vault.read_file(rel).ok().map(|t| crate::hash_string(&t));
-        }
-        slot.clone()
-    }
-
-    fn candidates(&self) -> Vec<String> {
-        self.hashes.borrow().keys().cloned().collect()
-    }
-
-    /// Drop a path from the candidate set once it's been claimed by a rename.
-    fn consume(&self, rel: &str) {
-        self.hashes.borrow_mut().remove(rel);
-    }
-}
-
-/// Probe the untracked disk paths for an offline-rename target of the gone
-/// doc `doc_id`: an untracked path whose current content hash matches the
-/// doc's *current* `materialize(accepted)` hash or one of its recent accepted
-/// history hashes (a rename plus a stale-but-recent body still recognizes the
-/// lineage). Returns the matched vault-relative path, or `None`. A lightweight
-/// reimplementation of `hiker-sync`'s `find_rename_source` content-hash probe,
-/// scoped to local disk.
-fn find_rename_target(
-    vault: &Vault,
-    log: &OpLog,
-    doc_id: &str,
-    untracked: &UntrackedDiskPaths,
-) -> Result<Option<String>, HikerError> {
-    let candidates = untracked.candidates();
-    if candidates.is_empty() {
-        return Ok(None);
-    }
-    // The doc's known content hashes: current + a bounded recent-history window.
-    let mut known: std::collections::HashSet<String> = log
-        .recent_doc_history_hashes(doc_id, RENAME_HISTORY_PROBE_DEPTH)
-        .map_err(map_err)?
-        .into_iter()
-        .collect();
-    known.insert(crate::hash_string(
-        &log.materialize_accepted(doc_id).map_err(map_err)?.text,
-    ));
-
-    for cand in candidates {
-        if let Some(h) = untracked.hash_of(vault, &cand)
-            && known.contains(&h)
-        {
-            return Ok(Some(cand));
-        }
-    }
-    Ok(None)
-}
-
-/// How many recent accepted-history content hashes to consider when probing a
-/// gone doc for an offline rename — enough to recognize a rename of a file
-/// whose body lagged a few edits behind, without scanning unbounded history.
-const RENAME_HISTORY_PROBE_DEPTH: usize = 16;
 
 /// Auto-reject any drifted pending ops on the document at `rel` when the
-/// `[op-log] auto_reject_on_drift` flag is set. A no-op when the flag is
+/// `[editing] auto_reject_on_drift` flag is set. A no-op when the flag is
 /// `false` or the path has no doc. Returns the op ids that were rejected.
 /// The caller passes the resolved config flag so this stays free of config
 /// plumbing. Per `op-log.md`'s drift section, this flips drifted ops to
@@ -1035,7 +936,7 @@ const RENAME_HISTORY_PROBE_DEPTH: usize = 16;
 ///
 /// status: op-log-status-states
 pub fn auto_reject_drifted(
-    log: &OpLog,
+    log: &LayeredDoc,
     rel: &str,
     enabled: bool,
 ) -> Result<Vec<String>, HikerError> {
@@ -1048,45 +949,8 @@ pub fn auto_reject_drifted(
     log.auto_reject_drifted(&doc_id).map_err(map_err)
 }
 
-/// Run the on-open retention GC: drop accepted-op metadata rows older than
-/// `metadata_retention_days` and rejected-op rows older than
-/// `rejected_retention_days`. Called once at vault open. Returns
-/// `(accepted_dropped, rejected_dropped)`.
-///
-/// A `retention_days` of `0` means "keep nothing older than now" — to avoid
-/// surprising data loss it is treated as "no GC".
-///
-/// status: op-log-retention
-pub fn run_retention_gc(
-    log: &OpLog,
-    metadata_retention_days: u32,
-    rejected_retention_days: u32,
-) -> Result<(usize, usize), HikerError> {
-    use crate::oplog::meta::OpStatus;
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    let day_ms: i64 = 86_400_000;
-    let mut accepted_dropped = 0;
-    let mut rejected_dropped = 0;
-    if metadata_retention_days > 0 {
-        let cutoff = now_ms - i64::from(metadata_retention_days) * day_ms;
-        accepted_dropped = log
-            .gc_metadata(OpStatus::Accepted, cutoff)
-            .map_err(map_err)?;
-    }
-    if rejected_retention_days > 0 {
-        let cutoff = now_ms - i64::from(rejected_retention_days) * day_ms;
-        rejected_dropped = log
-            .gc_metadata(OpStatus::Rejected, cutoff)
-            .map_err(map_err)?;
-    }
-    Ok((accepted_dropped, rejected_dropped))
-}
-
-/// Convenience alias for the `Arc<OpLog>` handle producers thread around. The
+/// Convenience alias for the `Arc<LayeredDoc>` handle producers thread around. The
 /// app holds one per vault session; the agent write paths take
-/// `Option<&OpLogHandle>` so call sites without an op log open (early CLI,
-/// some tests) skip op-log staging.
-pub type OpLogHandle = Arc<OpLog>;
+/// `Option<&LayeredDocHandle>` so call sites without a layered doc open (early
+/// CLI, some tests) skip pending staging.
+pub type LayeredDocHandle = Arc<LayeredDoc>;

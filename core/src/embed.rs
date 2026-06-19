@@ -21,9 +21,6 @@ use thiserror::Error;
 /// configured. See `embedder-fastembed-bge-small`.
 pub const DEFAULT_MODEL_ID: &str = "bge-small-en-v1.5";
 
-/// Back-compat alias for the v1 default; some tests still reference this.
-pub const EMBEDDER_VERSION: &str = DEFAULT_MODEL_ID;
-
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("no platform data dir available")]

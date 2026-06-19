@@ -10,11 +10,11 @@ use rmcp::{tool, tool_router};
 
 use super::App;
 use crate::handler::params::{
-    audit_err, audit_status, ApplyTag, BoardAddCard, BoardAddColumn, BoardAddTextCard, BoardCreate,
-    BoardDeleteColumn, BoardGet, BoardMoveCard, BoardRemoveCard, BoardRenameColumn,
+    audit_err, audit_status, ApplyTag, BoardAddCard, BoardAddColumn, BoardAddTextCard,
+    BoardCreate, BoardDeleteColumn, BoardGet, BoardMoveCard, BoardRemoveCard, BoardRenameColumn,
     BoardReorderColumn, BoardSetCardText, BoardsList, CheckDiagram, EditNote, GetActiveNote,
-    GetNote, GetOpenNotes, GetSelection, RelatedNotes, SearchNotes, SetFrontmatter, TaskCheckout,
-    TaskFail, TaskHeartbeat, TaskList, TaskSubmit, WriteNote,
+    GetNote, GetOpenNotes, GetSelection, RunQuery, RelatedNotes, SearchNotes, SetFrontmatter,
+    TaskCheckout, TaskFail, TaskHeartbeat, TaskList, TaskSubmit, WriteNote,
 };
 
 // ---------- tool router ----------
@@ -291,6 +291,34 @@ impl App {
         let outcome = self.update_tag(&p, false).await;
         self.state.audit.record(
             "remove_tag",
+            &serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
+            audit_status(&outcome),
+            audit_err(&outcome),
+        );
+        outcome
+    }
+
+    /// Run a saved query-doc or an inline filter over the note-metadata
+    /// index (read-only).
+    ///
+    /// status: query-mcp-tool
+    #[tool(
+        name = "query",
+        description = "Run a saved query-doc (by vault-relative path) or an inline filter over the \
+                       note-metadata index. Exactly one of query_doc / filter. The filter grammar is \
+                       closed: kind, tags, path glob, fields ({key, eq | exists | min/max} — dates as \
+                       ISO-8601 strings), board membership ({path, column?}); clauses AND, list values \
+                       OR. `select` packs named frontmatter keys into each row; `limit` defaults to 100 \
+                       (max 500). Returns { rows: [{ path, title, mtime, fields }] }. Read-only."
+    )]
+    pub async fn query(
+        &self,
+        params: Parameters<RunQuery>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let Parameters(p) = params;
+        let outcome = self.run_query_tool(&p).await;
+        self.state.audit.record(
+            "query",
             &serde_json::to_value(&p).unwrap_or(serde_json::Value::Null),
             audit_status(&outcome),
             audit_err(&outcome),

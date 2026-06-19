@@ -14,6 +14,10 @@
 //!   a note / board, drag-drop move, rename, duplicate, reindex,
 //!   add-to-trail / set-active-trail, add-to-board, delete) are routed
 //!   through `SurfaceCtx::defer`.
+//! - `rename.rs` — the inline-rename machinery: the egui-memory draft
+//!   lifecycle behind the in-tree rename `TextEdit`, the commit path through
+//!   the indexer-driven `move_note`, and the open-buffer/tab repointing +
+//!   observed-rename git commit shared with drag-drop moves.
 //!
 //! The host (`workbench_host`) keeps the title-row `+` new-note / new-board
 //! buttons and the `⋯` refresh / sort menu — those have full
@@ -30,6 +34,7 @@
 //! render path then reads only that opaque snapshot — at most one frame
 //! stale, which is cosmetically harmless for these markers.
 
+pub mod rename;
 pub mod sidebar;
 
 use eframe::egui;

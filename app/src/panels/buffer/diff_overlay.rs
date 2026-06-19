@@ -1,6 +1,6 @@
 //! Unified inline-diff overlay for the editor tab. The single entry point
 //! every diff-on-the-live-buffer flow rides on: dirty-buffer diff toggle,
-//! pending agent edits (`agent_proposal` suggestion overlay), op-log history viewer.
+//! pending agent edits (`agent_proposal` suggestion overlay), layered-doc history viewer.
 //!
 //! Inputs are the active buffer plus its tab's optional `DiffSource`.
 //! Output is a `Set` ready to push onto the editor's decoration
@@ -196,7 +196,8 @@ impl<'a> Compute<'a> {
             BufferSource::HistoryVersion { .. } => Some(DiffOwner::HistoryVersion),
             BufferSource::PendingProposal { .. } => Some(DiffOwner::Pending),
             BufferSource::Trash { .. } => Some(DiffOwner::Manual),
-            BufferSource::Vault { .. } => None,
+            // Code files open without a diff layer, like a plain vault buffer.
+            BufferSource::Vault { .. } | BufferSource::CodeFile { .. } => None,
         };
         let active = self.app.session.active_tab?;
         let tab = self.app.tab_by_id(active)?;
@@ -208,8 +209,11 @@ impl<'a> Compute<'a> {
             match src {
                 DiffSource::HistoryVersion { .. } => DiffOwner::HistoryVersion,
                 DiffSource::PendingProposal { .. } => DiffOwner::Pending,
+                // GitRef is a viewer-only comparison (diff-source-git-ref):
+                // Manual owner, so no per-hunk verbs ride the overlay.
                 DiffSource::Disk { .. }
                 | DiffSource::LiveBuffer { .. }
+                | DiffSource::GitRef { .. }
                 | DiffSource::Trash { .. }
                 | DiffSource::Empty => DiffOwner::Manual,
             }
@@ -228,13 +232,13 @@ impl<'a> Compute<'a> {
                 self.app.session.buffers.get(path).map(|b| b.editor.doc.to_string())
             }
             DiffSource::HistoryVersion { op_id, path } => {
-                let log = self.app.vault_session.services.oplog.as_ref();
-                hiker_core::ops::op_writes::content_at_op(log, path, op_id)
+                let log = self.app.vault_session.services.layered.as_ref();
+                hiker_core::ops::op_writes::content_at_snapshot(log, path, op_id)
                     .ok()
                     .flatten()
             }
             DiffSource::PendingProposal { proposal_id } => {
-                // The op id's proposed content via the op log. The target
+                // The op id's proposed content via the layered doc. The target
                 // path comes from the preview buffer's source (a
                 // `PendingProposal` buffer fronts a whole-file op for one
                 // path). No legacy pending-store read on this surface.
@@ -244,7 +248,7 @@ impl<'a> Compute<'a> {
                     }
                     _ => return None,
                 };
-                let log = self.app.vault_session.services.oplog.as_ref();
+                let log = self.app.vault_session.services.layered.as_ref();
                 hiker_core::ops::op_writes::proposal_materializations(
                     log,
                     target,
@@ -253,6 +257,15 @@ impl<'a> Compute<'a> {
                 .ok()
                 .flatten()
                 .map(|(_accepted, proposed)| proposed)
+            }
+            DiffSource::GitRef { rev, path } => {
+                // The file's content at a git rev, via the git transport
+                // engine's `show` (present only when `[sync].transport =
+                // "git"`). A path absent at the rev resolves to an empty base
+                // — the whole file reads as added — rather than suppressing
+                // the overlay. status: diff-source-git-ref
+                let git = self.app.vault_session.services.git_sync.as_ref()?;
+                git.show_at(rev, path).ok().map(Option::unwrap_or_default)
             }
             DiffSource::Trash { trash_path } => std::fs::read_to_string(trash_path).ok(),
             DiffSource::Empty => Some(String::new()),
@@ -325,13 +338,13 @@ impl<'a> Compute<'a> {
         hunks: &[HunkInfo],
     ) -> (Set, HashMap<u64, HunkAction>) {
         let current = &self.buffer.editor.doc;
-        let log = self.app.vault_session.services.oplog.as_ref();
+        let log = self.app.vault_session.services.layered.as_ref();
         let session = self.buffer.active_session.as_deref();
         let doc_id = log.doc_id_for_path(self.path).ok().flatten();
         // User-edit ranges in `working` coords: the changed regions of
         // diff(accepted, working). A hunk overlapping one of these is a
         // conflict (the user and the agent both touched that region) per
-        // `op-log-merge-conflict`. Read both materializations off the op log
+        // `op-log-merge-conflict`. Read both materializations off the layered doc
         // by doc_id; absent doc → no user edits → every hunk is "normal".
         let (accepted_text, user_edits) = doc_id
             .as_deref()
@@ -346,7 +359,7 @@ impl<'a> Compute<'a> {
             if !hunk.is_change() {
                 continue;
             }
-            // Resolve the hunk to its contributing pending op ids (op-log seam,
+            // Resolve the hunk to its contributing pending op ids (layered-doc seam,
             // session-scoped). `op_*` is the hunk's span in the *proposal*
             // (review) coordinates where pending-op footprints live and an
             // insertion has width; `ops_in_range` matches against affected
@@ -397,12 +410,12 @@ impl<'a> Compute<'a> {
 
     /// `(accepted_text, user_edit_ranges)` for `doc_id`: the canonical text
     /// plus the regions the user changed in `working` (in `working` coords).
-    /// Both materializations come straight off the op-log handle per
+    /// Both materializations come straight off the layered-doc handle per
     /// `op-log.md`'s module placement. A materialization error collapses to
     /// "no user edits", so the overlay degrades to plain Accept/Reject rather
     /// than blocking.
     fn user_edits_for_doc(&self, doc_id: &str) -> (String, Vec<conflict::UserEdit>) {
-        let log = self.app.vault_session.services.oplog.as_ref();
+        let log = self.app.vault_session.services.layered.as_ref();
         let (Ok(accepted), Ok(working)) =
             (log.materialize_accepted(doc_id), log.materialize_working(doc_id))
         else {

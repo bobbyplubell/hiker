@@ -12,11 +12,20 @@
 //! self-describing PNG plus a tiny sidecar for the inline-math baseline metric
 //! (PNG carries width/height; baseline is the only thing it can't):
 //!
-//!   `<domain>-<hash:016x>.png`   — straight RGBA8 pixels (PNG RGBA, no alpha
-//!                                  premultiply), width/height self-described.
-//!   `<domain>-<hash:016x>.base`  — present only for inline math: 4 raw
+//!   `<domain>-r<rev>-<hash:016x>.png`  — straight RGBA8 pixels (PNG RGBA, no
+//!                                  alpha premultiply), width/height
+//!                                  self-described.
+//!   `<domain>-r<rev>-<hash:016x>.base` — present only for inline math: 4 raw
 //!                                  little-endian bytes of the `f32` baseline.
 //!                                  Absent ⇒ block widget (no baseline).
+//!
+//! `<rev>` is the domain's renderer revision ([`Domain::revision`]): the
+//! `content_hash` folds in source/style/theme but knows nothing about the
+//! *code* that turns source into pixels, so without it a renderer fix keeps
+//! serving pre-fix pixels forever. Bumping the revision makes every old entry
+//! unreachable (different filename), and the once-per-session sweep deletes
+//! entries whose revision no longer matches before doing its byte-budget
+//! pass.
 //!
 //! Gated by `[render] cache_diagrams` (default on); when off the render path
 //! skips this layer entirely and the in-memory caches carry the session.
@@ -40,6 +49,9 @@ pub enum Domain {
     Mermaid,
     WaveDrom,
     Chart,
+    /// A vault image (`![alt](path)`) loaded + decoded to a texture for a table
+    /// cell. status: widget-table-render
+    Image,
 }
 
 impl Domain {
@@ -49,8 +61,34 @@ impl Domain {
             Domain::Mermaid => "mermaid",
             Domain::WaveDrom => "wavedrom",
             Domain::Chart => "chart",
+            Domain::Image => "image",
         }
     }
+
+    /// Renderer revision, part of the on-disk filename. **Bump a domain's
+    /// number whenever its renderer starts producing different pixels for
+    /// identical input** — including changes in the renderer's dependencies
+    /// (Mermaid's output shifts with `hiker-graph` layout changes, Math's
+    /// with `hiker-math`, charts' with the `hiker-charts` crates). Stale
+    /// entries become unreachable immediately and are deleted by the next
+    /// session sweep. Cosmetic-only refactors don't need a bump; when in
+    /// doubt, bump — the only cost is one cold re-render per diagram.
+    const fn revision(self) -> u32 {
+        match self {
+            Domain::Math => 1,
+            Domain::Mermaid => 1,
+            Domain::WaveDrom => 1,
+            Domain::Chart => 1,
+            Domain::Image => 1,
+        }
+    }
+}
+
+/// `<prefix>-r<rev>-` — the filename prefix every *current* entry of a domain
+/// starts with; anything carrying a known domain prefix but not matching its
+/// current revision prefix is stale and gets purged by the sweep.
+fn rev_prefix(domain: Domain) -> String {
+    format!("{}-r{}-", domain.prefix(), domain.revision())
 }
 
 /// Cache directory budget before the LRU sweep starts evicting. 64 MB of
@@ -84,11 +122,11 @@ impl DiagramCacheCtx {
     }
 
     fn png_path(&self, domain: Domain, hash: u64) -> PathBuf {
-        self.dir.join(format!("{}-{hash:016x}.png", domain.prefix()))
+        self.dir.join(format!("{}{hash:016x}.png", rev_prefix(domain)))
     }
 
     fn base_path(&self, domain: Domain, hash: u64) -> PathBuf {
-        self.dir.join(format!("{}-{hash:016x}.base", domain.prefix()))
+        self.dir.join(format!("{}{hash:016x}.base", rev_prefix(domain)))
     }
 
     /// Look up a previously-stored render for `(domain, hash)`. Returns `None`
@@ -165,14 +203,49 @@ fn encode_png(rendered: &RenderedWidget) -> Option<Vec<u8>> {
     Some(out.into_inner())
 }
 
-/// Run the byte-budget LRU sweep at most once per `dir` per session. Guarded
-/// by a `OnceLock` so the (cheap, best-effort) directory scan happens once on
-/// first cache use rather than blocking vault open or every render.
+/// Run the stale-revision purge + byte-budget LRU sweep at most once per `dir`
+/// per session. Guarded by a `OnceLock` so the (cheap, best-effort) directory
+/// scan happens once on first cache use rather than blocking vault open or
+/// every render.
 fn maybe_sweep(dir: &Path) {
     static SWEPT: OnceLock<()> = OnceLock::new();
     SWEPT.get_or_init(|| {
+        purge_stale_revisions(dir);
         sweep_to_budget(dir, BUDGET_BYTES);
     });
+}
+
+/// Delete every entry written under an outdated renderer revision (or the
+/// pre-revision filename scheme): any `.png`/`.base` whose name starts with a
+/// known domain prefix but not with that domain's current `<prefix>-r<rev>-`.
+/// Files that match no domain are left alone (not ours). Best-effort.
+fn purge_stale_revisions(dir: &Path) {
+    const DOMAINS: [Domain; 5] = [
+        Domain::Math,
+        Domain::Mermaid,
+        Domain::WaveDrom,
+        Domain::Chart,
+        Domain::Image,
+    ];
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in read.flatten() {
+        let path = entry.path();
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("png") | Some("base") => {}
+            _ => continue,
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let stale = DOMAINS.iter().any(|&d| {
+            name.starts_with(&format!("{}-", d.prefix())) && !name.starts_with(&rev_prefix(d))
+        });
+        if stale {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// Evict oldest-by-mtime entries until the directory's total byte size is at
@@ -280,6 +353,32 @@ mod tests {
         // Same hash, different domain → distinct files, distinct baselines.
         assert_eq!(ctx.load(Domain::Math, 0x7).unwrap().baseline, Some(1.0));
         assert_eq!(ctx.load(Domain::Mermaid, 0x7).unwrap().baseline, None);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn purge_removes_stale_revisions_only() {
+        let tmp = std::env::temp_dir().join(format!("hiker-dc-purge-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        // Current-revision entry: kept.
+        let current = tmp.join(format!("{}00000000000000aa.png", rev_prefix(Domain::Mermaid)));
+        // Outdated revision and pre-revision filename scheme: purged.
+        let old_rev = tmp.join("mermaid-r0-00000000000000bb.png");
+        let old_fmt = tmp.join("mermaid-00000000000000cc.png");
+        let old_base = tmp.join("math-00000000000000dd.base");
+        // Not ours (unknown prefix / extension): left alone.
+        let foreign = tmp.join("notes-00000000000000ee.png");
+        let other_ext = tmp.join("mermaid-r0-00000000000000ff.txt");
+        for f in [&current, &old_rev, &old_fmt, &old_base, &foreign, &other_ext] {
+            std::fs::write(f, b"x").unwrap();
+        }
+        purge_stale_revisions(&tmp);
+        assert!(current.exists(), "current revision kept");
+        assert!(!old_rev.exists(), "outdated revision purged");
+        assert!(!old_fmt.exists(), "pre-revision scheme purged");
+        assert!(!old_base.exists(), "stale sidecar purged");
+        assert!(foreign.exists(), "unknown prefix untouched");
+        assert!(other_ext.exists(), "non-cache extension untouched");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

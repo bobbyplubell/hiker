@@ -15,8 +15,8 @@ use hiker_core::indexer::IndexJob;
 use hiker_theme as theme;
 
 /// Which kind of external source a row configures. (Only the kinds with a working binding are
-/// offered: `repo` → SCIP code graph, `docs` → a content folder. Jira/LSP are design-level future
-/// sources with no adapter yet, so they're intentionally not selectable here.)
+/// offered: `repo` → SCIP code graph, `docs` → a content folder. The LSP backend is a design-level
+/// future source with no adapter yet, so it's intentionally not selectable here.)
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SrcKind {
     Repo,
@@ -24,13 +24,13 @@ enum SrcKind {
 }
 
 impl SrcKind {
-    fn label(self) -> &'static str {
+    const fn label(self) -> &'static str {
         match self {
             SrcKind::Repo => "repo (code)",
             SrcKind::Docs => "docs",
         }
     }
-    fn wire(self) -> &'static str {
+    const fn wire(self) -> &'static str {
         match self {
             SrcKind::Repo => "repo",
             SrcKind::Docs => "docs",
@@ -50,7 +50,7 @@ struct SourceForm {
 
 /// Per-tab project-config form state.
 #[derive(Default)]
-pub struct ProjectConfigForm {
+pub struct Form {
     loaded: bool,
     name: String,
     kinds: Vec<SrcKind>,
@@ -105,7 +105,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId, source_note: O
             }
         }
         if let Ok(rel) = result {
-            crate::panels::code_graph::open(app, &rel);
+            crate::panels::code_graph::open(app, crate::tab::CodeSource::Project(rel));
         }
     }
 
@@ -120,8 +120,8 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId, source_note: O
 
 /// Build the initial form: load an existing note's frontmatter into fields, or seed a blank form
 /// with one repo source for a new project.
-fn build_initial(app: &AppState, source_note: Option<&str>) -> ProjectConfigForm {
-    let mut form = ProjectConfigForm { loaded: true, ..Default::default() };
+fn build_initial(app: &AppState, source_note: Option<&str>) -> Form {
+    let mut form = Form { loaded: true, ..Default::default() };
     if let Some(path) = source_note {
         form.name = path.rsplit('/').next().unwrap_or(path).trim_end_matches(".md").to_string();
         if let Ok(text) = app.vault_session.vault.read_file(path) {
@@ -137,11 +137,11 @@ fn build_initial(app: &AppState, source_note: Option<&str>) -> ProjectConfigForm
 
 /// Parse a project note's raw frontmatter `sources[]` into the form rows (faithful round-trip — no
 /// path expansion / id derivation, unlike a bound `hiker_projects::Project`).
-fn load_sources_into(form: &mut ProjectConfigForm, text: &str) {
+fn load_sources_into(form: &mut Form, text: &str) {
     let Some(fm) = hiker_core::frontmatter::split(text).frontmatter else { return };
     let Ok(raw) = serde_yml::from_value::<RawNote>(fm) else { return };
     for s in raw.sources.unwrap_or_default() {
-        // Unknown / not-yet-supported kinds (e.g. a hand-authored `jira`) load as a `docs` row so
+        // Unknown / not-yet-supported kinds (any hand-authored unknown kind) load as a `docs` row so
         // the path is preserved and visible rather than silently dropped.
         let kind = if s.kind == "repo" { SrcKind::Repo } else { SrcKind::Docs };
         form.kinds.push(kind);
@@ -156,7 +156,7 @@ fn load_sources_into(form: &mut ProjectConfigForm, text: &str) {
 }
 
 /// Render the editable form; sets `*do_save` when the Save button is clicked.
-fn render_form(ui: &mut egui::Ui, form: &mut ProjectConfigForm, do_save: &mut bool) {
+fn render_form(ui: &mut egui::Ui, form: &mut Form, do_save: &mut bool) {
     ui.horizontal(|ui| {
         ui.label("Project name:");
         ui.text_edit_singleline(&mut form.name);
@@ -179,14 +179,14 @@ fn render_form(ui: &mut egui::Ui, form: &mut ProjectConfigForm, do_save: &mut bo
             form.kinds.push(SrcKind::Repo);
             form.sources.push(SourceForm::default());
         }
-        if ui.add(egui::Button::new("💾 Save project")).clicked() {
+        if ui.add(egui::Button::new("Save project")).clicked() {
             *do_save = true;
         }
     });
 }
 
 /// Render one source row (kind selector + kind-specific fields + remove).
-fn render_source(ui: &mut egui::Ui, i: usize, form: &mut ProjectConfigForm, remove: &mut Option<usize>) {
+fn render_source(ui: &mut egui::Ui, i: usize, form: &mut Form, remove: &mut Option<usize>) {
     egui::Frame::default()
         .fill(theme::active_bg())
         .inner_margin(egui::Margin::symmetric(8, 6))
@@ -200,7 +200,7 @@ fn render_source(ui: &mut egui::Ui, i: usize, form: &mut ProjectConfigForm, remo
                         }
                     });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("✕").on_hover_text("Remove source").clicked() {
+                    if ui.small_button("×").on_hover_text("Remove source").clicked() {
                         *remove = Some(i);
                     }
                 });
@@ -263,7 +263,7 @@ fn save_project(app: &mut AppState, tab_id: TabId, source_note: Option<&str>) ->
 
 /// Build the project-note markdown: nested `hiker: { kind: project }` frontmatter + `sources[]` + a
 /// short body.
-fn render_note(form: &ProjectConfigForm) -> Result<String, String> {
+fn render_note(form: &Form) -> Result<String, String> {
     let sources: Vec<SrcOut> = form
         .sources
         .iter()
@@ -386,7 +386,7 @@ mod tests {
     /// makes a UI-authored project usable by the code-graph view.
     #[test]
     fn saved_note_parses_back() {
-        let form = ProjectConfigForm {
+        let form = Form {
             loaded: true,
             name: "My Proj".to_string(),
             kinds: vec![SrcKind::Repo, SrcKind::Docs],

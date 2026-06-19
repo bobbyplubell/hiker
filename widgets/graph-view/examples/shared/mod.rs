@@ -7,9 +7,8 @@
 
 #![allow(dead_code)] // each example uses a subset of these helpers.
 
-use hiker_graph_view::graph_view::{
-    LayoutConfig, NodeDescriptor, NodeShape, Palette, Source, Style,
-};
+use hiker_graph_view::graph_view::source::{LayoutConfig, NodeDescriptor, NodeShape, Source};
+use hiker_graph_view::graph_view::styling::{Palette, Style};
 use hiker_graph::{LayoutKind, LayoutTree};
 
 /// One central cluster plus a ring of `RING` clusters, each `PER_CLUSTER` nodes.
@@ -111,8 +110,11 @@ impl Source for SyntheticGraph {
                     fill: if is_hub { active } else { fill },
                     resting_stroke: egui::Stroke::NONE,
                     hover_stroke: egui::Stroke::new(2.0, active),
+                    badge: None,
+                    bug_badge: None,
                     label: None,
                     label_min_zoom: 0.0,
+                    label_scale: 1.0,
                     click_path: None,
                     tooltip: None,
                 }
@@ -210,8 +212,11 @@ impl Source for LayeredGraph {
                 fill: if index == 0 { active } else { fill },
                 resting_stroke: egui::Stroke::NONE,
                 hover_stroke: egui::Stroke::new(2.0, active),
+                badge: None,
+                bug_badge: None,
                 label: None,
                 label_min_zoom: 0.0,
+                label_scale: 1.0,
                 click_path: None,
                 tooltip: None,
             })

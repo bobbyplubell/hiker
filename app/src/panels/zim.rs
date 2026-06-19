@@ -9,7 +9,11 @@
 //! Navigation: we hit-test the pointer against the laid-out document on click
 //! ([`HtmlView::link_at`]); a hit returns the link's href, which we resolve to
 //! a content article in the same archive and reload the view in place (and
-//! update the tab payload so the article survives tab bookkeeping).
+//! update the tab payload so the article survives tab bookkeeping). Every
+//! in-place navigation is recorded on a per-pane [`History`] stack, surfaced
+//! as toolbar Back/Forward buttons and Esc-as-back (`interaction.md`
+//! [keyboard-esc-ladder] — a surface that navigates in place wires the
+//! middle rung), alongside the global nav stack ([zim-nav-stack]).
 //!
 //! Subresources (in-archive images / CSS): served through a ZIM-backed
 //! [`hiker_htmlview::ResourceProvider`] ([`SubresourceProvider`]). When the
@@ -181,6 +185,55 @@ pub struct Pane {
     /// In-tab "Jump to" title picker: query + debounced, background-run hits
     /// (see [`title_picker`]).
     picker: TitlePicker,
+    /// Per-pane visit history backing the toolbar Back/Forward buttons and
+    /// Esc-as-back. Articles are `Option<String>` (`None` = main page).
+    history: History,
+    /// One-shot flag set when a Back/Forward landing drives the next article
+    /// load, so that load isn't re-recorded as a fresh visit.
+    nav_from_history: bool,
+}
+
+/// A pane's in-place visit history: pure back/forward stacks over the
+/// articles the pane has shown (`None` = the archive's main page). Mirrors
+/// browser semantics — a new visit clears the forward stack; Back/Forward
+/// move the current article between the two stacks.
+#[derive(Default)]
+struct History {
+    back: Vec<Option<String>>,
+    forward: Vec<Option<String>>,
+}
+
+impl History {
+    /// Record an in-place navigation away from `from`. Clears the forward
+    /// stack — a fresh visit forks the timeline, like a browser.
+    fn record(&mut self, from: Option<String>) {
+        self.back.push(from);
+        self.forward.clear();
+    }
+
+    /// Step back: returns the article to show, moving `current` onto the
+    /// forward stack. `None` when there's nothing to go back to.
+    fn back_from(&mut self, current: Option<String>) -> Option<Option<String>> {
+        let target = self.back.pop()?;
+        self.forward.push(current);
+        Some(target)
+    }
+
+    /// Step forward: returns the article to show, moving `current` onto the
+    /// back stack. `None` when there's nothing to go forward to.
+    fn forward_from(&mut self, current: Option<String>) -> Option<Option<String>> {
+        let target = self.forward.pop()?;
+        self.back.push(current);
+        Some(target)
+    }
+
+    fn can_back(&self) -> bool {
+        !self.back.is_empty()
+    }
+
+    fn can_forward(&self) -> bool {
+        !self.forward.is_empty()
+    }
 }
 
 /// Max title hits shown in the in-tab article picker.
@@ -251,6 +304,8 @@ impl Pane {
             theme: ThemeChoice::Auto,
             zoom: 1.0,
             picker: TitlePicker::new(),
+            history: History::default(),
+            nav_from_history: false,
         }
     }
 }
@@ -388,6 +443,10 @@ pub fn show(
     crate::profile_function!();
     let want = article.clone();
     let mut nav_to: Option<Option<String>> = None;
+    // A Back/Forward landing from the per-pane history — applied in place on
+    // THIS tab (never re-routed through the preview-tab logic), and never
+    // re-recorded as a fresh visit.
+    let mut hist_to: Option<Option<String>> = None;
     let mut toast: Option<String> = None;
 
     PANES.with(|panes| {
@@ -405,13 +464,53 @@ pub fn show(
                 );
             }
             Ok(archive) => {
-                // View options (theme + zoom) menu, then the article picker.
-                view_options_menu(ui, &mut pane.theme, &mut pane.zoom);
+                // Toolbar: per-pane Back/Forward over the in-place visit
+                // history (mirrors the code graph's nav controls), then the
+                // view options (theme + zoom) menu.
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(pane.history.can_back(), egui::Button::new("⟵").small())
+                        .on_hover_text("Back (Esc)")
+                        .clicked()
+                    {
+                        hist_to = pane.history.back_from(want.clone());
+                    }
+                    if ui
+                        .add_enabled(pane.history.can_forward(), egui::Button::new("⟶").small())
+                        .on_hover_text("Forward")
+                        .clicked()
+                    {
+                        hist_to = pane.history.forward_from(want.clone());
+                    }
+                    ui.separator();
+                    view_options_menu(ui, &mut pane.theme, &mut pane.zoom);
+                });
 
                 // Article picker: title-prefix search within this archive.
                 // A click navigates the view (mirrors a link click).
                 if let Some(url) = title_picker(ui, archive, &mut pane.picker) {
                     nav_to = Some(Some(url));
+                }
+
+                // Esc ladder (`interaction.md` [keyboard-esc-ladder]): a
+                // non-empty picker consumes Esc first (clears it); otherwise
+                // Esc steps back, exactly like the toolbar button. Skipped
+                // while any text field holds focus (Esc there means "drop
+                // focus", egui's default).
+                let esc = ui.input(|i| i.key_pressed(egui::Key::Escape))
+                    && ui.ctx().memory(|m| m.focused().is_none());
+                if esc {
+                    if pane.picker.query.is_empty() && pane.picker.hits.is_empty() {
+                        hist_to = pane.history.back_from(want.clone());
+                    } else {
+                        pane.picker.query.clear();
+                        pane.picker.last_query.clear();
+                        pane.picker.hits.clear();
+                        pane.picker.pending_at = None;
+                    }
+                }
+                if hist_to.is_some() {
+                    pane.nav_from_history = true;
                 }
 
                 // Feed the chosen theme + zoom into the widget every frame.
@@ -437,6 +536,14 @@ pub fn show(
                 if !pane.initialized || pane.loaded != want {
                     match load_article(archive, want.as_deref()) {
                         Ok(html) => {
+                            // Record the in-place navigation (link click,
+                            // picker pick, search jump, global restore) on the
+                            // pane history — unless this load IS a history
+                            // Back/Forward landing.
+                            let from_history = std::mem::take(&mut pane.nav_from_history);
+                            if pane.initialized && !from_history {
+                                pane.history.record(pane.loaded.clone());
+                            }
                             // Base URL + provider are set once at pane open
                             // (see `open_archive`); just swap the HTML.
                             pane.view.set_html(&html);
@@ -505,6 +612,18 @@ pub fn show(
     // [zim-link-preview-open, zim-nav-stack]
     if let Some(new_article) = nav_to {
         navigate_within(app, tab_id, zim_path, &new_article);
+        ui.ctx().request_repaint();
+    }
+    // Apply a per-pane history Back/Forward landing IN PLACE on this tab —
+    // even a pinned tab walks its own history in place — without re-pushing
+    // the global nav stack (a restore moves the cursor, it isn't a new visit;
+    // same posture as the code graph's nav restores).
+    if let Some(target) = hist_to {
+        if let Some(tab) = app.tab_by_id_mut(tab_id) {
+            if let TabKind::ZimView { article: a, .. } = &mut tab.kind {
+                *a = target;
+            }
+        }
         ui.ctx().request_repaint();
     }
 }
@@ -1009,6 +1128,43 @@ fn percent_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Back/Forward walk the visit history like a browser: back pops onto
+    /// the forward stack, forward replays it, both return the article to
+    /// show (`None` = main page).
+    #[test]
+    fn history_back_and_forward_walk_visits() {
+        let mut h = History::default();
+        // main page → A → B (each `record` logs where we navigated FROM).
+        h.record(None);
+        h.record(Some("A".into()));
+        assert!(h.can_back() && !h.can_forward());
+
+        // Back from B lands on A; back again lands on the main page.
+        assert_eq!(h.back_from(Some("B".into())), Some(Some("A".into())));
+        assert_eq!(h.back_from(Some("A".into())), Some(None));
+        assert!(!h.can_back() && h.can_forward());
+        assert_eq!(h.back_from(None), None, "nothing further back");
+
+        // Forward replays the same walk.
+        assert_eq!(h.forward_from(None), Some(Some("A".into())));
+        assert_eq!(h.forward_from(Some("A".into())), Some(Some("B".into())));
+        assert_eq!(h.forward_from(Some("B".into())), None, "nothing further forward");
+        assert!(h.can_back());
+    }
+
+    /// A fresh visit forks the timeline: recording a new navigation clears
+    /// the forward stack (browser semantics).
+    #[test]
+    fn history_record_clears_forward() {
+        let mut h = History::default();
+        h.record(None);
+        assert_eq!(h.back_from(Some("A".into())), Some(None));
+        assert!(h.can_forward());
+        h.record(None); // navigate somewhere new from the main page
+        assert!(!h.can_forward(), "new visit clears the forward stack");
+        assert!(h.can_back());
+    }
 
     #[test]
     fn resolves_simple_href() {

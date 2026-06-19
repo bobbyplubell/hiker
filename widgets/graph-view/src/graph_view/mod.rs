@@ -9,8 +9,9 @@
 
 use std::collections::HashMap;
 
-use hiker_graph::{LayoutKind, LayoutParams, LayoutTree};
-use hiker_projection::{forward, Complex, Mobius, ProjectionConfig, ProjectionKind};
+use hiker_graph::{LayoutKind, LayoutParams};
+use hiker_projection::{Complex, Mobius, ProjectionConfig, ProjectionKind};
+use hiker_projection_view::lens_disk;
 use hiker_theme as theme;
 
 use crate::force_graph::View;
@@ -19,39 +20,71 @@ use graph_widgets::{
     horizontal_tree_positions, layered_layout, radial_positions, vertical_tree_positions,
 };
 
+pub mod edge_paint;
 mod edges;
+pub mod gpu;
 mod layout;
+pub mod minimap;
 mod nav;
 mod panes;
+pub mod source;
+pub mod styling;
+#[cfg(test)]
+mod tests;
+
+/// A `puffin` profile span, gated behind this crate's `profiling` feature so it
+/// compiles to nothing when off (mirrors the app's `profile_scope!`). Lets the
+/// GPU batch build + upload show up in the same capture as the app's spans.
+macro_rules! profile_scope {
+    ($name:expr) => {
+        #[cfg(feature = "profiling")]
+        puffin::profile_scope!($name);
+    };
+}
+pub(crate) use profile_scope;
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use layout::{adaptive_anchor_stiffness, build_warm_seed, change_fraction, scatter};
+use source::{LayoutConfig, NodeDescriptor, PreviewCache, Snapshot, Source, Toggles};
+use styling::{color_row, palette_rows, HighlightStyle, Palette, Style};
+
+/// Process-global opt-in for the custom instanced GPU paint path. Off by
+/// default so every test / example / snapshot renders through the unchanged
+/// egui Painter; the live app turns it on only when it selected the wgpu
+/// backend (see `set_gpu_paint`). Combined per-`State` with
+/// [`State::gpu_instancing`] before the GPU path activates.
+static GPU_PAINT: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable the custom instanced GPU paint path process-wide. The live app
+/// calls `set_gpu_paint(true)` after choosing the wgpu renderer; nothing else
+/// does, so committed snapshots keep rendering through the Painter path.
+pub fn set_gpu_paint(on: bool) {
+    GPU_PAINT.store(on, Ordering::Relaxed);
+}
+
+/// Whether the process-global GPU paint opt-in is set.
+fn gpu_paint_enabled() -> bool {
+    GPU_PAINT.load(Ordering::Relaxed)
+}
 
 const ZOOM_MIN: f32 = 0.005;
 const ZOOM_MAX: f32 = 6.0;
 
-/// Fraction of the pane's shorter half-dimension the locked Poincaré disk fills,
-/// leaving a small margin so the boundary ring isn't flush against the edge.
-const DISK_FILL: f32 = 0.92;
+// The locked Poincaré disk frame, its `DISK_FILL` / `POINCARE_ZOOM_MIN/MAX`
+// constants, the `zoom_poincare` scroll law, the `centroid_scale` framing, and
+// the `forward`+nav disk operator now live in the shared `hiker_projection_view`
+// crate — the single source of truth with the canvas camera (they were
+// hand-synced copies). `poincare_disk` stays as a thin engine-internal delegate
+// so callers (`panes.rs`) and the in-file tests keep the short name.
+// [proj-canvas-mode]
 
-/// The locked Poincaré disk frame for a pane: its centre (the pane centre) and
-/// radius (`DISK_FILL` of the shorter half-dimension, times `zoom`). Deliberately
-/// a pure function of `pane_rect` + `zoom` *only* — it must NOT depend on [`View`]
-/// pan/zoom, so the disk stays fixed-CENTERED to the pane as the user navigates
-/// (the disk IS the viewport; navigation is Möbius drag + click fly-to, never
-/// affine pan/zoom). Scroll-zoom scales the RADIUS only: the centre is
-/// zoom-invariant (always the pane centre), so the disk grows/shrinks centred and
-/// never drifts. At `zoom > 1` the disk may exceed the pane and clip — the user
-/// Möbius-drags to explore; `zoom = 1.0` is fit.
+/// The locked Poincaré disk frame for a pane — a pure function of `pane_rect` +
+/// `zoom` (centre = pane centre, radius = `DISK_FILL` of the shorter
+/// half-dimension × `zoom`). Delegates to [`hiker_projection_view::poincare_disk`].
 fn poincare_disk(pane_rect: egui::Rect, zoom: f32) -> (egui::Pos2, f32) {
-    let radius = 0.5 * pane_rect.size().min_elem() * DISK_FILL * zoom;
-    (pane_rect.center(), radius)
+    hiker_projection_view::poincare_disk(pane_rect, zoom)
 }
-
-/// Scroll-zoom clamp for the locked Poincaré disk radius. The max is generous
-/// so a dense graph can be magnified enough to read a recentred region (matches
-/// the canvas Poincaré zoom range).
-const POINCARE_ZOOM_MIN: f32 = 0.3;
-const POINCARE_ZOOM_MAX: f32 = 25.0;
 
 /// Persistent per-view engine state: pan/zoom, node positions, the active
 /// layout + its background worker, the configurable [`Style`], the common
@@ -99,27 +132,6 @@ pub struct State {
     /// `1.0`. Reset alongside `nav`/`flyto`. Poincaré-only — ignored by the
     /// affine regimes.
     pub poincare_zoom: f32,
-    /// Whether to paint the always-on corner Poincaré overview minimap after
-    /// the main graph. Off by default, so an untouched view is unchanged.
-    pub show_minimap: bool,
-    /// Which pane corner the minimap occupies.
-    pub minimap_corner: Corner,
-    /// Side of the minimap as a fraction of the shorter pane dimension.
-    pub minimap_size: f32,
-    /// Whether the minimap reads as a clipped circle or a filled square.
-    pub minimap_shape: MinimapShape,
-    /// Click-to-expand swap target: when `true` the Poincaré overview promotes
-    /// to fill the pane while the Euclidean main view demotes into the corner;
-    /// `false` settles back to the corner overview. The actual layout follows
-    /// `swap_t`, which eases toward this each frame.
-    pub minimap_expanded: bool,
-    /// Eased swap progress in `[0, 1]`: `0` ⇒ Euclidean-in-full +
-    /// Poincaré-in-corner (today's layout), `1` ⇒ Poincaré-in-full +
-    /// Euclidean-in-corner. Advances toward `minimap_expanded ? 1 : 0`.
-    swap_t: f32,
-    /// When set (demo/snapshot only), `swap_t` is held fixed and never advances
-    /// toward `minimap_expanded`, so a filmstrip can capture intermediate frames.
-    swap_pinned: bool,
     /// In-flight click fly-to animation, if any.
     flyto: Option<FlyTo>,
     /// Magnification at or above which a node renders at FULL detail (circle /
@@ -166,24 +178,119 @@ pub struct State {
     /// re-layout, higher = nodes stay put as the graph changes. Only effective
     /// when the source supplies stable [`node_key`](Source::node_key)s.
     pub anchor_stiffness: f32,
+    /// How far the force layout spreads out (user-controllable). Maps to FA2
+    /// gravity as `gravity = 1/spread` (less gravity → wider layout) and scales
+    /// the runaway safety belt with it, so bigger spread never piles nodes at the
+    /// wall. `1.0` = the default weak-gravity shape. Force-directed only.
+    pub layout_spread: f32,
+    /// Force-layout iteration budget (FA2 `max_iters`). Higher = longer settle for
+    /// big graphs that still drift at the default cap; it still stops early on
+    /// convergence. User-configurable via the view menu.
+    pub settle_iters: u32,
+    /// Whether the node-colour palette controls (flat node fill + active-note accent)
+    /// are meaningful for this source. `false` when nodes are coloured by some other
+    /// rule (e.g. the code graph colours by entity kind), so the view menu hides the
+    /// inapplicable vault-style palette pickers. Edge/label/background colours still
+    /// apply regardless.
+    pub palette_editable: bool,
+    /// Per-`State` user toggle for the custom instanced GPU paint path. Only has
+    /// an effect when the process-global opt-in ([`set_gpu_paint`]) is also set —
+    /// i.e. in the live app under the wgpu backend. Default `true`.
+    pub gpu_instancing: bool,
+    /// Stable GPU-callback slot ids for this view's panes (main + minimap),
+    /// allocated lazily so each pane keeps its own persistent instance buffer.
+    gpu_pane_ids: [Option<u64>; 2],
+    /// CPU-side mirror of the geometry key each pane's GPU buffers were last
+    /// built for (indexed by pane slot, 0 = main, 1 = minimap). Lets the affine
+    /// fast-path decide — before building the batch — whether this frame is a
+    /// cache hit (skip the fill build) or a rebuild. Kept in sync with the GPU's
+    /// own `PaneBuffers.cache_key`.
+    gpu_last_key: [Option<gpu::GpuCacheKey>; 2],
+    /// Animated "edge flow": toggle-able tracer dots that ride each edge from
+    /// caller→callee, drawn by the GPU flow pipeline. Default `false`. GPU path
+    /// only — inert under the Painter fallback (flow is a GPU feature). When on,
+    /// `ui()` feeds the seconds clock into the callback and requests a repaint
+    /// every frame so the dots advance; when off, no extra repaint, zero cost
+    /// (the flow pipeline simply isn't drawn).
+    pub flow_enabled: bool,
+    /// Tracer-dot hue. A vivid amber (`#ff8c1a`) by default so the dots read on
+    /// both the white live code-graph background and dark demo backgrounds (the
+    /// old white-brightened dots washed out on white — Bug 2). Only meaningful
+    /// when `flow_enabled`.
+    pub flow_color: egui::Color32,
+    /// Tracer-dot radius in screen px (1.0..=6.0). Not view-scaled.
+    pub flow_size: f32,
+    /// Tracer-dot opacity (0.0..=1.0) — how intrusive the dots are.
+    pub flow_alpha: f32,
+    /// Dots emitted per edge (1..=8). Multiple evenly-spaced dots keep one in the
+    /// on-screen edge span at any zoom (Bug 1).
+    pub flow_density: u32,
+    /// Tracer-dot speed in cycles/second (0.05..=2.0).
+    pub flow_speed: f32,
+    /// The seconds clock fed to the flow shader this frame. Normally
+    /// `ui.input(|i| i.time)`; a headless demo can pin it via
+    /// [`set_flow_for_demo`](Self::set_flow_for_demo).
+    flow_time: f32,
+    /// `true` once a demo pinned `flow_time`, so `ui()` stops overwriting it with
+    /// the live input clock (headless snapshots render at a fixed flow phase).
+    flow_time_pinned: bool,
+    /// Monotonic "the layout geometry changed" counter for the GPU paint cache.
+    /// Bumped on every [`recompute_layout`](Self::recompute_layout) and on every
+    /// frame the force worker is still settling (positions move). The affine GPU
+    /// path records the epoch it last built its instance/edge buffers for and
+    /// skips the rebuild + upload when it's unchanged — so a pure pan/zoom (which
+    /// leaves the world positions alone) only rewrites a small view-transform
+    /// uniform. See `gpu.rs`.
+    layout_epoch: u64,
+    /// Hover / selection edge-highlight appearance + toggles. [graph-hover-highlight]
+    pub highlight: HighlightStyle,
+    /// The "selected" node index the host marks for a persistent edge highlight
+    /// (e.g. the code view's drilled-into node). Set by the consumer each frame;
+    /// `None` = nothing selected. Honored when `highlight.selected_edges`.
+    pub selected_node: Option<usize>,
+    /// The node whose hover highlight is currently animating — retained when the
+    /// pointer leaves so its edges can FADE OUT (the live `hovered` is already
+    /// `None` by then). Internal.
+    hover_anim_node: Option<usize>,
+    /// In-flight hover-flow transition: when the hover MOVES between two nodes,
+    /// the highlight doesn't jump — the old node's glow fades out while the new
+    /// one's fades in, and any edge directly connecting them carries a travelling
+    /// pulse. Internal. status: graph-hover-flow
+    hover_flow: Option<HoverFlow>,
+    /// Fluid-highlight energy per node: injected at the hovered node, diffusing
+    /// along edges, drifting downhill toward the selected node, decaying.
+    /// Internal. status: graph-hover-fluid
+    fluid_energy: Vec<f32>,
+    /// Hop-distance potential from the selected node (the "gravity" the fluid
+    /// runs down); rebuilt when the selection / graph changes. Internal.
+    fluid_potential: Vec<f32>,
+    fluid_potential_for: Option<usize>,
+    fluid_potential_epoch: u64,
+    fluid_last_time: f64,
+    /// The `click_path` of the node RIGHT-clicked this frame (set during paint,
+    /// read+cleared by the host via [`take_secondary_click`](Self::take_secondary_click)).
+    /// Lets a consumer attach a context action (e.g. the code view's "open source
+    /// file") without the engine knowing the verb.
+    secondary_click: Option<String>,
+    /// Positions-vector index of the node RIGHT-clicked this frame (set during
+    /// paint alongside `secondary_click`, read+cleared via
+    /// [`take_secondary_click_node`](Self::take_secondary_click_node)). Unlike
+    /// `secondary_click` it is set even for nodes with no `click_path`, so a
+    /// host can attach a context menu to non-openable nodes (e.g. cluster
+    /// nodes) without giving them a misleading click affordance.
+    secondary_click_node: Option<usize>,
 }
 
-/// Pane corner the overview minimap is anchored to.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Corner {
-    TopLeft,
-    TopRight,
-    BottomLeft,
-    BottomRight,
+/// An in-flight hover-flow transition: the two keyframes (`from` = the previously
+/// hovered node, `to` = the newly hovered one) and the wall-clock start, from which
+/// each frame derives its progress. status: graph-hover-flow
+#[derive(Clone, Copy, Debug)]
+struct HoverFlow {
+    from: usize,
+    to: usize,
+    start: f64,
 }
 
-/// Frame style of the overview minimap: a clipped Poincaré disk or a filled
-/// square with the disk clipped to it.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum MinimapShape {
-    Circle,
-    Square,
-}
 
 /// Where the lens focus (the world point that maps to the disk centre) sits each
 /// frame, for the interactive pane. The lens *scale* is always the centroid
@@ -224,15 +331,6 @@ fn lerp_complex(a: Complex, b: Complex, t: f32) -> Complex {
     Complex::new(a.re + (b.re - a.re) * t, a.im + (b.im - a.im) * t)
 }
 
-/// Interpolate two rects by lerping their min + max corners — `t = 0` ⇒ `a`,
-/// `t = 1` ⇒ `b`. Drives the expand swap (full ⇄ corner) animation.
-fn lerp_rect(a: egui::Rect, b: egui::Rect, t: f32) -> egui::Rect {
-    egui::Rect::from_min_max(a.min.lerp(b.min, t), a.max.lerp(b.max, t))
-}
-
-/// Seconds the expand swap animation takes end to end.
-const SWAP_DURATION: f32 = 0.35;
-
 /// Per-frame lens: the `world → lensed-world` step inserted *before* the
 /// affine [`View::screen_mapper`]. Holds the focus (the world point that maps
 /// to the disk centre) and `lens_scale` (the world distance that normalises
@@ -250,25 +348,13 @@ struct Lens {
     nav: Mobius,
 }
 
-/// The layout centroid and the centroid extent (farthest node distance from the
-/// centroid, floored at 1.0). The extent normalises the lens so `tanh` doesn't
-/// saturate; computing it from the centroid — not from the lens focus — keeps
-/// the layout scale fixed when the focus moves (focus-modes).
+/// The layout centroid + centroid extent — delegates to
+/// [`hiker_projection_view::centroid_scale`]. Kept as an engine-internal wrapper
+/// so `Lens` and `nav.rs` keep the short name. The extent normalises the lens so
+/// `tanh` doesn't saturate; computing it from the centroid (not the moving lens
+/// focus) keeps the layout scale fixed as the focus moves (focus-modes).
 fn centroid_scale(positions: &[egui::Vec2]) -> (egui::Vec2, f32) {
-    if positions.is_empty() {
-        return (egui::Vec2::ZERO, 1.0);
-    }
-    let mut sum = egui::Vec2::ZERO;
-    for &p in positions {
-        sum += p;
-    }
-    let centroid = sum / positions.len() as f32;
-    let scale = positions
-        .iter()
-        .map(|&p| (p - centroid).length())
-        .fold(0.0_f32, f32::max)
-        .max(1.0);
-    (centroid, scale)
+    hiker_projection_view::centroid_scale(positions)
 }
 
 impl Lens {
@@ -299,13 +385,7 @@ impl Lens {
     /// route through here, so they pick up navigation automatically. Fisheye
     /// never applies `nav`, keeping its affine pan unchanged.
     fn disk(&self, w: egui::Vec2) -> Complex {
-        let rel = (w - self.focus) / self.scale;
-        let z = forward(Complex::from([rel.x, rel.y]), self.cfg);
-        if self.cfg.kind == ProjectionKind::Poincare {
-            self.nav.apply(z)
-        } else {
-            z
-        }
+        lens_disk((w - self.focus) / self.scale, self.cfg, self.nav)
     }
 
     /// Map a disk point back to lensed-world space (the inverse of the
@@ -354,129 +434,98 @@ fn smoothstep(t: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// LOD render tier for a node, selected from its magnification.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Lod {
-    /// Full detail: the descriptor's circle/square + label (zoom rule still
-    /// gates the label).
-    Full,
-    /// A small filled dot, no label, no hover ring.
-    Dot,
-    /// A tiny point, no label.
-    Marker,
-}
-
-/// Multiply an egui colour's alpha by `factor` (clamped). Used for rim fade.
-fn fade(color: egui::Color32, factor: f32) -> egui::Color32 {
-    if factor >= 1.0 {
-        return color;
+const fn projection_kind_str(kind: ProjectionKind) -> &'static str {
+    match kind {
+        ProjectionKind::Affine => "affine",
+        ProjectionKind::Fisheye => "fisheye",
+        ProjectionKind::Poincare => "poincare",
     }
-    let a = (color.a() as f32 * factor.clamp(0.0, 1.0)).round() as u8;
-    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), a)
 }
 
-/// View toggles common to every graph. Caller-specific toggles (the vault
-/// "Orphans", the cluster "Leaves", the review tab's "Live preview") live on
-/// the caller and are surfaced through the `extra_toggles` argument of
-/// [`State::view_options_menu`].
-#[derive(Clone, Copy)]
-pub struct Toggles {
-    pub show_labels: bool,
-    pub show_edges: bool,
-    pub show_preview: bool,
+fn projection_kind_from_str(s: &str) -> ProjectionKind {
+    match s {
+        "fisheye" => ProjectionKind::Fisheye,
+        "poincare" => ProjectionKind::Poincare,
+        _ => ProjectionKind::Affine,
+    }
 }
 
-/// Hover-preview card text, refreshed only when the hovered node changes so
-/// we don't re-read the note body every frame.
-#[derive(Default)]
-pub struct PreviewCache {
-    hovered_index: Option<usize>,
-    title: Option<String>,
-    body: Option<String>,
+const fn focus_mode_str(mode: FocusMode) -> &'static str {
+    match mode {
+        FocusMode::LockedCenter => "center",
+        FocusMode::Cursor => "cursor",
+        FocusMode::Selection => "selection",
+    }
 }
 
-/// Per-node draw + hit-test descriptor produced by a [`Source`] each frame.
-/// The caller computes `fill`/`radius`/`shape` from its own data and the
-/// active [`Style`]; the engine never hardcodes a coloring scheme.
-pub struct NodeDescriptor {
-    /// Index into `positions` — also the hover/preview identity.
-    pub index: usize,
-    pub world_pos: egui::Vec2,
-    /// Base radius in world units, before `node_scale`/zoom.
-    pub radius: f32,
-    pub shape: NodeShape,
-    pub fill: egui::Color32,
-    pub resting_stroke: egui::Stroke,
-    pub hover_stroke: egui::Stroke,
-    pub label: Option<String>,
-    /// Labels draw only at or above this zoom (0.0 = always).
-    pub label_min_zoom: f32,
-    /// `Some` makes the node clickable; the path is returned from [`State::ui`]
-    /// for the caller to open.
-    pub click_path: Option<String>,
-    /// Hover tooltip text (the cluster graph shows node names; the vault
-    /// graph passes `None`).
-    pub tooltip: Option<String>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum NodeShape {
-    Circle,
-    Square,
-}
-
-/// World-space layout sizing. The vault graph and cluster graph settled on
-/// different scales (1000² vs 800² boxes), so each caller passes its own.
-#[derive(Clone, Copy)]
-pub struct LayoutConfig {
-    /// Area handed to the tree layouts.
-    pub area: f32,
-    /// Full width of the random scatter box for the force seed.
-    pub seed_box: f32,
-}
-
-/// The caller-supplied bridge from domain data to the engine. Vault and
-/// cluster panels each implement it over their own storage.
-pub trait Source {
-    /// Total node count (length of the `positions` vector). Includes nodes
-    /// the caller hides in [`Source::nodes`] (orphans / leaves) so edge and
-    /// layout indices stay stable.
-    fn node_count(&self) -> usize;
-
-    /// Build the visible node descriptors for this frame. `positions` is the
-    /// engine's current layout; the caller reads `positions[i]` for each node
-    /// it emits and skips its own hidden nodes.
-    fn nodes(&self, positions: &[egui::Vec2], style: &Style) -> Vec<NodeDescriptor>;
-
-    /// Edges as `positions`-index pairs. Used both for drawing and as the
-    /// force-worker topology.
-    fn edges(&self) -> Vec<(u32, u32)>;
-
-    /// Spanning/parent tree for a tree layout. The vault graph BFS/DFS-es a
-    /// spanning tree per kind; the cluster graph uses its parent tree for
-    /// all. Only called for non-force kinds.
-    fn layout_tree(&self, kind: LayoutKind) -> LayoutTree;
-
-    /// `(title, body)` for the hover-preview card of node `index`. Called
-    /// once per hover change. Returns `None` to suppress the card.
-    fn preview_for(&self, index: usize) -> Option<(String, String)>;
-
-    /// A stable per-node identity that survives a rebuild, used by the
-    /// force-directed layout to map old node positions onto the new graph so a
-    /// re-cluster / vault-rebuild *morphs* smoothly instead of reshuffling: a
-    /// retained key keeps (and is anchored toward) its prior position; a node
-    /// whose key is new settles in fresh.
-    ///
-    /// The default returns `None` for every node, which opts out entirely —
-    /// the layout then falls back to today's fresh random scatter on every
-    /// rebuild, byte-identical to the pre-anchor behaviour.
-    fn node_key(&self, index: usize) -> Option<String> {
-        let _ = index;
-        None
+fn focus_mode_from_str(s: &str) -> FocusMode {
+    match s {
+        "cursor" => FocusMode::Cursor,
+        "selection" => FocusMode::Selection,
+        _ => FocusMode::LockedCenter,
     }
 }
 
 impl State {
+    /// Snapshot the persistable view bits into a plain, serde-free
+    /// [`Snapshot`] the app converts to its tab-state store. The node
+    /// positions come from `prev_positions` (the live layout keyed by stable
+    /// [`Source::node_key`], captured every frame in [`State::ui`]) so they
+    /// survive a rebuild. Excludes the worker / edge routes / preview / fly-to /
+    /// nav / GPU handles. status: graph-view-state-persist
+    pub fn view_snapshot(&self) -> Snapshot {
+        Snapshot {
+            positions: self
+                .prev_positions
+                .iter()
+                .map(|(k, v)| (k.clone(), (v.x, v.y)))
+                .collect(),
+            pan_x: self.view.pan.x,
+            pan_y: self.view.pan.y,
+            zoom: self.view.zoom,
+            projection_kind: projection_kind_str(self.projection.kind).to_string(),
+            projection_strength: self.projection.strength,
+            projection_size_falloff: self.projection.size_falloff,
+            focus_mode: focus_mode_str(self.focus_mode).to_string(),
+            show_labels: self.toggles.show_labels,
+            show_edges: self.toggles.show_edges,
+            show_preview: self.toggles.show_preview,
+            lod_full_mag: self.lod_full_mag,
+            lod_marker_mag: self.lod_marker_mag,
+        }
+    }
+
+    /// Apply a previously-captured [`Snapshot`] (projection / focus /
+    /// toggles / LOD / pan-zoom + the warm-seed positions). The positions are
+    /// seeded into `prev_positions` so the NEXT same-kind force [`recompute_layout`](Self::recompute_layout)
+    /// warm-seeds + anchors the retained nodes onto their saved spots (robust when
+    /// the node set changed: only matching keys are re-used, new nodes settle
+    /// fresh). The caller suppresses the fresh-build auto-fit so the restored
+    /// pan/zoom sticks. status: graph-view-state-persist
+    pub fn restore_view(&mut self, snap: &Snapshot) {
+        self.view.pan = egui::vec2(snap.pan_x, snap.pan_y);
+        if snap.zoom > 0.0 {
+            self.view.zoom = snap.zoom;
+        }
+        self.projection.kind = projection_kind_from_str(&snap.projection_kind);
+        self.projection.strength = snap.projection_strength;
+        self.projection.size_falloff = snap.projection_size_falloff;
+        self.focus_mode = focus_mode_from_str(&snap.focus_mode);
+        self.toggles.show_labels = snap.show_labels;
+        self.toggles.show_edges = snap.show_edges;
+        self.toggles.show_preview = snap.show_preview;
+        self.lod_full_mag = snap.lod_full_mag;
+        self.lod_marker_mag = snap.lod_marker_mag;
+        // Seed the warm-layout history so the next force rebuild morphs onto the
+        // saved shape. `last_layout_kind` is left untouched — the caller drives
+        // the rebuild; an empty `prev_positions` simply means a fresh scatter.
+        self.prev_positions = snap
+            .positions
+            .iter()
+            .map(|(k, &(x, y))| (k.clone(), egui::vec2(x, y)))
+            .collect();
+    }
+
     /// Fresh engine state with the given style + starting layout.
     pub fn new(style: Style, layout_kind: LayoutKind) -> Self {
         Self {
@@ -498,13 +547,6 @@ impl State {
             show_boundary: true,
             nav: Mobius::identity(),
             poincare_zoom: 1.0,
-            show_minimap: false,
-            minimap_corner: Corner::BottomRight,
-            minimap_size: 0.28,
-            minimap_shape: MinimapShape::Circle,
-            minimap_expanded: false,
-            swap_t: 0.0,
-            swap_pinned: false,
             flyto: None,
             lod_full_mag: 0.5,
             lod_marker_mag: 0.15,
@@ -519,7 +561,152 @@ impl State {
             prev_adjacency: HashMap::new(),
             last_layout_kind: None,
             anchor_stiffness: 0.2,
+            layout_spread: 1.0,
+            settle_iters: 800,
+            palette_editable: true,
+            gpu_instancing: true,
+            gpu_pane_ids: [None, None],
+            gpu_last_key: [None, None],
+            flow_enabled: false,
+            // Defaults that look good out of the box: vivid amber, ~3px, ~0.9
+            // alpha, density 3, speed 0.35.
+            flow_color: egui::Color32::from_rgb(0xff, 0x8c, 0x1a),
+            flow_size: 3.0,
+            flow_alpha: 0.9,
+            flow_density: 3,
+            flow_speed: 0.35,
+            flow_time: 0.0,
+            flow_time_pinned: false,
+            layout_epoch: 0,
+            highlight: HighlightStyle::default(),
+            selected_node: None,
+            hover_anim_node: None,
+            hover_flow: None,
+            fluid_energy: Vec::new(),
+            fluid_potential: Vec::new(),
+            fluid_potential_for: None,
+            fluid_potential_epoch: 0,
+            fluid_last_time: 0.0,
+            secondary_click: None,
+            secondary_click_node: None,
         }
+    }
+
+    /// Take the `click_path` of the node RIGHT-clicked this frame (clearing it).
+    /// The host calls this right after [`ui`](Self::ui) to run a context action —
+    /// e.g. the code view opens the node's source file. `None` if no node was
+    /// right-clicked.
+    pub const fn take_secondary_click(&mut self) -> Option<String> {
+        self.secondary_click.take()
+    }
+
+    /// Take the positions-vector index of the node RIGHT-clicked this frame
+    /// (clearing it). The index-keyed sibling of
+    /// [`take_secondary_click`](Self::take_secondary_click) for hosts whose
+    /// menu targets include nodes without a `click_path` (cluster nodes, group
+    /// nodes): the host maps the index back to its own node identity.
+    pub const fn take_secondary_click_node(&mut self) -> Option<usize> {
+        self.secondary_click_node.take()
+    }
+
+    /// Inject full fluid-highlight energy at `indices` (positions-vector indices),
+    /// as if each were hovered to saturation at once — the host-side entry into the
+    /// hover fluid (`graph-hover-fluid`): the energy then diffuses along edges,
+    /// drifts toward the selection, and decays exactly like a hover wake. Lets a
+    /// consumer *light up a set of nodes* (e.g. a spec's implementing entities) with
+    /// one call and no new render machinery. Out-of-range indices are ignored; a
+    /// no-op while the layout is empty or the fluid highlight is toggled off
+    /// (the field only renders under `highlight.fluid`).
+    /// status: code-graph-spec-lighting
+    pub fn pulse_nodes(&mut self, indices: &[usize]) {
+        let n = self.positions.len();
+        // The fluid field only advances (and decays) while `highlight.fluid` is
+        // on — injecting with it off would park stale energy that pops in later.
+        if n == 0 || !(self.highlight.fluid && self.highlight.hover_edges) {
+            return;
+        }
+        // Mirror the advance step's resize: a stale-length field is replaced (and
+        // its selection potential invalidated) rather than indexed out of bounds.
+        if self.fluid_energy.len() != n {
+            self.fluid_energy = vec![0.0; n];
+            self.fluid_potential_for = None;
+        }
+        for &i in indices {
+            if i < n {
+                self.fluid_energy[i] = 1.0;
+            }
+        }
+    }
+
+    /// Force the GPU paint cache to rebuild its instance/edge buffers next frame
+    /// even though the layout geometry is unchanged. Hosts call this when a
+    /// *coloring input* outside the engine changes (e.g. the code graph switching
+    /// its fill overlay): the cached affine batch bakes node fills, so a pure
+    /// recolor would otherwise keep stale colors on the GPU path.
+    pub const fn invalidate_paint_cache(&mut self) {
+        self.layout_epoch = self.layout_epoch.wrapping_add(1);
+    }
+
+    /// Whether the GPU instanced paint path should run this frame: the process
+    /// opt-in *and* this view's user toggle.
+    fn gpu_active(&self) -> bool {
+        gpu_paint_enabled() && self.gpu_instancing
+    }
+
+    /// The edge-flow animation inputs to thread onto this frame's GPU callbacks:
+    /// the current seconds clock + whether flow is enabled. A no-op (`flow: false`)
+    /// unless `flow_enabled` is set; the dots animate purely off the moving
+    /// `flow_time`, so the affine edge buffer is never rebuilt.
+    fn flow_params(&self) -> gpu::FlowParams {
+        // The colour picker stores a premultiplied `Color32`; the shader wants
+        // the STRAIGHT (un-premultiplied) sRGB hue in 0..1 and applies the
+        // opacity itself, so pass the un-multiplied components.
+        let [r, g, b, _] = self.flow_color.to_srgba_unmultiplied();
+        gpu::FlowParams {
+            time: self.flow_time,
+            flow: self.flow_enabled,
+            color: [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0],
+            size: self.flow_size,
+            alpha: self.flow_alpha,
+            speed: self.flow_speed,
+            density: self.flow_density as f32,
+        }
+    }
+
+    /// Pin the edge-flow clock to a fixed value and enable flow — for headless
+    /// snapshot/demo frames that render the tracer dots at a deterministic phase
+    /// without driving real time. Not part of the interactive flow.
+    #[doc(hidden)]
+    pub const fn set_flow_for_demo(&mut self, time: f32) {
+        self.flow_enabled = true;
+        self.flow_time = time;
+        self.flow_time_pinned = true;
+    }
+
+    /// The stable GPU-callback slot id for pane `slot` (0 = main, 1 = minimap),
+    /// allocating it on first use so the pane's instance buffer persists.
+    fn gpu_pane_id(&mut self, slot: usize) -> u64 {
+        *self.gpu_pane_ids[slot].get_or_insert_with(gpu::GraphPaintCallback::next_id)
+    }
+
+    /// A cheap structural fingerprint of what the affine GPU batch *emits* this
+    /// frame, beyond the `layout_epoch`. Two frames that share an epoch but
+    /// differ here (a toggled edge layer, a changed node/edge count, a layout
+    /// kind switch, a node-scale/edge-width edit that resizes geometry) must
+    /// rebuild; a pure pan/zoom leaves all of these alone, so the key matches and
+    /// the rebuild is skipped. `node_count`/`edges` come from the [`Source`].
+    fn gpu_content_key(&self, source: &dyn Source) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        source.node_count().hash(&mut h);
+        source.edges().len().hash(&mut h);
+        self.toggles.show_edges.hash(&mut h);
+        self.toggles.show_labels.hash(&mut h);
+        (self.layout_kind as u8).hash(&mut h);
+        // Node scale + edge width resize the baked geometry, so fold them in.
+        self.style.node_scale.to_bits().hash(&mut h);
+        self.style.edge_width.to_bits().hash(&mut h);
+        h.finish()
     }
 
     /// Force the lens focus onto a specific node — for demo/snapshot frames that
@@ -532,13 +719,27 @@ impl State {
         self.focus_node = Some(index);
     }
 
-    /// Force the swap progress directly — for headless snapshot/demo filmstrips
-    /// that need to capture intermediate frames without driving the animation
-    /// over real time. Not part of the interactive flow.
+    /// Force the affine pan/zoom view directly — for headless snapshot/demo
+    /// frames that need to render at a panned + zoomed view without driving real
+    /// scroll/drag input. `zoom` is the affine view zoom; `pan` is the world-space
+    /// pan offset (`screen = center + (w + pan) * zoom`). Cancels the settle-time
+    /// auto-fit so the view sticks. Not part of the interactive flow.
     #[doc(hidden)]
-    pub const fn set_swap_t_for_demo(&mut self, t: f32) {
-        self.swap_t = t.clamp(0.0, 1.0);
-        self.swap_pinned = true;
+    pub const fn set_view_for_demo(&mut self, zoom: f32, pan: egui::Vec2) {
+        self.view.zoom = zoom;
+        self.view.pan = pan;
+        self.needs_fit = false;
+    }
+
+    /// Drop the warm-seed history so the NEXT [`recompute_layout`](Self::recompute_layout)
+    /// lays out fresh (compact scatter) instead of morphing from the prior layout.
+    /// Call this when the node set changes so drastically that warm-seeding from the
+    /// old positions would scatter the new graph — e.g. drilling from a huge overview
+    /// into a small focus neighbourhood, where inheriting the overview's wide spread
+    /// would fling the few nodes across an empty area and the fit would zoom past them.
+    pub fn reset_layout_history(&mut self) {
+        self.prev_positions.clear();
+        self.last_layout_kind = None;
     }
 
     /// (Re)compute positions for the current `layout_kind`. Force-directed
@@ -548,6 +749,9 @@ impl State {
     pub fn recompute_layout(&mut self, source: &dyn Source, cfg: LayoutConfig) {
         self.worker = None;
         self.needs_fit = true;
+        // New geometry: invalidate the GPU paint cache so the affine fast-path
+        // rebuilds its instance/edge buffers this frame (see `layout_epoch`).
+        self.layout_epoch = self.layout_epoch.wrapping_add(1);
         // Routed edges only exist for the Layered layout; clear any stale routes
         // up front, and the Layered arm below repopulates them.
         self.edge_routes.clear();
@@ -570,8 +774,25 @@ impl State {
                 // same-kind data rebuild morphs from the prior layout.
                 let same_kind = self.last_layout_kind == Some(LayoutKind::ForceDirected);
                 let have_history = !self.prev_positions.is_empty();
-                // `bound` is only a runaway-force safety belt; keep it well
-                // clear of any natural equilibrium for realistic graphs.
+                // Spread → repulsion strength: the settled radius scales ~√scaling_ratio
+                // (repulsion balanced against the edge springs; weak gravity, being
+                // ∝1/dist like repulsion, barely moves the extent — measured). So map
+                // `layout_spread` to `scaling_ratio = 100·spread²`, giving radius ∝ spread
+                // (spread 1 = the default scaling_ratio 100). `bound` is only a runaway
+                // safety belt, and a FIXED belt becomes a wall as graphs grow (a 20k-node
+                // graph settles at radius ~95k, so the old 50k belt pinned 8% of nodes
+                // into a square wall during settle). Scale it with the graph's mass
+                // (≈ n + 2·edges) AND the spread so the layout keeps its spread-out shape
+                // with room to stretch (measured: 0% at the wall) while still catching
+                // true runaways. Small graphs keep the 50k floor.
+                let spread = self.layout_spread.clamp(0.25, 5.0);
+                let scaling_ratio = 100.0 * spread * spread;
+                let bound = (2.0 * spread * (n + 2 * edges.len()) as f32).max(50_000.0);
+                // Iteration budget: a big graph often still drifts when it hits the
+                // default cap, so let the user extend the settle. FA2 still stops
+                // early once its swinging metric converges, so a high cap just means
+                // "keep going until actually settled" rather than always running it.
+                let max_iters = self.settle_iters.max(50);
                 if same_kind && have_history {
                     // Adaptive anchoring: a small clustering scrub (membership
                     // barely moves) keeps the full `self.anchor_stiffness` and a
@@ -598,7 +819,9 @@ impl State {
                         seed,
                         edges,
                         LayoutParams {
-                            bound: 50_000.0,
+                            bound,
+                            scaling_ratio,
+                            max_iters,
                             anchor_stiffness: effective,
                             ..LayoutParams::default()
                         },
@@ -615,7 +838,9 @@ impl State {
                         seed,
                         edges,
                         LayoutParams {
-                            bound: 50_000.0,
+                            bound,
+                            scaling_ratio,
+                            max_iters,
                             ..LayoutParams::default()
                         },
                     ));
@@ -695,6 +920,9 @@ impl State {
             && let Some(w) = self.worker.as_ref()
         {
             w.snapshot_into(&mut self.positions);
+            // Positions moved this frame: invalidate the GPU paint cache so the
+            // affine fast-path rebuilds against the fresh layout while settling.
+            self.layout_epoch = self.layout_epoch.wrapping_add(1);
             ui.ctx().request_repaint();
         }
 
@@ -708,80 +936,31 @@ impl State {
             }
         }
 
-        // Advance the expand swap toward its target; repaint while in flight.
-        // A pinned `swap_t` (demo/snapshot) is held fixed.
-        if !self.swap_pinned {
-            let dt = ui.input(|i| i.stable_dt);
-            let target = if self.minimap_expanded { 1.0 } else { 0.0 };
-            if self.swap_t != target && dt > 0.0 {
-                let step = dt / SWAP_DURATION;
-                if (target - self.swap_t).abs() <= step {
-                    self.swap_t = target;
-                } else {
-                    self.swap_t += step * (target - self.swap_t).signum();
-                }
-            }
-            if self.swap_t > 0.0 && self.swap_t < 1.0 {
+        // Edge-flow animation clock: feed the egui monotonic seconds clock into
+        // the flow shader and keep repainting so the dots advance. A demo can pin
+        // the clock (`flow_time_pinned`) to render a fixed phase headlessly. When
+        // flow is off, no extra repaint + zero cost (the pipeline isn't drawn).
+        if self.flow_enabled {
+            if self.flow_time_pinned {
+                // Headless demo: the clock is fixed, so the dots are static — no
+                // repaint needed (and the kittest harness would loop forever).
+            } else {
+                self.flow_time = ui.input(|i| i.time) as f32;
                 ui.ctx().request_repaint();
             }
         }
 
         let nodes = source.nodes(&self.positions, &self.style);
         let inputs = PaneInputs { source, nodes: &nodes, draw_preview: &draw_preview };
+        // Cleared each frame; `paint_pane` sets them when a node is right-clicked.
+        self.secondary_click = None;
+        self.secondary_click_node = None;
 
-        // FAST PATH — the common case is byte-identical to the historical single
-        // interactive pane: no minimap, no expansion, no swap in flight.
-        if !self.show_minimap && !self.minimap_expanded && self.swap_t == 0.0 {
-            return self.paint_pane(ui, &painter, rect, self.projection, Some(&response), &inputs);
-        }
-
-        // Two contents (Euclidean = `self.projection`, Poincaré = overview) move
-        // between two slots (full pane ⇄ corner) as `swap_t` eases 0 → 1.
-        let corner = self.corner_rect(rect);
-        let euclid_rect = lerp_rect(rect, corner, self.swap_t);
-        let poincare_rect = lerp_rect(corner, rect, self.swap_t);
-        let euclid_is_main = self.swap_t < 0.5;
-        // Mid-flight: neither pane is interactive (avoids jank); only the settled
-        // full-slot content takes input.
-        let settled = self.swap_t == 0.0 || self.swap_t == 1.0;
-        let euclid_interactive = settled && euclid_is_main;
-        let poincare_interactive = settled && !euclid_is_main;
-        let euclid_resp = euclid_interactive.then_some(&response);
-        let poincare_resp = poincare_interactive.then_some(&response);
-
-        let euclid_cfg = self.projection;
-        let poincare_cfg = self.overview_cfg();
-
-        // Paint the full-slot content first so the corner inset sits above it.
-        let clicked = if euclid_is_main {
-            // Euclidean fills (or nearly fills) the pane; Poincaré is the inset.
-            let c = self.paint_pane(ui, &painter, euclid_rect, euclid_cfg, euclid_resp, &inputs);
-            self.frame_corner(&painter, poincare_rect);
-            self.paint_pane(ui, &painter, poincare_rect, poincare_cfg, poincare_resp, &inputs);
-            c
-        } else {
-            // Poincaré fills the pane; Euclidean is the inset.
-            let c = self.paint_pane(ui, &painter, poincare_rect, poincare_cfg, poincare_resp, &inputs);
-            self.frame_corner(&painter, euclid_rect);
-            let c2 = self.paint_pane(ui, &painter, euclid_rect, euclid_cfg, euclid_resp, &inputs);
-            if poincare_interactive { c } else { c2 }
-        };
-
-        // Click the corner-slot content to toggle the expand swap.
-        let corner_slot_rect = if euclid_is_main { poincare_rect } else { euclid_rect };
-        let swap_resp = ui.interact(
-            corner_slot_rect,
-            ui.id().with("graphview_minimap_swap"),
-            egui::Sense::click(),
-        );
-        if swap_resp.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        if swap_resp.clicked() {
-            self.minimap_expanded = !self.minimap_expanded;
-        }
-
-        clicked
+        // A single interactive pane. The corner overview is now a first-class,
+        // standalone [`minimap::Minimap`] the host composes over this pane (so it
+        // works even when the host's main view isn't a graph-view, like the canvas
+        // board) — no longer an inline swap branch here.
+        self.paint_pane(ui, &painter, rect, self.projection, Some(&response), &inputs, 0)
     }
 
     /// Eye-icon view-options popup: layout selector, common toggles plus any
@@ -803,175 +982,168 @@ impl State {
         let resp = ui.add(egui::Button::image(eye_icon)).on_hover_text("View options");
         let prev_kind = self.layout_kind;
         let prev_rankdir = self.layered_rankdir;
-        egui::Popup::menu(&resp).show(|ui| {
-            ui.label(egui::RichText::new("Layout").small().color(theme::muted()));
-            for kind in LayoutKind::all() {
-                let mut selected = self.layout_kind == kind;
-                if ui.checkbox(&mut selected, kind.label()).clicked() && selected {
-                    self.layout_kind = kind;
-                }
-            }
-            // Rank direction for the layered layout (relayout on change).
-            if self.layout_kind == LayoutKind::Layered {
-                ui.horizontal(|ui| {
-                    ui.label("Direction");
-                    ui.selectable_value(
-                        &mut self.layered_rankdir,
-                        hiker_graph::RankDir::Tb,
-                        "Top-Down",
-                    );
-                    ui.selectable_value(
-                        &mut self.layered_rankdir,
-                        hiker_graph::RankDir::Lr,
-                        "Left-Right",
-                    );
-                });
-            }
-            // Anchor stiffness governs how strongly retained nodes hold their
-            // prior spot across a rebuild — the display-engine control for the
-            // morph. Force-directed only. [force-cfg-anchor-stiffness]
-            if self.layout_kind == LayoutKind::ForceDirected {
-                ui.add(
-                    egui::Slider::new(&mut self.anchor_stiffness, 0.0..=1.0)
-                        .text("Anchor stiffness"),
-                )
-                .on_hover_text(
-                    "0 = lively/free re-layout, higher = stays put as the graph changes",
-                );
-            }
-            ui.separator();
-            ui.checkbox(&mut self.toggles.show_labels, "Labels");
-            ui.checkbox(&mut self.toggles.show_edges, "Edges");
-            for (label, flag) in extra_toggles.iter_mut() {
-                ui.checkbox(flag, *label);
-            }
-            ui.checkbox(&mut self.toggles.show_preview, "Show note preview");
+        // Cap the menu height to the viewport so a long option list scrolls instead
+        // of running off the bottom of the screen.
+        let max_h = (ui.ctx().screen_rect().height() - 96.0).max(240.0);
+        let mut spread_relayout = false;
+        // Stay open while the user toggles checkboxes / drags sliders inside —
+        // only an OUTSIDE click dismisses it (a sticky settings menu).
+        egui::Popup::menu(&resp)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+          egui::ScrollArea::vertical().max_height(max_h).show(ui, |ui| {
+            // Accordion: each section is a collapsible header so the (long) option
+            // list stays scannable. Layout + Display open by default; the rest
+            // collapse. egui persists each header's open state by id.
+            use egui::CollapsingHeader;
 
-            ui.separator();
-            ui.label(egui::RichText::new("Colors").small().color(theme::muted()));
-            palette_rows(ui, &mut self.style.palette);
-            color_row(ui, "Edges", &mut self.style.edge_color);
-            color_row(ui, "Labels", &mut self.style.label_color);
-            let theme_bg = ui.visuals().extreme_bg_color;
-            let mut bg = self.style.background.unwrap_or(theme_bg);
-            ui.horizontal(|ui| {
-                if ui.color_edit_button_srgba(&mut bg).changed() {
-                    self.style.background = Some(bg);
+            CollapsingHeader::new("Layout").default_open(true).show(ui, |ui| {
+                for kind in LayoutKind::all() {
+                    let mut selected = self.layout_kind == kind;
+                    if ui.checkbox(&mut selected, kind.label()).clicked() && selected {
+                        self.layout_kind = kind;
+                    }
                 }
-                ui.label("Background");
+                if self.layout_kind == LayoutKind::Layered {
+                    ui.horizontal(|ui| {
+                        ui.label("Direction");
+                        ui.selectable_value(&mut self.layered_rankdir, hiker_graph::RankDir::Tb, "Top-Down");
+                        ui.selectable_value(&mut self.layered_rankdir, hiker_graph::RankDir::Lr, "Left-Right");
+                    });
+                }
+                // Force-directed morph controls. [force-cfg-anchor-stiffness]
+                if self.layout_kind == LayoutKind::ForceDirected {
+                    ui.add(egui::Slider::new(&mut self.anchor_stiffness, 0.0..=1.0).text("Anchor stiffness"))
+                        .on_hover_text("0 = lively/free re-layout, higher = stays put as the graph changes");
+                    // Relayout on release only — dragging would respawn the worker every frame.
+                    let sr = ui.add(egui::Slider::new(&mut self.layout_spread, 0.5..=4.0).text("Spread"))
+                        .on_hover_text("How far the graph spreads out before settling");
+                    let it = ui.add(egui::Slider::new(&mut self.settle_iters, 200..=8000).text("Settle iters").logarithmic(true))
+                        .on_hover_text("Force-layout iteration budget (stops early if it converges)");
+                    if sr.drag_stopped() || (sr.changed() && !sr.dragged()) || it.drag_stopped() || (it.changed() && !it.dragged()) {
+                        spread_relayout = true;
+                    }
+                }
             });
 
-            ui.separator();
-            ui.label(egui::RichText::new("Size").small().color(theme::muted()));
-            ui.add(egui::Slider::new(&mut self.style.node_scale, 0.3..=3.0).text("Nodes"));
-            ui.add(egui::Slider::new(&mut self.style.edge_width, 0.25..=4.0).text("Edges"));
-            ui.add(egui::Slider::new(&mut self.style.label_size, 7.0..=20.0).text("Labels"));
-
-            ui.separator();
-            ui.label(egui::RichText::new("Projection").small().color(theme::muted()));
-            for (kind, label) in [
-                (ProjectionKind::Affine, "Off"),
-                (ProjectionKind::Fisheye, "Fisheye"),
-                (ProjectionKind::Poincare, "Poincaré"),
-            ] {
-                let mut selected = self.projection.kind == kind;
-                if ui.checkbox(&mut selected, label).clicked() && selected {
-                    self.projection.kind = kind;
-                    // Reframe so the (newly) lensed extent fills the view.
-                    self.needs_fit = true;
+            CollapsingHeader::new("Display").default_open(true).show(ui, |ui| {
+                ui.checkbox(&mut self.toggles.show_labels, "Labels");
+                ui.checkbox(&mut self.toggles.show_edges, "Edges");
+                for (label, flag) in extra_toggles.iter_mut() {
+                    ui.checkbox(flag, *label);
                 }
-            }
-            if self.projection.kind != ProjectionKind::Affine {
-                ui.add(
-                    egui::Slider::new(&mut self.projection.strength, 0.1..=3.0).text("Strength"),
-                );
-                ui.add(
-                    egui::Slider::new(&mut self.projection.size_falloff, 0.0..=1.0)
-                        .text("Size falloff"),
-                );
+                ui.checkbox(&mut self.toggles.show_preview, "Show note preview");
+                ui.checkbox(&mut self.gpu_instancing, "GPU instancing")
+                    .on_hover_text("Draw node fills + edge lines via a custom wgpu pipeline (wgpu backend only)");
+            });
 
-                ui.label(egui::RichText::new("Focus").small().color(theme::muted()));
-                ui.horizontal(|ui| {
-                    ui.selectable_value(
-                        &mut self.focus_mode,
-                        FocusMode::LockedCenter,
-                        "Center",
+            CollapsingHeader::new("Highlight").default_open(false).show(ui, |ui| {
+                ui.checkbox(&mut self.highlight.hover_edges, "Edges on hover")
+                    .on_hover_text("Light up a node's connected edges while hovering it");
+                ui.checkbox(&mut self.highlight.fluid, "Fluid highlight")
+                    .on_hover_text(
+                        "Hover energy flows through edges like a fluid, drawn toward the \
+                         selected node; off = a discrete cross-fade between hovered nodes",
                     );
-                    ui.selectable_value(&mut self.focus_mode, FocusMode::Cursor, "Cursor");
-                    ui.selectable_value(
-                        &mut self.focus_mode,
-                        FocusMode::Selection,
-                        "Selection",
+                ui.checkbox(&mut self.highlight.selected_edges, "Edges of selected node")
+                    .on_hover_text("Keep the drilled-into / selected node's edges highlighted");
+                ui.checkbox(&mut self.highlight.dim_labels, "Dim labels to selection")
+                    .on_hover_text(
+                        "With a node selected: its label full strength, 1-hop neighbours \
+                         semi-dimmed, everything else dimmed",
                     );
-                });
+                color_row(ui, "Color", &mut self.highlight.color);
+                ui.add(egui::Slider::new(&mut self.highlight.width, 0.5..=6.0).text("Width"));
+                ui.add(egui::Slider::new(&mut self.highlight.opacity, 0.0..=1.0).text("Opacity"));
+                ui.add(egui::Slider::new(&mut self.highlight.softness, 0.0..=1.0).text("Softness"))
+                    .on_hover_text("Soft glow halo around the highlighted edges");
+                ui.add(egui::Slider::new(&mut self.highlight.fade_secs, 0.0..=0.6).text("Fade (s)"))
+                    .on_hover_text("Hover fade in/out duration");
+            });
 
-                ui.label(egui::RichText::new("Detail (LOD)").small().color(theme::muted()));
-                ui.add(
-                    egui::Slider::new(&mut self.lod_full_mag, 0.0..=1.0).text("Full above"),
+            CollapsingHeader::new("Edge flow").default_open(false).show(ui, |ui| {
+                ui.checkbox(&mut self.flow_enabled, "Edge flow").on_hover_text(
+                    "Animate tracer dots along each edge from caller to callee (GPU paint path only)",
                 );
-                ui.add(
-                    egui::Slider::new(&mut self.lod_marker_mag, 0.0..=1.0).text("Dot above"),
-                );
-
-                ui.label(egui::RichText::new("Edges").small().color(theme::muted()));
-                ui.checkbox(&mut self.geodesic_edges, "Curved (geodesic)");
-                ui.add(
-                    egui::Slider::new(&mut self.projection.geodesic_segments, 2..=64)
-                        .text("Segments"),
-                );
-
-                if self.projection.kind == ProjectionKind::Poincare {
-                    ui.label(egui::RichText::new("Fly-to").small().color(theme::muted()));
-                    ui.checkbox(&mut self.flyto_enabled, "Click to fly-to");
-                    ui.add(
-                        egui::Slider::new(&mut self.flyto_duration, 0.1..=2.0)
-                            .text("Duration (s)"),
-                    );
-
-                    ui.label(
-                        egui::RichText::new("Boundary fade").small().color(theme::muted()),
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut self.fade_start, 0.0..=1.0).text("Start"),
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut self.fade_strength, 0.0..=1.0).text("Strength"),
-                    );
-                    ui.checkbox(&mut self.show_boundary, "Boundary ring");
+                if self.flow_enabled {
+                    color_row(ui, "Flow color", &mut self.flow_color);
+                    ui.add(egui::Slider::new(&mut self.flow_size, 1.0..=6.0).text("Size"));
+                    ui.add(egui::Slider::new(&mut self.flow_alpha, 0.0..=1.0).text("Opacity"));
+                    ui.add(egui::Slider::new(&mut self.flow_density, 1..=8).text("Density"));
+                    ui.add(egui::Slider::new(&mut self.flow_speed, 0.05..=2.0).text("Speed"));
                 }
-            }
+            });
 
-            ui.separator();
-            ui.label(egui::RichText::new("Minimap").small().color(theme::muted()));
-            ui.checkbox(&mut self.show_minimap, "Show minimap");
-            if self.show_minimap || self.minimap_expanded {
-                ui.checkbox(&mut self.minimap_expanded, "Expanded");
-            }
-            if self.show_minimap {
-                ui.horizontal(|ui| {
-                    for (corner, label) in [
-                        (Corner::TopLeft, "TL"),
-                        (Corner::TopRight, "TR"),
-                        (Corner::BottomLeft, "BL"),
-                        (Corner::BottomRight, "BR"),
-                    ] {
-                        ui.selectable_value(&mut self.minimap_corner, corner, label);
+            CollapsingHeader::new("Colors").default_open(false).show(ui, |ui| {
+                // Node palette is a vault-graph concept; hidden where nodes are
+                // coloured by another rule (e.g. code-graph kinds).
+                if self.palette_editable {
+                    palette_rows(ui, &mut self.style.palette);
+                }
+                color_row(ui, "Edges", &mut self.style.edge_color);
+                color_row(ui, "Labels", &mut self.style.label_color);
+                // Optional translucent pill behind labels (legibility at low LOD).
+                let mut label_bg_on = self.style.label_bg.is_some();
+                if ui.checkbox(&mut label_bg_on, "Label background").changed() {
+                    self.style.label_bg =
+                        label_bg_on.then(|| egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160));
+                }
+                if let Some(mut bg) = self.style.label_bg
+                    && color_row(ui, "Label background color", &mut bg)
+                {
+                    self.style.label_bg = Some(bg);
+                }
+                let theme_bg = ui.visuals().extreme_bg_color;
+                let mut bg = self.style.background.unwrap_or(theme_bg);
+                if color_row(ui, "Background", &mut bg) {
+                    self.style.background = Some(bg);
+                }
+            });
+
+            CollapsingHeader::new("Size").default_open(false).show(ui, |ui| {
+                ui.add(egui::Slider::new(&mut self.style.node_scale, 0.3..=3.0).text("Nodes"));
+                ui.add(egui::Slider::new(&mut self.style.edge_width, 0.25..=4.0).text("Edges"));
+                ui.add(egui::Slider::new(&mut self.style.label_size, 7.0..=20.0).text("Labels"));
+            });
+
+            CollapsingHeader::new("Projection").default_open(false).show(ui, |ui| {
+                for (kind, label) in [
+                    (ProjectionKind::Affine, "Off"),
+                    (ProjectionKind::Fisheye, "Fisheye"),
+                    (ProjectionKind::Poincare, "Poincaré"),
+                ] {
+                    let mut selected = self.projection.kind == kind;
+                    if ui.checkbox(&mut selected, label).clicked() && selected {
+                        self.projection.kind = kind;
+                        self.needs_fit = true;
                     }
-                });
-                ui.add(egui::Slider::new(&mut self.minimap_size, 0.12..=0.5).text("Size"));
-                ui.horizontal(|ui| {
-                    ui.selectable_value(
-                        &mut self.minimap_shape,
-                        MinimapShape::Circle,
-                        "Circle",
-                    );
-                    ui.selectable_value(
-                        &mut self.minimap_shape,
-                        MinimapShape::Square,
-                        "Square",
-                    );
-                });
-            }
+                }
+                if self.projection.kind != ProjectionKind::Affine {
+                    ui.add(egui::Slider::new(&mut self.projection.strength, 0.1..=3.0).text("Strength"));
+                    ui.add(egui::Slider::new(&mut self.projection.size_falloff, 0.0..=1.0).text("Size falloff"));
+                    ui.label(egui::RichText::new("Focus").small().color(theme::muted()));
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.focus_mode, FocusMode::LockedCenter, "Center");
+                        ui.selectable_value(&mut self.focus_mode, FocusMode::Cursor, "Cursor");
+                        ui.selectable_value(&mut self.focus_mode, FocusMode::Selection, "Selection");
+                    });
+                    ui.label(egui::RichText::new("Detail (LOD)").small().color(theme::muted()));
+                    ui.add(egui::Slider::new(&mut self.lod_full_mag, 0.0..=1.0).text("Full above"));
+                    ui.add(egui::Slider::new(&mut self.lod_marker_mag, 0.0..=1.0).text("Dot above"));
+                    ui.label(egui::RichText::new("Edges").small().color(theme::muted()));
+                    ui.checkbox(&mut self.geodesic_edges, "Curved (geodesic)");
+                    ui.add(egui::Slider::new(&mut self.projection.geodesic_segments, 2..=64).text("Segments"));
+                    if self.projection.kind == ProjectionKind::Poincare {
+                        ui.label(egui::RichText::new("Fly-to").small().color(theme::muted()));
+                        ui.checkbox(&mut self.flyto_enabled, "Click to fly-to");
+                        ui.add(egui::Slider::new(&mut self.flyto_duration, 0.1..=2.0).text("Duration (s)"));
+                        ui.label(egui::RichText::new("Boundary fade").small().color(theme::muted()));
+                        ui.add(egui::Slider::new(&mut self.fade_start, 0.0..=1.0).text("Start"));
+                        ui.add(egui::Slider::new(&mut self.fade_strength, 0.0..=1.0).text("Strength"));
+                        ui.checkbox(&mut self.show_boundary, "Boundary ring");
+                    }
+                }
+            });
 
             ui.separator();
             if ui.button("Reset style").clicked() {
@@ -980,108 +1152,14 @@ impl State {
                     Palette::Policy { .. } => Style::policy(),
                 };
             }
+          });
         });
-        // A layout change is either a kind switch or a layered rank-direction
-        // switch — both need a relayout.
-        self.layout_kind != prev_kind || self.layered_rankdir != prev_rankdir
+        // A layout change is a kind switch, a layered rank-direction switch, or a
+        // spread change — all need a relayout.
+        self.layout_kind != prev_kind
+            || self.layered_rankdir != prev_rankdir
+            || spread_relayout
     }
-}
-
-/// Configurable colors + sizes for a graph view. The [`Palette`] varies the
-/// per-node coloring controls (flat vault fill + active accent vs. the
-/// cluster color-by-policy set); every other control is common to both.
-#[derive(Clone, Copy)]
-pub struct Style {
-    pub edge_color: egui::Color32,
-    pub label_color: egui::Color32,
-    /// `None` follows the theme's `extreme_bg_color`.
-    pub background: Option<egui::Color32>,
-    /// Multiplier on each node's base radius.
-    pub node_scale: f32,
-    pub edge_width: f32,
-    pub label_size: f32,
-    pub palette: Palette,
-}
-
-/// The per-node color scheme, which differs between the two graphs.
-#[derive(Clone, Copy)]
-pub enum Palette {
-    /// Vault graph: one flat fill + an accent for the active note.
-    Flat {
-        node: egui::Color32,
-        active: egui::Color32,
-    },
-    /// Cluster graph: color by node kind / policy, blended toward `stale` by
-    /// summary churn.
-    Policy {
-        cluster: egui::Color32,
-        move_policy: egui::Color32,
-        tag_policy: egui::Color32,
-        leaf: egui::Color32,
-        stale: egui::Color32,
-    },
-}
-
-impl Style {
-    /// Vault-graph defaults: flat `#6b7280` nodes, active note in accent,
-    /// translucent grey edges. Defaults mirror the historical hard-coded
-    /// render values so an untouched graph looks unchanged.
-    pub const fn flat() -> Self {
-        Self {
-            edge_color: egui::Color32::from_rgba_premultiplied(0x90, 0x96, 0xa0, 0xa0),
-            label_color: theme::muted(),
-            background: None,
-            node_scale: 1.0,
-            edge_width: 1.0,
-            label_size: 11.0,
-            palette: Palette::Flat {
-                node: egui::Color32::from_rgb(0x6b, 0x72, 0x80),
-                active: theme::accent(),
-            },
-        }
-    }
-
-    /// Cluster-graph defaults: color-by-policy with the spec's four encoding
-    /// colors plus a staleness grey, divider-colored edges.
-    pub const fn policy() -> Self {
-        Self {
-            edge_color: theme::divider(),
-            label_color: theme::muted(),
-            background: None,
-            node_scale: 1.0,
-            edge_width: 1.0,
-            label_size: 11.0,
-            palette: Palette::Policy {
-                cluster: theme::accent(),
-                move_policy: egui::Color32::from_rgb(0x2f, 0x6f, 0xb9),
-                tag_policy: egui::Color32::from_rgb(0xa8, 0x4a, 0xc4),
-                leaf: egui::Color32::from_rgb(0x2f, 0x8f, 0x4d),
-                stale: egui::Color32::from_rgb(0xa0, 0xa0, 0xa0),
-            },
-        }
-    }
-}
-
-/// Policy-color legend row (cluster graph only). No-op for a flat palette.
-/// Reads the configured colors so the legend tracks any user edits.
-pub fn policy_legend(ui: &mut egui::Ui, palette: &Palette) {
-    let Palette::Policy {
-        cluster,
-        move_policy,
-        tag_policy,
-        leaf,
-        ..
-    } = palette
-    else {
-        return;
-    };
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Encoding:").color(theme::muted()).small());
-        legend_swatch(ui, *cluster, "cluster");
-        legend_swatch(ui, *move_policy, "move policy");
-        legend_swatch(ui, *tag_policy, "tag policy");
-        legend_swatch(ui, *leaf, "leaf");
-    });
 }
 
 /// The per-frame, pane-independent inputs every [`State::paint_pane`] call
@@ -1107,14 +1185,19 @@ struct EdgeMap<'a> {
     disk_to_screen: &'a dyn Fn(Complex) -> egui::Pos2,
 }
 
-/// Inputs to one node-paint pass: the active lens + view zoom (for radius +
-/// label gating) and the interaction state (hover/click — both empty for a
-/// read-only pane).
+/// Inputs to one node-paint pass: the active lens, the view zoom (node radius),
+/// the label-LOD zoom (the semantic label-reveal gate — `view.zoom` under Affine,
+/// `poincare_zoom` under Poincaré, so it's decoupled from radius scaling), and
+/// the interaction state (hover/click — both empty for a read-only pane).
 struct NodePaint<'a> {
     lens: &'a Lens,
     zoom: f32,
+    label_zoom: f32,
     hovered: Option<usize>,
     response_clicked: bool,
+    /// Per-node label alpha factors (selection dimming, `graph-label-dim`);
+    /// `None` = no dimming this frame.
+    label_dim: Option<&'a [f32]>,
 }
 
 /// Scratch results from one node-paint pass.
@@ -1163,259 +1246,3 @@ fn draw_tooltip(painter: &egui::Painter, pos: egui::Pos2, text: String) {
     painter.galley(pos, galley, egui::Color32::BLACK);
 }
 
-/// The palette-specific color rows — flat node/active, or the five policy
-/// colors.
-fn palette_rows(ui: &mut egui::Ui, palette: &mut Palette) {
-    match palette {
-        Palette::Flat { node, active } => {
-            color_row(ui, "Nodes", node);
-            color_row(ui, "Active note", active);
-        }
-        Palette::Policy {
-            cluster,
-            move_policy,
-            tag_policy,
-            leaf,
-            stale,
-        } => {
-            color_row(ui, "Cluster", cluster);
-            color_row(ui, "Move policy", move_policy);
-            color_row(ui, "Tag policy", tag_policy);
-            color_row(ui, "Leaf", leaf);
-            color_row(ui, "Stale", stale);
-        }
-    }
-}
-
-/// One labeled color swatch row.
-fn color_row(ui: &mut egui::Ui, label: &str, color: &mut egui::Color32) {
-    ui.horizontal(|ui| {
-        ui.color_edit_button_srgba(color);
-        ui.label(label);
-    });
-}
-
-fn legend_swatch(ui: &mut egui::Ui, color: egui::Color32, label: &str) {
-    let (rect, _) = ui.allocate_exact_size(egui::Vec2::new(10.0, 10.0), egui::Sense::hover());
-    ui.painter().rect_filled(rect, 2.0, color);
-    ui.label(egui::RichText::new(label).small().color(theme::muted()));
-}
-
-#[cfg(test)]
-mod poincare_disk_tests {
-    use super::*;
-
-    /// The Poincaré projection config the locked-disk tests render at. A
-    /// strength that visibly spreads the clusters across the disk.
-    fn poincare_cfg() -> ProjectionConfig {
-        ProjectionConfig {
-            kind: ProjectionKind::Poincare,
-            strength: 1.4,
-            ..Default::default()
-        }
-    }
-
-    /// A small clustered layout: a central blob at the origin plus a ring of
-    /// off-centre clusters, mirroring the synthetic snapshot graph's shape so
-    /// the periphery has real spread for the lens to compress toward the rim.
-    fn clustered_positions() -> Vec<egui::Vec2> {
-        let mut pos = Vec::new();
-        // Central cluster.
-        for i in 0..6 {
-            let a = i as f32;
-            pos.push(egui::vec2(a * 7.0 - 17.0, a * -5.0 + 12.0));
-        }
-        // Ring clusters.
-        let radius = 320.0;
-        for c in 0..5 {
-            let ang = c as f32 / 5.0 * std::f32::consts::TAU;
-            let (cx, cy) = (ang.cos() * radius, ang.sin() * radius);
-            for i in 0..6 {
-                let a = i as f32;
-                pos.push(egui::vec2(cx + a * 9.0 - 22.0, cy + a * -6.0 + 15.0));
-            }
-        }
-        pos
-    }
-
-    /// The locked-disk frame is a pure function of the pane rect + zoom: centre =
-    /// pane centre (ZOOM-INVARIANT), radius = `DISK_FILL` of the shorter
-    /// half-dimension × zoom — and it does NOT (cannot) depend on any
-    /// `View`/pan/zoom. This is the core regression guard for "the disk drifts":
-    /// the signature itself forbids the bug. The centre must be the pane centre
-    /// for ANY zoom; only the radius scales.
-    #[test]
-    fn poincare_disk_is_pane_locked() {
-        let rects = [
-            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 600.0)),
-            egui::Rect::from_min_size(egui::pos2(40.0, 90.0), egui::vec2(800.0, 400.0)),
-            egui::Rect::from_min_size(egui::pos2(-120.0, 30.0), egui::vec2(300.0, 900.0)),
-        ];
-        for r in rects {
-            for zoom in [0.5_f32, 1.0, 3.0] {
-                let (center, radius) = poincare_disk(r, zoom);
-                assert_eq!(
-                    center,
-                    r.center(),
-                    "disk centre must be the pane centre at zoom {zoom}"
-                );
-                let expected = 0.5 * r.size().min_elem() * DISK_FILL * zoom;
-                assert!(
-                    (radius - expected).abs() < 1e-4,
-                    "disk radius {radius} != {expected} for {r:?} at zoom {zoom}"
-                );
-            }
-        }
-    }
-
-    /// Scroll-zoom scales the RADIUS while leaving the CENTRE fixed: two zoom
-    /// values yield the same centre, and the radius ratio equals the zoom ratio
-    /// (the disk grows/shrinks centred, never drifting).
-    #[test]
-    fn poincare_zoom_scales_radius_keeps_center() {
-        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(640.0, 480.0));
-        let (c_a, r_a) = poincare_disk(rect, 1.0);
-        let (c_b, r_b) = poincare_disk(rect, 2.5);
-        assert_eq!(c_a, c_b, "centre must be zoom-invariant");
-        assert_eq!(c_a, rect.center(), "centre must be the pane centre");
-        // radius ratio == zoom ratio (2.5 / 1.0).
-        assert!(
-            (r_b / r_a - 2.5).abs() < 1e-4,
-            "radius ratio {} != zoom ratio 2.5",
-            r_b / r_a
-        );
-    }
-
-    /// The disk→screen map sends the unit-disk origin to the disk centre and a
-    /// rim point (|z| = 1) to the disk centre + radius — the disk fills exactly
-    /// the locked frame.
-    #[test]
-    fn poincare_maps_origin_to_center_and_rim_to_radius() {
-        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(640.0, 480.0));
-        let (center, radius) = poincare_disk(rect, 1.0);
-        let disk_to_screen = |z: Complex| center + egui::vec2(z.re, z.im) * radius;
-        let o = disk_to_screen(Complex::ORIGIN);
-        assert!((o - center).length() < 1e-4, "origin {o:?} != centre {center:?}");
-        let rim = disk_to_screen(Complex::new(1.0, 0.0));
-        let expected = center + egui::vec2(radius, 0.0);
-        assert!(
-            (rim - expected).length() < 1e-4,
-            "rim {rim:?} != centre+radius {expected:?}"
-        );
-    }
-
-    /// Every node, projected through the locked Poincaré map at fit (zoom 1.0),
-    /// lands inside the fixed disk (within 1px of the boundary) — the whole graph
-    /// is pressed into the disk, never panned off-screen. (At higher zoom the disk
-    /// may exceed the pane and nodes legitimately fall outside it, so this is a
-    /// zoom-1.0 / relative-to-disk-radius invariant.)
-    #[test]
-    fn poincare_keeps_all_nodes_inside_disk() {
-        let pos = clustered_positions();
-        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 600.0));
-        let (center, radius) = poincare_disk(rect, 1.0);
-        let disk_to_screen = |z: Complex| center + egui::vec2(z.re, z.im) * radius;
-        let lens = Lens::centred(poincare_cfg(), Mobius::identity(), &pos);
-        for &w in &pos {
-            let p = disk_to_screen(lens.disk(w));
-            let dist = (p - center).length();
-            assert!(
-                dist <= radius + 1.0,
-                "node at {dist}px from centre exceeds disk radius {radius}"
-            );
-        }
-    }
-
-    /// Möbius navigation moves the projected content but leaves the disk frame
-    /// invariant: the disk centre/radius are unchanged and at least one node's
-    /// screen position changes. The disk is a fixed viewport; nav re-aims the
-    /// graph within it.
-    #[test]
-    fn mobius_nav_moves_content_but_not_disk_geometry() {
-        let pos = clustered_positions();
-        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 600.0));
-        let cfg = poincare_cfg();
-        // The disk frame depends only on the pane (+ a fixed zoom) — recomputing
-        // it after nav must yield the identical centre/radius.
-        let (c0, r0) = poincare_disk(rect, 1.0);
-        let disk_to_screen = |z: Complex| c0 + egui::vec2(z.re, z.im) * r0;
-
-        let plain = Lens::centred(cfg, Mobius::identity(), &pos);
-        // Recentre on a peripheral node, as a drag/fly-to would.
-        let target = plain.disk(pos[pos.len() - 1]);
-        let nav = Mobius::from_point_pair(target, Complex::ORIGIN);
-        let navd = Lens::centred(cfg, nav, &pos);
-
-        let (c1, r1) = poincare_disk(rect, 1.0);
-        assert_eq!(c0, c1, "nav must not move the disk centre");
-        assert!((r0 - r1).abs() < 1e-6, "nav must not rescale the disk");
-
-        let mut moved = false;
-        for &w in &pos {
-            let before = disk_to_screen(plain.disk(w));
-            let after = disk_to_screen(navd.disk(w));
-            if (before - after).length() > 1.0 {
-                moved = true;
-            }
-            // Content stays inside the (unchanged) disk under navigation too.
-            assert!((after - c1).length() <= r1 + 1.0, "navigated node left the disk");
-        }
-        assert!(moved, "navigation did not move any content");
-    }
-}
-
-#[cfg(test)]
-mod nav_tests {
-    use super::*;
-
-    fn positions() -> Vec<egui::Vec2> {
-        vec![
-            egui::vec2(0.0, 0.0),
-            egui::vec2(100.0, 0.0),
-            egui::vec2(-100.0, 50.0),
-            egui::vec2(40.0, -90.0),
-        ]
-    }
-
-    /// A non-identity nav must leave Off and Fisheye disk points untouched —
-    /// navigation is Poincaré-only, so those modes stay byte-identical.
-    #[test]
-    fn nav_ignored_off_and_fisheye() {
-        let pos = positions();
-        let nav = Mobius::from_point_pair(Complex::new(0.3, -0.2), Complex::ORIGIN);
-        for kind in [ProjectionKind::Affine, ProjectionKind::Fisheye] {
-            let cfg = ProjectionConfig { kind, strength: 1.2, ..Default::default() };
-            let plain = Lens::centred(cfg, Mobius::identity(), &pos);
-            let navd = Lens::centred(cfg, nav, &pos);
-            for &w in &pos {
-                let a = plain.disk(w);
-                let b = navd.disk(w);
-                assert!(
-                    (a.re - b.re).abs() < 1e-6 && (a.im - b.im).abs() < 1e-6,
-                    "{kind:?} disk changed under nav: {a:?} vs {b:?}"
-                );
-            }
-        }
-    }
-
-    /// Under Poincaré the recentre `from_point_pair(z_node, ORIGIN)` must drive
-    /// the chosen node's disk point exactly to the origin.
-    #[test]
-    fn poincare_flyto_centres_target() {
-        let pos = positions();
-        let cfg = ProjectionConfig {
-            kind: ProjectionKind::Poincare,
-            strength: 1.2,
-            ..Default::default()
-        };
-        let base = Lens::centred(cfg, Mobius::identity(), &pos);
-        let target = base.disk(pos[2]); // a peripheral node, pre-nav
-        let nav = Mobius::from_point_pair(target, Complex::ORIGIN);
-        let navd = Lens::centred(cfg, nav, &pos);
-        let centred = navd.disk(pos[2]);
-        assert!(
-            centred.abs() < 1e-4,
-            "fly-to did not centre target: {centred:?}"
-        );
-    }
-}

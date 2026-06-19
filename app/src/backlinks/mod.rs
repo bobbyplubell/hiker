@@ -99,12 +99,18 @@ fn render_body(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>) {
     }
     for rel in &hits {
         let label = rel.rsplit('/').next().unwrap_or(rel.as_str());
+        // Standard note-row grammar (`interaction.md`): hover wash (the
+        // button's themed hover fill) + pointer signal the open; click opens
+        // preview, mod-click sticky; the row is a drag source carrying the
+        // vault-relative path.
         let resp = ui
-            .add(egui::Button::image_and_text(
-                icons::ICONS.image(icons::Icon::File),
-                label,
-            ))
-            .on_hover_text(rel);
+            .add(
+                egui::Button::image_and_text(icons::ICONS.image(icons::Icon::File), label)
+                    .sense(egui::Sense::click_and_drag()),
+            )
+            .on_hover_text(rel)
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        crate::widgets::note_row::note_drag_source(ui, &resp, rel, label);
         if resp.hovered() {
             crate::widgets::preview::register_note_hover(ui, resp.rect, rel);
         }
@@ -115,8 +121,9 @@ fn render_body(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>) {
             crate::item_menu::BaseOpts { reveal: true },
         );
         if resp.clicked() {
+            let sticky = crate::widgets::note_row::open_sticky(ui.input(|i| i.modifiers));
             let rel_owned = rel.clone();
-            ctx.defer(move |app| editor_pane::open_file(app, &rel_owned, false));
+            ctx.defer(move |app| editor_pane::open_file(app, &rel_owned, sticky));
         }
     }
 }

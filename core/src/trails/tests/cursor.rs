@@ -7,7 +7,7 @@
 //! parsed trail-doc on disk.
 //!
 //! These ops write the trail-doc synchronously before returning (and seed
-//! the op-log doc_id in `create_trail`), so the tests assert directly
+//! the layered-doc doc_id in `create_trail`), so the tests assert directly
 //! against the on-disk frontmatter. A live indexer runs only to drain the
 //! `IndexJob` channel the ops enqueue onto — its derived tables aren't
 //! read here (unlike the rename test, which needs `trail_waypoints`).
@@ -19,7 +19,7 @@ use tempfile::TempDir;
 use crate::config::sections::TrailsConfig;
 use crate::embed::{Embedder, Error as EmbedError};
 use crate::indexer;
-use crate::oplog::OpLog;
+use crate::editing::LayeredDoc;
 use crate::store::Store;
 use crate::trails::ops::{
     append_waypoint, create_trail, remove_waypoint, set_append_cursor, AppendWaypointArgs,
@@ -43,14 +43,14 @@ impl Embedder for ZeroEmbedder {
 }
 
 /// Shared fixture: a vault with a running (channel-draining) indexer, a
-/// created trail whose op-log doc_id is seeded, and three source notes on
+/// created trail whose layered-doc doc_id is seeded, and three source notes on
 /// disk to point waypoints at.
 struct Fixture {
     _td: TempDir,
     vault: Vault,
     watcher: Watcher,
     trash: Trash,
-    oplog: Arc<OpLog>,
+    layered: Arc<LayeredDoc>,
     idx: indexer::Handle,
     trail_doc_rel: String,
 }
@@ -61,11 +61,11 @@ async fn setup() -> Fixture {
     let watcher = Watcher::start(td.path()).unwrap();
     let trash = Trash::open(td.path());
     let store = Store::open(td.path()).unwrap();
-    let oplog = Arc::new(OpLog::open(td.path()).unwrap());
+    let layered = Arc::new(LayeredDoc::open(td.path()).unwrap());
     let idx = indexer::start(vault.clone(), store, || {
         Ok(Arc::new(ZeroEmbedder) as Arc<dyn Embedder>)
     });
-    idx.attach_oplog(oplog.clone());
+    idx.attach_layered(layered.clone());
 
     // Source notes for waypoints — written to disk so the waypoint append
     // has a real path to reference (the append never reads their bodies).
@@ -75,7 +75,7 @@ async fn setup() -> Fixture {
     }
 
     let cfg = TrailsConfig::default();
-    let created = create_trail(&watcher, &idx.job_sender(), &oplog, &vault, &cfg, "t")
+    let created = create_trail(&watcher, &idx.job_sender(), &layered, &vault, &cfg, "t")
         .await
         .unwrap();
 
@@ -84,7 +84,7 @@ async fn setup() -> Fixture {
         vault,
         watcher,
         trash,
-        oplog,
+        layered,
         idx,
         trail_doc_rel: created.trail_doc_rel,
     }
@@ -97,7 +97,7 @@ impl Fixture {
         append_waypoint(AppendWaypointArgs {
             watcher: &self.watcher,
             jobs: &self.idx.job_sender(),
-            log: &self.oplog,
+            log: &self.layered,
             vault: &self.vault,
             trail_doc_rel: &self.trail_doc_rel,
             source_rel,

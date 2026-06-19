@@ -18,6 +18,23 @@ hiker-theme = { workspace = true }
 graph-widgets = { workspace = true }
 # The egui-free lens kernel (forward/inverse/magnification + geodesic sampling).
 hiker-projection = { workspace = true }
+# The view-layer lens over the kernel: the locked Poincaré disk frame, the
+# forward+nav disk operator, the screen↔disk map, scroll-zoom and centroid
+# framing — shared with the canvas camera.
+hiker-projection-view = { workspace = true }
+# Custom instanced GPU paint path (node fills + edge lines) that bypasses egui's
+# CPU tessellation under the wgpu backend. Gated OFF unless the live app opts in.
+egui-wgpu = "0.32"
+wgpu = "25"
+bytemuck = { version = "1", features = ["derive"] }
+# Optional profiling spans around the GPU batch build + upload, mirroring the
+# app's `profiling` feature. Zero-cost (compiled out) when the feature is off.
+puffin = { version = "0.19", optional = true }
+
+[features]
+# Enable `puffin` profile spans in the GPU paint path. Turn on alongside the
+# app's own `profiling` feature so these spans show up in the same capture.
+profiling = ["dep:puffin"]
 
 [dev-dependencies]
 egui_kittest = { version = "0.32", features = ["snapshot", "wgpu"] }

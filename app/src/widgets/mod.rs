@@ -4,6 +4,7 @@
 
 pub mod autocomplete_picker;
 pub mod modal;
+pub mod note_row;
 pub mod preview;
 pub mod profiler_overlay;
 pub mod split_button;

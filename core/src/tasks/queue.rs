@@ -9,7 +9,8 @@ use std::time::{Duration, SystemTime};
 
 use tokio::sync::{broadcast, oneshot, Mutex};
 
-use crate::agent::StopSignal;
+use tokio_util::sync::CancellationToken;
+
 use crate::config::sections::TasksConfig;
 
 use super::types::{
@@ -18,6 +19,39 @@ use super::types::{
 };
 
 use crate::config::sections::WorkerPreferenceCfg;
+
+/// Cooperative stop signal the queue hands a leased direct worker so a
+/// queue-side cancel can wind the worker down. Formerly lived on
+/// `core::agent` (the in-house chat loop, removed when the AI layer
+/// collapsed to MCP-only); the task queue is its only remaining consumer.
+/// Cheap to clone (one `CancellationToken`).
+//
+// status: task-queue-cancel-propagation-internal
+#[derive(Clone, Default)]
+pub struct StopSignal {
+    token: CancellationToken,
+}
+
+impl StopSignal {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Borrow the underlying token for `tokio::select!` arms or other
+    /// callers that want a `WaitForCancellationFuture`.
+    pub const fn token(&self) -> &CancellationToken {
+        &self.token
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.token.is_cancelled()
+    }
+
+    /// Stop the worker.
+    pub fn cancel(&self) {
+        self.token.cancel();
+    }
+}
 
 /// Internal record carrying everything the queue needs to drive a task
 /// through its lifecycle.

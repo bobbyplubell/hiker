@@ -1,0 +1,32 @@
+{
+  "name": "arch",
+  "_comment": "Hiker architecture diagram from manual/architecture.md: 3 clusters (front ends 15, engine 16, world 17), edges fan out from app/mcp across cluster boundaries. Repro for crossed mcp->core/mcp->llm chains and pinned dummy chains.",
+  "rankdir": "TB",
+  "ranksep": 50, "nodesep": 50, "edgesep": 20,
+  "nodes": [
+    { "w": 120, "h": 42 }, { "w": 110, "h": 42 }, { "w": 170, "h": 42 },
+    { "w": 330, "h": 42 }, { "w": 100, "h": 42 }, { "w": 100, "h": 42 },
+    { "w": 100, "h": 42 }, { "w": 190, "h": 42 }, { "w": 160, "h": 42 },
+    { "w": 130, "h": 56 }, { "w": 120, "h": 44 }, { "w": 160, "h": 44 },
+    { "w": 90, "h": 44 }, { "w": 130, "h": 42 }, { "w": 130, "h": 42 },
+    { "w": 0, "h": 0 }, { "w": 0, "h": 0 }, { "w": 0, "h": 0 }
+  ],
+  "edges": [
+    { "v": 0, "w": 3 },
+    { "v": 0, "w": 4 },
+    { "v": 0, "w": 5 },
+    { "v": 0, "w": 7 },
+    { "v": 0, "w": 8 },
+    { "v": 1, "w": 3 },
+    { "v": 2, "w": 3 },
+    { "v": 2, "w": 6 },
+    { "v": 3, "w": 6 },
+    { "v": 3, "w": 9 },
+    { "v": 3, "w": 10 },
+    { "v": 5, "w": 12 },
+    { "v": 4, "w": 13 },
+    { "v": 6, "w": 14 },
+    { "v": 7, "w": 11 }
+  ],
+  "parents": [15, 15, 15, 16, 16, 16, 16, 16, 16, 17, 17, 17, 17, 17, 17, null, null, null]
+}

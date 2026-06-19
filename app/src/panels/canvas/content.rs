@@ -492,6 +492,13 @@ fn max_scroll(pane: &EditorPane, inner: egui::Rect) -> f32 {
 /// borrow without allocating per frame.
 static EMPTY_FOLDS: LazyLock<HashSet<u64>> = LazyLock::new(HashSet::new);
 
+/// An always-empty per-table overflow map: a canvas card renders every table in
+/// the default Fit mode (the Scrollable escape hatch + its right-click toggle
+/// are an editor-only affordance), so this hands the decoration pipeline a
+/// `'static` borrow without allocating per frame. status: widget-table-overflow-scroll
+static EMPTY_TABLE_OVERFLOW: LazyLock<crate::panels::buffer::widgets::tables::TableViewMap> =
+    LazyLock::new(crate::panels::buffer::widgets::tables::TableViewMap::new);
+
 /// Build the read-only `DecoRebuildCtx` a canvas card renders its markdown body
 /// through: the buffer panel's FULL decoration pipeline, with `render_widgets`
 /// on so a card shows the same rendered Mermaid / WaveDrom / display-math /
@@ -512,16 +519,20 @@ fn card_decoration_ctx<'a>(
         cache,
         folds: &EMPTY_FOLDS,
         loaded_text,
+        // No dirty-diff gutter in a canvas embed. status: git-dirty-diff-gutter
+        git_head_text: None,
         theme: Some(theme),
         live_preview: true,
         render_widgets: true,
         is_markdown: markdown,
+        code_language: None, // canvas embeds host vault notes, not code files
         dpr,
         font_px,
         chunk_boundaries: false,
         show_whitespace: false,
         highlight_trailing_whitespace: false,
         diff: None,
+        conflict: None,
         resolve_title: None,
         // Canvas node previews don't carry a vault-scoped disk cache — they
         // render through the in-memory caches only. status: widget-render-disk-cache
@@ -529,6 +540,14 @@ fn card_decoration_ctx<'a>(
         // Embedded preview: inline-CSV charts render; external `data:` charts
         // fall back to source (no note-bound resolver here). status: widget-chart-render
         chart_resolver: None,
+        // No vault binding → `![alt](path)` image cells fall back to source.
+        // status: widget-table-render
+        image_resolver: None,
+        // Cards render tables Fit-only (no overflow toggle off-canvas).
+        // status: widget-table-overflow-scroll
+        table_overflow: &EMPTY_TABLE_OVERFLOW,
+        // No in-place table cell edit on a card. status: widget-table-cell-edit-inplace
+        editing_table: None,
     }
 }
 

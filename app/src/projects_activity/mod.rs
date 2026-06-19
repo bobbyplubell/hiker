@@ -1,6 +1,6 @@
 //! Projects activity — a sidebar `Activity` listing every **project note** (`hiker.kind: project`)
 //! in the vault. A row click opens that project's code-entity graph (`panels::code_graph::open` —
-//! the same opener the file tree uses for a project note); a per-row ⚙ opens the project-config
+//! the same opener the file tree uses for a project note); a per-row Edit button opens the project-config
 //! form to edit it. A **"+ New project"** button opens a fresh config form
 //! (`panels::project_config`) to author a new project note via UI instead of hand-writing YAML.
 //!
@@ -21,6 +21,30 @@ use hiker_theme as theme;
 #[derive(Default)]
 pub struct State;
 
+/// A verb on a project row's right-click menu (`interaction.md`
+/// [rightclick-menu-always]): a project row names a note (`hiker.kind:
+/// project`), so it carries the shared note-item base plus the row's own
+/// verbs.
+#[derive(Clone, Copy, Debug)]
+enum RowVerb {
+    /// A shared note-item base verb (Open / Reveal / Properties).
+    Base(crate::item_menu::ItemAction),
+    /// Open the project's code-entity graph (the row click's verb).
+    OpenGraph,
+    /// Open the project-config form on this note (the Edit button's verb).
+    Configure,
+}
+
+/// Build a project row's context menu: the shared note-item base, then the
+/// project-contextual section (Open code graph / Edit project config).
+fn build_project_row_menu(rel: &str) -> egui_workbench::menu::Menu<RowVerb> {
+    use crate::item_menu::{note_item_base, BaseOpts};
+    note_item_base(rel, BaseOpts { reveal: true }, RowVerb::Base)
+        .section()
+        .action("Open code graph", RowVerb::OpenGraph)
+        .action("Edit project config", RowVerb::Configure)
+}
+
 fn basename(p: &str) -> String {
     p.rsplit('/').next().unwrap_or(p).trim_end_matches(".md").to_string()
 }
@@ -32,7 +56,7 @@ pub fn list_projects(ctx: &SurfaceCtx<'_>) -> Vec<(String, String)> {
     let query = NoteQuery {
         filters: vec![MetaFilter::Equals {
             key: "hiker.kind".to_string(),
-            value: "project".to_string(),
+            values: vec!["project".to_string()],
         }],
         ..Default::default()
     };
@@ -74,10 +98,9 @@ fn render_body(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>) {
         return;
     }
 
-    let mut to_open: Option<String> = None;
-    let mut to_edit: Option<String> = None;
+    let mut picked: Option<(String, RowVerb)> = None;
     for (rel, title) in &projects {
-        ui.horizontal(|ui| {
+        let row = ui.horizontal(|ui| {
             let resp = ui
                 .add(
                     egui::Label::new(egui::RichText::new(title).small())
@@ -86,24 +109,34 @@ fn render_body(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>) {
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .on_hover_text(format!("{rel}\nClick to open the code graph"));
             if resp.clicked() {
-                to_open = Some(rel.clone());
+                picked = Some((rel.clone(), RowVerb::OpenGraph));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("⚙").on_hover_text("Edit project config").clicked() {
-                    to_edit = Some(rel.clone());
+                if ui.small_button("Edit").on_hover_text("Edit project config").clicked() {
+                    picked = Some((rel.clone(), RowVerb::Configure));
                 }
             });
         });
+        // Right-click anywhere on the row → its context menu (`interaction.md`
+        // [rightclick-menu-always]): note base + Open code graph / Configure.
+        let mut chosen = None;
+        row.response.interact(egui::Sense::click()).context_menu(|ui| {
+            chosen = egui_workbench::menu::show(ui, build_project_row_menu(rel));
+        });
+        if let Some(verb) = chosen {
+            picked = Some((rel.clone(), verb));
+        }
     }
 
-    if let Some(rel) = to_open {
-        ctx.defer(move |app| {
-            crate::panels::code_graph::open(app, &rel);
-        });
-    }
-    if let Some(rel) = to_edit {
-        ctx.defer(move |app| {
-            crate::panels::project_config::open(app, Some(rel));
+    if let Some((rel, verb)) = picked {
+        ctx.defer(move |app| match verb {
+            RowVerb::Base(action) => crate::item_menu::apply_item_action(app, action, &rel),
+            RowVerb::OpenGraph => {
+                crate::panels::code_graph::open(app, crate::tab::CodeSource::Project(rel));
+            }
+            RowVerb::Configure => {
+                crate::panels::project_config::open(app, Some(rel));
+            }
         });
     }
 }
@@ -145,5 +178,38 @@ impl View<dyn AppCtx> for ProjectsListView {
             .show(ui, |ui| {
                 render_body(ui, ctx);
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use egui_workbench::menu::Entry;
+
+    use super::{build_project_row_menu, RowVerb};
+
+    /// Menu composition: the shared note-item base (a project row names a
+    /// note), then the project-contextual section.
+    #[test]
+    fn project_row_menu_composes_base_plus_project_verbs() {
+        let menu = build_project_row_menu("projects/x.md");
+        let sections = menu.sections();
+        assert_eq!(sections.len(), 2, "note base section + project section");
+        assert_eq!(sections[0].len(), 5, "Open · Reveal · Open in graph · Copy path · Properties");
+        let labels: Vec<&str> = sections[1]
+            .iter()
+            .map(|e| match e {
+                Entry::Action { label, .. } => label.as_ref(),
+                _ => panic!("expected Action entries"),
+            })
+            .collect();
+        assert_eq!(labels, ["Open code graph", "Edit project config"]);
+        assert!(matches!(
+            sections[1][0],
+            Entry::Action { action: RowVerb::OpenGraph, .. }
+        ));
+        assert!(matches!(
+            sections[1][1],
+            Entry::Action { action: RowVerb::Configure, .. }
+        ));
     }
 }

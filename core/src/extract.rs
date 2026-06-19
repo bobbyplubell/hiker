@@ -1,5 +1,5 @@
 //! Binary-artifact retention for versioned/captured sources
-//! (`extract-artifact-retention`). The op-log versions a sidecar's *text*, not
+//! (`extract-artifact-retention`). The layered doc versions a sidecar's *text*, not
 //! its bytes — it can't hold the prior PDF or the prior HTML archive. Whether
 //! those binary artifacts are kept across captures is a per-source retention
 //! policy, resolved as a **cascade** (lower wins): the vault default
@@ -7,17 +7,16 @@
 //! (stamped onto captured pages) → the per-source `hiker.artifact_retention`
 //! frontmatter on the sidecar itself.
 //!
-//! Retained per-capture artifacts live hidden under `.hiker/refs/<doc_id>/`,
-//! one subdirectory per op that produced them, so a version's artifact is
-//! recoverable alongside that version's text in the op-log. They are
-//! **device-local**: the op-log syncs the sidecar text, not these blobs (per
-//! `op-log.md`'s "Versioned sources" / embedding-sync posture — the op-log
-//! text stays lean and blobs ride a separate, best-effort transport).
+//! Retained per-capture artifacts live hidden under
+//! `.hiker/refs/<vault-relative-path>/`, one subdirectory per capture that
+//! produced them, so a capture's artifact is recoverable alongside that note.
+//! They are **device-local** cache: nothing here syncs.
 //!
 //! This module owns the *policy resolution* + the *refs store* + *pruning*. It
-//! lives in `core` (keyed on the op-log's `doc_id` / op-id, both core
-//! concepts), independent of the `hiker-extract` leaf crate — the host hands it
-//! the produced artifact bytes and the resolved frontmatter, and it stores /
+//! lives in `core`, keyed by the note's vault-relative path (consistent with
+//! path-identity, mirroring how `core::snapshot` keys `.hiker/history/<rel>/`),
+//! independent of the `hiker-extract` leaf crate — the host hands it the
+//! produced artifact bytes and the resolved frontmatter, and it stores /
 //! prunes under the policy.
 //
 // status: extract-artifact-retention
@@ -98,29 +97,31 @@ pub fn resolve_retention(
     Retention::parse(pick)
 }
 
-/// The `.hiker/refs/<doc_id>/` directory for a document's retained artifacts.
-fn refs_dir(vault_root: &Path, doc_id: &str) -> PathBuf {
-    vault_root.join(".hiker").join("refs").join(doc_id)
+/// The `.hiker/refs/<rel_path>/` directory for a note's retained artifacts.
+/// Keyed by the note's vault-relative path (path-identity), mirroring how
+/// `core::snapshot` keys `.hiker/history/<rel>/`.
+fn refs_dir(vault_root: &Path, rel_path: &str) -> PathBuf {
+    vault_root.join(".hiker").join("refs").join(rel_path)
 }
 
-/// Store one capture's binary artifact under `.hiker/refs/<doc_id>/<op_id>/`,
-/// keyed by the op that produced it (the `extractor` op id from
-/// `reextract_replace`, or the create op for a first capture). `filename` is
-/// the artifact's name within that op's directory (e.g. `original.html`,
-/// `source.pdf`). Returns the absolute path written.
+/// Store one capture's binary artifact under
+/// `.hiker/refs/<rel_path>/<capture_id>/`, keyed by the note's vault-relative
+/// path and the capture that produced it (re-imports come from the producer's
+/// manifest under manifest-only ingest). `filename` is the artifact's name
+/// within that capture's directory (e.g. `original.html`, `source.pdf`).
+/// Returns the absolute path written. status: manifest-only-ingest
 ///
-/// Device-local: nothing here syncs — the op-log carries the sidecar text, not
-/// these blobs.
+/// Device-local: nothing here syncs.
 ///
 /// status: extract-artifact-retention
 pub fn store_artifact(
     vault_root: &Path,
-    doc_id: &str,
-    op_id: &str,
+    rel_path: &str,
+    capture_id: &str,
     filename: &str,
     bytes: &[u8],
 ) -> std::io::Result<PathBuf> {
-    let dir = refs_dir(vault_root, doc_id).join(op_id);
+    let dir = refs_dir(vault_root, rel_path).join(capture_id);
     std::fs::create_dir_all(&dir)?;
     let dest = dir.join(filename);
     let tmp = dir.join(format!("{filename}.tmp"));
@@ -129,30 +130,29 @@ pub fn store_artifact(
     Ok(dest)
 }
 
-/// Prune `.hiker/refs/<doc_id>/` to the resolved retention policy, newest-first
-/// by directory mtime: keep the N most-recent per-op artifact directories and
-/// remove the rest. `Forever` prunes nothing. Returns the op-id directory names
-/// that were removed.
+/// Prune `.hiker/refs/<rel_path>/` to the resolved retention policy,
+/// newest-first by directory mtime: keep the N most-recent per-capture artifact
+/// directories and remove the rest. `Forever` prunes nothing. Returns the
+/// capture directory names that were removed.
 ///
-/// Per-op directory recency is read from each subdirectory's mtime (the op ids
-/// are ULIDs, which are also lexicographically time-ordered, so the mtime and
-/// name orderings agree; mtime is used so a touched/restored dir sorts as
-/// recent). A missing refs dir prunes nothing.
+/// Per-capture directory recency is read from each subdirectory's mtime (mtime
+/// is used so a touched/restored dir sorts as recent). A missing refs dir
+/// prunes nothing.
 ///
 /// status: extract-artifact-retention
 pub fn prune_refs(
     vault_root: &Path,
-    doc_id: &str,
+    rel_path: &str,
     retention: Retention,
 ) -> std::io::Result<Vec<String>> {
     let Some(keep) = retention.keep_count() else {
         return Ok(Vec::new()); // Forever
     };
-    let dir = refs_dir(vault_root, doc_id);
+    let dir = refs_dir(vault_root, rel_path);
     if !dir.is_dir() {
         return Ok(Vec::new());
     }
-    // Collect (op_id_dir_name, mtime) for each per-op subdirectory.
+    // Collect (capture_dir_name, mtime) for each per-capture subdirectory.
     let mut entries: Vec<(String, std::time::SystemTime)> = Vec::new();
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
@@ -222,13 +222,13 @@ mod tests {
         assert_eq!(resolve_retention("latest", None, None), Retention::Latest);
     }
 
-    /// Set a per-op refs directory's mtime to a deterministic instant so the
-    /// recency ordering in [`prune_refs`] is stable regardless of how coarse
+    /// Set a per-capture refs directory's mtime to a deterministic instant so
+    /// the recency ordering in [`prune_refs`] is stable regardless of how coarse
     /// the filesystem's timestamp granularity is. Uses the std-stable
     /// `File::set_modified` (no extra dependency).
-    fn touch_opdir(root: &Path, doc_id: &str, op: &str, secs: u64) {
-        let opdir = root.join(".hiker/refs").join(doc_id).join(op);
-        let f = std::fs::File::open(&opdir).unwrap();
+    fn touch_capture(root: &Path, rel_path: &str, cap: &str, secs: u64) {
+        let capdir = root.join(".hiker/refs").join(rel_path).join(cap);
+        let f = std::fs::File::open(&capdir).unwrap();
         let when = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs);
         f.set_modified(when).unwrap();
     }
@@ -238,21 +238,23 @@ mod tests {
         // status: extract-artifact-retention
         let dir = tempdir().unwrap();
         let root = dir.path();
-        // Three captures, each its own op-id dir, oldest first.
-        for (i, op) in ["op-a", "op-b", "op-c"].iter().enumerate() {
-            store_artifact(root, "doc-1", op, "original.html", format!("v{i}").as_bytes())
+        // Path-keyed: a note in a subfolder, three captures oldest-first. The
+        // nested `notes/page.md` rel-path exercises the path-identity keying.
+        let rel = "notes/page.md";
+        for (i, cap) in ["cap-a", "cap-b", "cap-c"].iter().enumerate() {
+            store_artifact(root, rel, cap, "original.html", format!("v{i}").as_bytes())
                 .unwrap();
             // Bump mtime monotonically so the recency ordering is deterministic
             // independent of filesystem timestamp granularity.
-            touch_opdir(root, "doc-1", op, 100 + i as u64);
+            touch_capture(root, rel, cap, 100 + i as u64);
         }
-        let removed = prune_refs(root, "doc-1", Retention::Latest).unwrap();
-        // Only the newest (`op-c`) survives.
+        let removed = prune_refs(root, rel, Retention::Latest).unwrap();
+        // Only the newest (`cap-c`) survives.
         assert_eq!(removed.len(), 2);
-        assert!(removed.contains(&"op-a".to_string()));
-        assert!(removed.contains(&"op-b".to_string()));
-        assert!(root.join(".hiker/refs/doc-1/op-c/original.html").exists());
-        assert!(!root.join(".hiker/refs/doc-1/op-a").exists());
+        assert!(removed.contains(&"cap-a".to_string()));
+        assert!(removed.contains(&"cap-b".to_string()));
+        assert!(root.join(".hiker/refs/notes/page.md/cap-c/original.html").exists());
+        assert!(!root.join(".hiker/refs/notes/page.md/cap-a").exists());
     }
 
     #[test]
@@ -262,7 +264,7 @@ mod tests {
         let root = dir.path();
         for (i, op) in ["o1", "o2", "o3", "o4"].iter().enumerate() {
             store_artifact(root, "d", op, "a.bin", b"x").unwrap();
-            touch_opdir(root, "d", op, 10 + i as u64);
+            touch_capture(root, "d", op, 10 + i as u64);
         }
         let removed = prune_refs(root, "d", Retention::Keep(2)).unwrap();
         assert_eq!(removed.len(), 2);

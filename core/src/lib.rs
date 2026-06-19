@@ -1,13 +1,10 @@
 //! `hiker-core` is the engine behind hiker: it owns the vault index store,
 //! the chunker and embedding pipeline, semantic and lexical search, the
-//! op-log change substrate and trails subsystems, note clustering, and the agent /
+//! layered editing model and trails subsystems, note clustering, and the agent /
 //! LLM plumbing. Everything that touches the SQLite index, the filesystem
 //! vault, or model inference lives here so the CLI, MCP server, and desktop
 //! app share one implementation.
 
-pub mod acp;
-pub mod activity;
-pub mod agent;
 pub mod audit;
 pub mod autosave;
 pub mod boards;
@@ -20,17 +17,21 @@ pub mod embed;
 pub mod errors;
 pub mod extract;
 pub mod frontmatter;
+pub mod ignore;
 pub mod inbox;
 pub mod indexer;
+pub mod kinds;
 pub mod links_rename;
 pub mod llm;
 pub mod merge;
-pub mod observability;
-pub mod oplog;
-pub mod prompts;
+pub mod editing;
 pub mod ops;
+pub mod pm;
+pub mod prompts;
+pub mod queries;
+pub mod rules;
 pub mod search;
-pub mod sessions;
+pub mod snapshot;
 pub mod store;
 pub mod suggest;
 pub mod tasks;

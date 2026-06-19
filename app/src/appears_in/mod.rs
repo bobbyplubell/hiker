@@ -45,6 +45,9 @@ pub struct State {
     boards: Vec<Ref>,
     trails: Vec<Ref>,
     trees: Vec<Ref>,
+    /// List-like notes (epics / plans) whose `refs` name this note, via
+    /// the derived `list_refs` reverse lookup. status: pm-epic-derived-table
+    lists: Vec<Ref>,
 }
 
 /// Zero-sized `View` descriptor. State lives in `AppState::appears_in_state`;
@@ -92,7 +95,8 @@ fn render_body(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>) {
         let store = ctx.services.read_store.clone();
         let trees = ctx.services.trees.clone();
         let vault = ctx.vault.clone();
-        let (canvases, boards, trails, trees_v) = compute(&store, &trees, &vault, &active);
+        let (canvases, boards, trails, trees_v, lists) =
+            compute(&store, &trees, &vault, &active);
         let st = ctx
             .state
             .downcast_mut::<State>()
@@ -101,12 +105,13 @@ fn render_body(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>) {
         st.boards = boards;
         st.trails = trails;
         st.trees = trees_v;
+        st.lists = lists;
         st.computed_for = Some(active.clone());
     }
 
     // Snapshot the groups out of state so the immutable borrow ends before we
     // queue `ctx.defer` closures (which need `ctx` mutably).
-    let groups: [(Icon, &str, Vec<Ref>); 4] = {
+    let groups: [(Icon, &str, Vec<Ref>); 5] = {
         let st = ctx
             .state
             .downcast_ref::<State>()
@@ -116,11 +121,13 @@ fn render_body(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>) {
             (Icon::Clipboard, "Boards", st.boards.clone()),
             (Icon::Boot, "Trails", st.trails.clone()),
             (Icon::ClusterTree, "Trees", st.trees.clone()),
+            // Epics / plans containing this note. status: pm-epic-derived-table
+            (Icon::Bookmark, "Lists", st.lists.clone()),
         ]
     };
     if groups.iter().all(|(_, _, rows)| rows.is_empty()) {
         ui.label(
-            egui::RichText::new("(not in any canvas, board, trail, or tree)")
+            egui::RichText::new("(not in any canvas, board, trail, tree, or list)")
                 .color(theme::muted())
                 .small(),
         );
@@ -149,7 +156,8 @@ fn draw_ref_row(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>, icon: Icon, r: &Ref
         // only on hover (no inline thumbnail). status: canvas-appears-in
         let resp = ui
             .add(egui::Button::image_and_text(icons::ICONS.image(icon), &r.label))
-            .on_hover_text(&r.path);
+            .on_hover_text(&r.path)
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
         if resp.hovered() {
             if let Ok(bytes) = ctx.vault.read_file(&r.path) {
                 let provider = crate::panels::canvas::thumbnail::CanvasPreview::new(bytes);
@@ -173,33 +181,43 @@ fn draw_ref_row(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>, icon: Icon, r: &Ref
     }
 
     let resp = ui
-        .add(egui::Button::image_and_text(icons::ICONS.image(icon), &r.label))
-        .on_hover_text(&r.path);
+        .add(
+            egui::Button::image_and_text(icons::ICONS.image(icon), &r.label)
+                .sense(egui::Sense::click_and_drag()),
+        )
+        .on_hover_text(&r.path)
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    // Standard note-row grammar ([drag-note-payload]): the row is a drag
+    // source carrying the vault-relative path, same as backlinks rows.
+    crate::widgets::note_row::note_drag_source(ui, &resp, &r.path, &r.label);
     if resp.hovered() {
         crate::widgets::preview::register_note_hover(ui, resp.rect, &r.path);
     }
     if resp.clicked() {
+        // Click opens preview; mod-click opens sticky ([modclick-sticky]).
+        let sticky = crate::widgets::note_row::open_sticky(ui.input(|i| i.modifiers));
         let path = r.path.clone();
-        ctx.defer(move |app| editor_pane::open_file(app, &path, false));
+        ctx.defer(move |app| editor_pane::open_file(app, &path, sticky));
     }
 }
 
-/// Gather the four reference sets for `note`. Canvases + trees are on-demand
-/// scans; boards + trails are indexed store queries taken under a single lock.
-/// Any failing source degrades to empty rather than failing the whole panel.
+/// Gather the five reference sets for `note`. Canvases + trees are on-demand
+/// scans; boards + trails + lists are indexed store queries taken under a
+/// single lock. Any failing source degrades to empty rather than failing the
+/// whole panel.
 fn compute(
     store: &Arc<Mutex<Store>>,
     trees: &Arc<Db>,
     vault: &Arc<Vault>,
     note: &str,
-) -> (Vec<Ref>, Vec<Ref>, Vec<Ref>, Vec<Ref>) {
+) -> (Vec<Ref>, Vec<Ref>, Vec<Ref>, Vec<Ref>, Vec<Ref>) {
     let canvases = hiker_core::canvas::canvases_referencing(vault, note)
         .unwrap_or_default()
         .into_iter()
         .map(|p| Ref { label: title_of(&p), path: p })
         .collect();
 
-    let (boards, trails) = match store.lock() {
+    let (boards, trails, lists) = match store.lock() {
         Ok(s) => {
             let boards = s
                 .boards_containing_note(note)
@@ -219,9 +237,30 @@ fn compute(
                 .filter(|h| seen.insert(h.tree_path.clone()))
                 .map(|h| Ref { label: title_of(&h.tree_path), path: h.tree_path })
                 .collect();
-            (boards, trails)
+            // Epics / plans whose ordered refs name this note — the
+            // `lists_containing_note` reverse lookup, labeled with the
+            // list's kind off the index. status: pm-epic-derived-table
+            let mut seen_lists = std::collections::HashSet::new();
+            let lists = s
+                .lists_containing_note(note)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|h| seen_lists.insert(h.list_path.clone()))
+                .map(|h| {
+                    let kind = s
+                        .meta_value(&h.list_path, "hiker.kind")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| "list".to_string());
+                    Ref {
+                        label: format!("{} \u{00b7} {kind}", title_of(&h.list_path)),
+                        path: h.list_path,
+                    }
+                })
+                .collect();
+            (boards, trails, lists)
         }
-        Err(_) => (Vec::new(), Vec::new()),
+        Err(_) => (Vec::new(), Vec::new(), Vec::new()),
     };
 
     let trees_v = trees
@@ -234,7 +273,7 @@ fn compute(
         })
         .collect();
 
-    (canvases, boards, trails, trees_v)
+    (canvases, boards, trails, trees_v, lists)
 }
 
 /// Basename without the `.md` / `.canvas` extension — the row's display title.

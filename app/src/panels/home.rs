@@ -1,46 +1,28 @@
-//! Home tab — vault dashboard. Shows top-level counts, a snapshots
-//! browser, and a one-click jump into the unified Changes feed (which
-//! now owns the recent-activity surface the home overview used to
-//! render inline).
+//! Home tab — vault dashboard. Shows top-level counts. Per-note version
+//! history lives in the editor's version dropdown + the "View history for
+//! this note" detail page (`HomeDetail::ActivityRow`), both sourced from
+//! plain-file snapshots. The old vault-wide cross-note activity/changes
+//! feed is retired (the core rework: git-log + per-note snapshot list only).
 #![allow(clippy::items_after_test_module)]
-
-use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-use hiker_core::activity::ChangeRow;
-
 use crate::editor_pane;
 use crate::state::AppState;
-use crate::tab::{HomeDetail, Tab, TabKind};
+use crate::tab::HomeDetail;
 use hiker_theme as theme;
 
-/// How long a cached snapshot-feed read stays fresh. The feed is a SQLite
-/// metadata query under the vault-wide op-log lock; running it every frame
-/// (the home tab repaints continuously) was a visible lag source. Snapshots
-/// only change on accept / commit / rollback, so a sub-second refresh is
-/// imperceptible while cutting ~59 of every 60 queries.
-const SNAPSHOT_REFRESH: Duration = Duration::from_millis(750);
-
-/// Per-tab local state for the Home surface. Currently just the throttled
-/// snapshot-feed cache (see [`SNAPSHOT_REFRESH`]).
+/// Per-tab local state for the Home surface. The vault-wide snapshot-feed
+/// cache was retired with the cross-note activity feed; nothing stateful
+/// remains, but the type is kept so the panel-state registry wiring is
+/// unchanged.
 #[derive(Default)]
-pub struct State {
-    snapshots: Option<SnapshotCache>,
-}
-
-struct SnapshotCache {
-    limit: usize,
-    fetched_at: Instant,
-    rows: Vec<ChangeRow>,
-}
+pub struct State;
 
 impl State {
-    /// Invalidate the cache so the next frame re-reads the feed — call after an
-    /// action that changes the snapshot list (e.g. a rollback).
-    pub fn invalidate_snapshots(&mut self) {
-        self.snapshots = None;
-    }
+    /// No-op retained for call-site compatibility: there is no longer a
+    /// vault-wide snapshot-feed cache to invalidate.
+    pub const fn invalidate_snapshots(&mut self) {}
 }
 
 pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
@@ -84,62 +66,19 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
 
     ui.add_space(20.0);
 
-    // Recent activity used to render inline here; it's now the
-    // dedicated Changes tab (one filterable surface for staged +
-    // committed history). The home page links to it instead of
-    // duplicating the rows.
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Activity").strong());
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("Open Changes →").clicked() {
-                app.open_singleton(TabKind::Changes);
-            }
-        });
-    });
     ui.label(
         egui::RichText::new(
-            "Pending agent proposals + committed history live in the Changes tab. Filter by author, source, and op.",
+            "Per-note version history lives in the editor's version dropdown and \
+             the right-click \"View history for this note\" page — sourced from \
+             plain-file snapshots under .hiker/history/.",
         )
         .color(theme::muted())
         .small(),
     );
-
-    ui.add_space(16.0);
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Version history").strong());
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("See all").clicked() {
-                open_home_detail(app, HomeDetail::VersionHistory);
-            }
-        });
-    });
-    render_snapshots(ui, app, 5);
-}
-
-impl AppState {
-    fn open_singleton(&mut self, kind: TabKind) {
-        if let Some(existing) = self
-            .session
-            .tabs
-            .iter()
-            .find(|t| std::mem::discriminant(&t.kind) == std::mem::discriminant(&kind))
-        {
-            self.session.active_tab = Some(existing.id);
-            return;
-        }
-        let id = self.next_tab_id();
-        self.session.tabs.push(Tab::new(id, kind, true));
-        self.session.active_tab = Some(id);
-    }
 }
 
 pub fn show_detail(ui: &mut egui::Ui, app: &mut AppState, which: &HomeDetail) {
     match which {
-        HomeDetail::VersionHistory => {
-            ui.heading("Version history");
-            ui.add_space(8.0);
-            render_snapshots(ui, app, 200);
-        }
         HomeDetail::ActivityRow { path } => {
             ui.heading(format!("History · {path}"));
             ui.add_space(8.0);
@@ -149,13 +88,13 @@ pub fn show_detail(ui: &mut egui::Ui, app: &mut AppState, which: &HomeDetail) {
 }
 
 impl AppState {
-    /// Render every accepted op touching `path`, newest-first. Each row
-    /// shows timestamp, author, and action so the user can see what
-    /// changed between versions.
+    /// Render every snapshot version of `path`, newest-first. Each row shows
+    /// the snapshot timestamp; clicking opens that version as a read-only
+    /// preview diffed against the live file. Sourced from `core::snapshot`.
     fn render_path_history(&mut self, ui: &mut egui::Ui, path: &str) {
     let app = self;
-    let log = app.vault_session.services.oplog.clone();
-    let rows = match hiker_core::ops::op_writes::path_history(log.as_ref(), path, 200) {
+    let log = app.vault_session.services.layered.clone();
+    let rows = match hiker_core::ops::op_writes::snapshot_history(log.as_ref(), path, 200) {
         Ok(v) => v,
         Err(err) => {
             ui.label(
@@ -178,6 +117,11 @@ impl AppState {
         if ui.button("Open note").clicked() {
             editor_pane::open_file(app, path, /* sticky */ true);
         }
+        // Roll back to the previous snapshot (forward-correct: re-saves the
+        // prior content as a new version). Needs at least two snapshots.
+        if rows.len() >= 2 && ui.button("Roll back to previous version").clicked() {
+            app.rollback_change(path);
+        }
         ui.label(
             egui::RichText::new(format!("{} versions", rows.len()))
                 .color(theme::muted())
@@ -185,146 +129,54 @@ impl AppState {
         );
     });
     ui.add_space(4.0);
+    let mut open: Option<String> = None;
     egui::ScrollArea::vertical()
         .id_salt(("home-activity-history", path.to_string()))
         .auto_shrink([false, false])
         .show(ui, |ui| {
             for (i, row) in rows.iter().enumerate() {
-                egui::Frame::default()
-                    .fill(theme::active_bg())
-                    .inner_margin(egui::Margin::symmetric(6, 4))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(format_timestamp(row.timestamp_ms))
-                                    .small()
-                                    .monospace(),
-                            );
-                            ui.label(
-                                egui::RichText::new(row.author.as_wire())
-                                    .small()
-                                    .color(theme::muted()),
-                            );
-                            ui.label(
-                                egui::RichText::new(&row.op_kind)
-                                    .small()
-                                    .strong(),
-                            );
-                            // Newest-first: index 0 is the on-disk version.
-                            if i == 0 {
-                                ui.label(
-                                    egui::RichText::new("current")
-                                        .small()
-                                        .color(theme::accent()),
-                                );
-                            }
-                        });
-                        let short = &row.op_id[..row.op_id.len().min(12)];
-                        ui.label(
-                            egui::RichText::new(short)
-                                .small()
-                                .monospace()
-                                .color(theme::muted()),
-                        );
-                    });
+                let badge = if i == 0 { " · current" } else { "" };
+                let label = format!("{}{}", format_timestamp(row.timestamp_ms), badge);
+                if ui
+                    .selectable_label(false, egui::RichText::new(label).small().monospace())
+                    .on_hover_text("Open this version (read-only, diffed against the live file)")
+                    .clicked()
+                {
+                    open = Some(row.snapshot_id.clone());
+                }
                 ui.add_space(2.0);
             }
         });
+    if let Some(snapshot_id) = open {
+        app.open_version(path, &snapshot_id);
     }
-}
-
-/// Read the snapshot feed through the throttled cache: re-query only when the
-/// cache is empty, the requested `limit` changed, or it has gone stale (see
-/// [`SNAPSHOT_REFRESH`]). Returns owned rows (a cheap clone of a small list)
-/// so the caller can render + dispatch `&mut app` clicks without holding the
-/// panel-state borrow.
-fn snapshot_rows(app: &mut AppState, limit: usize) -> Result<Vec<ChangeRow>, String> {
-    let now = Instant::now();
-    let fresh = app.panels.home.snapshots.as_ref().is_some_and(|c| {
-        c.limit == limit && now.duration_since(c.fetched_at) < SNAPSHOT_REFRESH
-    });
-    if !fresh {
-        let feed = hiker_core::activity::AcceptedFeed::new(&app.vault_session.services.oplog);
-        let rows = feed.recent(limit).map_err(|e| e.to_string())?;
-        app.panels.home.snapshots = Some(SnapshotCache { limit, fetched_at: now, rows });
     }
-    Ok(app.panels.home.snapshots.as_ref().map(|c| c.rows.clone()).unwrap_or_default())
-}
-
-fn render_snapshots(ui: &mut egui::Ui, app: &mut AppState, limit: usize) {
-    let rows = match snapshot_rows(app, limit) {
-        Ok(v) => v,
-        Err(err) => {
-            ui.label(
-                egui::RichText::new(format!("changes error: {}", err))
-                    .color(egui::Color32::RED)
-                    .small(),
-            );
-            return;
-        }
-    };
-    if rows.is_empty() {
-        ui.label(
-            egui::RichText::new("(no versions yet)")
-                .color(theme::muted())
-                .small(),
-        );
-        return;
-    }
-    egui::ScrollArea::vertical()
-        .id_salt("home-snapshots")
-        .auto_shrink([false, true])
-        .max_height(220.0)
-        .show(ui, |ui| {
-            for row in rows {
-                // The op-log projection carries the ulid `op_id` in
-                // `metadata` (the `id` field holds `timestamp_ms`).
-                let Some(op_id) = row
-                    .metadata
-                    .get("op_id")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-                else {
-                    continue;
-                };
-                let ts = format_timestamp(row.timestamp_ms);
-                let short = &op_id[..op_id.len().min(8)];
-                let label = format!("{}  {}  {}", ts, short, row.path);
-                if ui
-                    .selectable_label(false, label)
-                    .on_hover_text("Open version preview")
-                    .clicked()
-                {
-                    app.open_version(&row.path, &op_id);
-                }
-            }
-        });
 }
 
 impl AppState {
-    fn open_version(&mut self, path: &str, op_id: &str) {
+    fn open_version(&mut self, path: &str, snapshot_id: &str) {
         use crate::tab::{Tab, TabKind};
         let id = self.next_tab_id();
         self.session.tabs.push(Tab::new(
             id,
-            TabKind::version_preview(path.to_string(), op_id.to_string()),
+            TabKind::version_preview(path.to_string(), snapshot_id.to_string()),
             true,
         ));
         self.session.active_tab = Some(id);
     }
 }
 
-/// Roll a file back to the content of its previous accepted version.
-/// Pulls the prior content from `previous_accepted_content` and writes it
-/// through the op log via `user_save` — a fresh `user` op that becomes the
-/// newest accepted version (the original op stays in the log).
+/// Roll a file back to its previous snapshot version. Pulls the prior
+/// content from `previous_snapshot_content` and writes it through the op
+/// log via `user_save` — a fresh `user` save that becomes the newest
+/// version (the prior snapshot stays in the history).
 impl AppState {
     pub(crate) fn rollback_change(&mut self, path: &str) {
     use crate::state::ToastLevel;
     let app = self;
-    let log = app.vault_session.services.oplog.clone();
+    let log = app.vault_session.services.layered.clone();
     let prior =
-        match hiker_core::ops::op_writes::previous_accepted_content(log.as_ref(), path) {
+        match hiker_core::ops::op_writes::previous_snapshot_content(log.as_ref(), path) {
             Ok(Some(p)) => p,
             Ok(None) => {
                 app.push_toast(

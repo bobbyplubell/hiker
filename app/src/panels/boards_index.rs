@@ -6,8 +6,10 @@
 //! board via `core::boards::list` (the same listing `boards_list` exposes to
 //! MCP), including empty boards, and shows each row's title + column / card
 //! counts. A row click opens that board in its board view; a **New board**
-//! action runs the create op; a per-row **Delete** moves the board-doc to
-//! trash (confirm-guarded) via `core::ops::delete`.
+//! action runs the create op; the row's context menu carries Open / Rename /
+//! Delete — Delete moves the board-doc to trash behind the shared confirm
+//! modal (`interaction.md` [destructive-verbs-in-menu]: destroy verbs are
+//! menu-only, never a bare row button).
 //!
 //! See `docs/kanban.md` §"Boards index page" / §"Deleting a board".
 //
@@ -21,9 +23,25 @@ use hiker_core::boards::BoardListItem;
 
 /// A row action requested this frame, applied after the list render so the
 /// borrow on the gathered listing is released first.
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum RowAction {
     Open(String),
+    /// Open the board with its title inline-rename active (the same
+    /// machinery `new_board` uses via `board::open_for_rename`).
+    Rename(String),
     Delete(String),
+}
+
+/// Build a board row's context menu (`interaction.md`
+/// [rightclick-menu-always]): Open / Rename, then the destructive Delete in
+/// its own section. Delete routes through the shared confirm-delete modal —
+/// the menu entry arms the confirm, it never trashes directly.
+fn build_board_row_menu(rel: &str) -> egui_workbench::menu::Menu<RowAction> {
+    egui_workbench::menu::Menu::new()
+        .action("Open board", RowAction::Open(rel.to_string()))
+        .action("Rename board", RowAction::Rename(rel.to_string()))
+        .section()
+        .action("Delete board", RowAction::Delete(rel.to_string()))
 }
 
 /// Render the Boards index page. status: board-index-page
@@ -61,6 +79,11 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
         Some(RowAction::Open(rel)) => {
             crate::panels::board::open(app, &rel);
         }
+        Some(RowAction::Rename(rel)) => {
+            // The board tab's title inline-rename (commit on Enter/focus
+            // loss, Esc cancels) — the same flow a fresh board opens with.
+            crate::panels::board::open_for_rename(app, &rel);
+        }
         Some(RowAction::Delete(rel)) => {
             // Confirm before trashing — the layout is discarded (though trash
             // makes it recoverable). Reuses the shared delete-confirm modal;
@@ -82,48 +105,82 @@ fn gather_boards(app: &AppState) -> Vec<BoardListItem> {
     hiker_core::boards::list(
         &app.vault_session.vault,
         &store,
-        &app.vault_session.services.oplog,
+        &app.vault_session.services.layered,
+        Some(app.vault_session.services.kinds.as_ref()),
     )
     .unwrap_or_default()
 }
 
-/// One board row: title (a click-to-open link) + column / card counts + a
-/// Delete button.
+/// One board row: title (a click-to-open link) + column / card counts. The
+/// row's verbs (Open / Rename / Delete-with-confirm) live in its right-click
+/// menu.
 fn render_row(ui: &mut egui::Ui, item: &BoardListItem, action: &mut Option<RowAction>) {
     let row = egui::Frame::default()
         .fill(theme::active_bg())
         .inner_margin(egui::Margin::symmetric(8, 6));
-    row.show(ui, |ui| {
-        ui.horizontal(|ui| {
-            if ui.link(egui::RichText::new(&item.title).strong()).clicked() {
-                *action = Some(RowAction::Open(item.rel_path.clone()));
-            }
-            ui.label(
-                egui::RichText::new(format!(
-                    "{} column{} · {} card{}",
-                    item.column_count,
-                    if item.column_count == 1 { "" } else { "s" },
-                    item.card_count,
-                    if item.card_count == 1 { "" } else { "s" },
-                ))
-                .small()
-                .color(theme::muted()),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .small_button(egui::RichText::new("Delete").color(error_color()))
-                    .on_hover_text("Move this board to trash")
-                    .clicked()
-                {
-                    *action = Some(RowAction::Delete(item.rel_path.clone()));
+    let response = row
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui.link(egui::RichText::new(&item.title).strong()).clicked() {
+                    *action = Some(RowAction::Open(item.rel_path.clone()));
                 }
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} column{} · {} card{}",
+                        item.column_count,
+                        if item.column_count == 1 { "" } else { "s" },
+                        item.card_count,
+                        if item.card_count == 1 { "" } else { "s" },
+                    ))
+                    .small()
+                    .color(theme::muted()),
+                );
             });
-        });
+        })
+        .response;
+    // Right-click anywhere on the row → its context menu (`interaction.md`
+    // [rightclick-menu-always]).
+    let mut chosen = None;
+    response.interact(egui::Sense::click()).context_menu(|ui| {
+        chosen = egui_workbench::menu::show(ui, build_board_row_menu(&item.rel_path));
     });
+    if chosen.is_some() {
+        *action = chosen;
+    }
     ui.add_space(4.0);
 }
 
-/// Error / danger accent (the theme has no dedicated error token).
-const fn error_color() -> egui::Color32 {
-    egui::Color32::from_rgb(200, 60, 60)
+#[cfg(test)]
+mod tests {
+    use egui_workbench::menu::Entry;
+
+    use super::{build_board_row_menu, RowAction};
+
+    /// Menu composition: Open / Rename, then Delete alone in the destructive
+    /// section (and Delete arms the confirm — it carries the rel-path the
+    /// modal needs, never a direct trash).
+    #[test]
+    fn board_row_menu_offers_open_rename_and_sectioned_delete() {
+        let menu = build_board_row_menu("boards/b.md");
+        let sections = menu.sections();
+        assert_eq!(sections.len(), 2, "verbs section + destructive section");
+        let label_action = |e: &Entry<RowAction>| match e {
+            Entry::Action { label, action, .. } => (label.to_string(), action.clone()),
+            _ => panic!("expected an Action entry"),
+        };
+        assert_eq!(
+            label_action(&sections[0][0]),
+            ("Open board".to_string(), RowAction::Open("boards/b.md".to_string()))
+        );
+        assert_eq!(
+            label_action(&sections[0][1]),
+            ("Rename board".to_string(), RowAction::Rename("boards/b.md".to_string()))
+        );
+        assert_eq!(sections[0].len(), 2);
+        assert_eq!(
+            label_action(&sections[1][0]),
+            ("Delete board".to_string(), RowAction::Delete("boards/b.md".to_string()))
+        );
+        assert_eq!(sections[1].len(), 1);
+    }
 }

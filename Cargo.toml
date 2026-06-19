@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "core",
-    "hiker-sync",
     "hiker-git",
     "hiker-canvas/core",
     "hiker-canvas/view-core",
@@ -107,6 +106,9 @@ tokio = { version = "1", features = ["rt", "sync", "macros", "time", "fs"] }
 notify = "7"
 notify-debouncer-full = "0.4"
 walkdir = "2"
+# ripgrep's ignore-file engine (.gitignore / .hikerignore parsing: nesting,
+# negation `!`, anchoring). MIT/Unlicense; no banned P2P deps (see deny.toml).
+ignore = "0.4"
 serde_yml = "0.0.12"
 time = { version = "0.3", features = ["formatting", "macros"] }
 tracing = "0.1"
@@ -163,7 +165,7 @@ egui = "0.32"
 # dependency the egui-free `canvas-view-core` needs.
 emath = "0.32"
 egui_extras = { version = "0.32", features = ["svg", "image"] }
-eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow", "wgpu", "wayland", "x11"] }
 egui_dock = "0.17"
 egui_tiles = { version = "0.13", features = ["serde"] }
 egui_workbench = { path = "egui-workbench" }
@@ -175,6 +177,11 @@ hiker-graph = { path = "hiker-render/graph" }
 # the render submodule); the graph/canvas view layers consume its Möbius +
 # geodesic + lens primitives.
 hiker-projection = { path = "hiker-render/projection" }
+# View-layer lens over `hiker-projection`: the pane-locked Poincaré disk frame,
+# the forward+nav disk operator (+inverse), the screen↔disk map, scroll-zoom and
+# centroid framing — the single source of truth the graph-view engine and the
+# canvas camera both build on (previously hand-synced copies). `emath`-only.
+hiker-projection-view = { path = "hiker-render/projection-view" }
 # Shared render→SVG / syntax-check (`check()`) trait across the diagram engines
 # (mermaid / wavedrom / math), in the render submodule. egui-free, no graphics
 # deps — the editor/agent seam for syntax-checking diagrams.

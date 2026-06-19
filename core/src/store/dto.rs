@@ -249,6 +249,23 @@ pub struct BoardContainingHit {
     pub column_name: String,
 }
 
+/// One row in the derived `list_refs` table — one row per `{ path }`
+/// member entry in a list-like note's `hiker.refs` frontmatter (epics,
+/// plans, any registered list-like kind). Populated by the indexer when it
+/// ingests a list-like note; generic over the shape — the row carries no
+/// kind, only structure.
+///
+/// status: pm-epic-derived-table
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListRefRow {
+    /// The list-like note's vault-relative path (path-as-identity).
+    pub list_path: String,
+    /// The referenced member note's vault-relative path.
+    pub member_path: String,
+    /// 0-based position within the list's ordered `refs`.
+    pub position: i64,
+}
+
 /// Bundle of everything needed to upsert a note in one transaction. Caller
 /// (the indexer task) builds this after chunking + embedding.
 pub struct NoteUpsert<'a> {
@@ -275,6 +292,18 @@ pub struct MetaEntry {
     pub num: Option<f64>,
 }
 
+/// One lenient-validation violation on a note: the offending field plus a
+/// short human-readable message. Write-side input to (and read row of) the
+/// derived `note_problems` table — re-derived on ingest like `note_meta`,
+/// never persisted into the note. Backs the badge + problems report.
+///
+/// status: kind-lenient-validation
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteProblem {
+    pub field: String,
+    pub message: String,
+}
+
 /// A single predicate in a structured `query_notes` filter. All predicates
 /// in a `NoteQuery` are ANDed.
 ///
@@ -282,10 +311,13 @@ pub struct MetaEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum MetaFilter {
-    /// Frontmatter `key` equals `value` (string compare). Tag membership is
-    /// `Equals { key: "tags", value: "<tag>" }` since list elements are
-    /// stored one-per-row under the list's key.
-    Equals { key: String, value: String },
+    /// Frontmatter `key` equals any of `values` (string compare; the list
+    /// is an any-of OR — `value IN (...)` inside the EXISTS, per
+    /// `query-filter-grammar`). Tag membership is
+    /// `Equals { key: "tags", values: ["<tag>"] }` since list elements are
+    /// stored one-per-row under the list's key. An empty list matches
+    /// nothing.
+    Equals { key: String, values: Vec<String> },
     /// Frontmatter `key` is present at all (any value).
     Exists { key: String },
     /// Numeric `key` falls in `[min, max]` (inclusive). Either bound may be
@@ -295,12 +327,31 @@ pub enum MetaFilter {
         min: Option<f64>,
         max: Option<f64>,
     },
+    /// The note is a card on the board at `board_path` (vault-relative —
+    /// path is identity), optionally restricted to a column-name set
+    /// (`None` = whole board; an empty set matches nothing). A single
+    /// named column is a one-element set; the query grammar's `category`
+    /// clause expands to the mapped column-name set at compile time
+    /// (`kind-column-state-map`). The one predicate that compiles against
+    /// the derived `board_cards` table rather than `note_meta`: the query
+    /// layer's board-membership clause (`docs/queries.md`).
+    ///
+    /// status: query-filter-grammar
+    Board {
+        board_path: String,
+        columns: Option<Vec<String>>,
+    },
+    /// A constant-false predicate: matches no note. Emitted for a
+    /// predicate-less query so it resolves to the empty set rather than
+    /// enumerating the whole vault (the module's no-match-everything
+    /// promise). Carries no bound value.
+    MatchNone,
 }
 
 /// Sort direction for `NoteOrder`.
 ///
 /// status: store-note-query
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum OrderDir {
     Asc,
@@ -337,6 +388,16 @@ pub struct NoteQuery {
     pub filters: Vec<MetaFilter>,
     #[serde(default)]
     pub folder: Option<String>,
+    /// Vault-relative `GLOB` pattern over the note path (`work/**`).
+    /// Generalizes `folder`'s prefix restriction for the query layer's
+    /// `path:` clause (`query-filter-grammar`).
+    #[serde(default)]
+    pub path_glob: Option<String>,
+    /// Exact note-path constraint — the per-note membership probe the
+    /// vault rules layer's `queries::matches_note` binds on top of a
+    /// compiled query (`rule-condition-reuses-queries`).
+    #[serde(default)]
+    pub path_eq: Option<String>,
     #[serde(default)]
     pub order: Option<NoteOrder>,
     #[serde(default)]

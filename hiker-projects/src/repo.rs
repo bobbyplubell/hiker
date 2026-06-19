@@ -42,12 +42,12 @@ impl Scope {
     /// `exclude`. Lets a caller post-filter `code_graph()` nodes by their `file`.
     pub fn accepts(&self, rel_path: &str) -> bool {
         let included =
-            self.include.is_empty() || self.include.iter().any(|p| glob::glob_match(p, rel_path));
-        let excluded = self.exclude.iter().any(|p| glob::glob_match(p, rel_path));
+            self.include.is_empty() || self.include.iter().any(|p| glob::matches(p, rel_path));
+        let excluded = self.exclude.iter().any(|p| glob::matches(p, rel_path));
         included && !excluded
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.include.is_empty() && self.exclude.is_empty()
     }
 }
@@ -55,7 +55,7 @@ impl Scope {
 /// A resolved code-source binding. `repo_id` is always concrete (frontmatter, else git-derived,
 /// else path-based); `root`/`index` are `~`-expanded absolute-ish paths.
 #[derive(Debug, Clone)]
-pub struct RepoSource {
+pub struct Source {
     pub root: PathBuf,
     pub repo_id: String,
     pub backend: Backend,
@@ -65,8 +65,8 @@ pub struct RepoSource {
     pub index_commit: Option<String>,
 }
 
-impl RepoSource {
-    pub(crate) fn from_raw(raw: RawSource) -> RepoSource {
+impl Source {
+    pub(crate) fn from_raw(raw: RawSource) -> Source {
         let root = expand_tilde(raw.root.as_deref().unwrap_or("."));
         let index = raw
             .index
@@ -76,7 +76,7 @@ impl RepoSource {
             // but the policy is "configured path"; callers should set `index:` explicitly.
             .unwrap_or_else(|| root.with_extension("scip"));
         let repo_id = raw.repo_id.clone().unwrap_or_else(|| resolve_repo_id(&root));
-        RepoSource {
+        Source {
             root,
             repo_id,
             backend: Backend::parse(raw.backend.as_deref()),

@@ -24,3 +24,8 @@ hiker-canvas = { workspace = true }
 # The lens MATH lives here in the egui-free camera; egui paint stays in
 # `canvas-view`. See docs/projection.md.
 hiker-projection = { workspace = true }
+# The view-layer lens shared with the graph-view engine: the locked Poincaré
+# disk frame, the forward+nav disk operator (+inverse), the screen↔disk map and
+# scroll-zoom. The camera keeps its f64 affine half and frames at f64, routing
+# the disk remap through this crate.
+hiker-projection-view = { workspace = true }

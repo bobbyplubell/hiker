@@ -116,6 +116,34 @@ impl Store {
         Ok(rows)
     }
 
+    /// Every card row across all boards, ordered by `(board_path,
+    /// column_name, ordinal)`. Backs the vault graph's board-membership
+    /// edge set (`vault-graph-typed-edges`), which unions every board-doc's
+    /// doc→card edges in one pass and so wants the whole table at once
+    /// rather than a per-board query per rebuild (mirrors
+    /// `all_trail_waypoints`).
+    ///
+    /// status: vault-graph-typed-edges
+    pub fn all_board_cards(&self) -> Result<Vec<BoardCardRow>, Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT board_id, board_path, card_note_path, column_name, ordinal
+             FROM board_cards
+             ORDER BY board_path, column_name, ordinal",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(BoardCardRow {
+                    board_id: row.get(0)?,
+                    board_path: row.get(1)?,
+                    card_note_path: row.get(2)?,
+                    column_name: row.get(3)?,
+                    ordinal: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Distinct board-doc paths known to the derived index — i.e. every
     /// board that currently has at least one card. Cheap one-query lookup
     /// the file tree uses to mark board rows + route their click to the

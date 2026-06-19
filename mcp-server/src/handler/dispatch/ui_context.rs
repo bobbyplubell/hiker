@@ -16,51 +16,6 @@ use crate::handler::params::{
 };
 
 impl App {
-    /// Dispatch one of the three UI-context read tools by name, recording
-    /// the audit row in the same shape every other dispatch arm uses.
-    /// Pulled out of `dispatch_tool` so the per-arm parse + record +
-    /// return-the-result boilerplate doesn't push that match over the
-    /// `too_many_lines` budget. Caller has already matched the name set.
-    pub(in crate::handler) async fn dispatch_ui_context_tool(
-        &self,
-        name: &str,
-        raw_value: &serde_json::Value,
-    ) -> Result<CallToolResult, ErrorData> {
-        let outcome = match name {
-            "get_active_note" => {
-                let p: GetActiveNote =
-                    serde_json::from_value(raw_value.clone()).unwrap_or(GetActiveNote {});
-                self.read_active_note(&p).await
-            }
-            "get_open_notes" => {
-                let p: GetOpenNotes =
-                    serde_json::from_value(raw_value.clone()).unwrap_or(GetOpenNotes {});
-                self.read_open_notes(&p).await
-            }
-            "get_selection" => {
-                let p: GetSelection =
-                    serde_json::from_value(raw_value.clone()).unwrap_or(GetSelection {});
-                self.read_selection(&p).await
-            }
-            other => {
-                // Caller is supposed to filter the name set; surface a
-                // clear error rather than panicking if a future caller
-                // misses an entry.
-                return Err(ErrorData::internal_error(
-                    format!("dispatch_ui_context_tool: unknown name `{other}`"),
-                    None,
-                ));
-            }
-        };
-        self.state.audit.record(
-            name,
-            raw_value,
-            crate::handler::params::audit_status(&outcome),
-            crate::handler::params::audit_err(&outcome),
-        );
-        outcome
-    }
-
     /// status: mcp-tool-get-active-note
     /// Returns the focused buffer tab's path + cursor byte offset +
     /// (if non-empty) selection. When the active tab is an app page
@@ -119,7 +74,7 @@ impl App {
     /// Returns `{path, start_byte, end_byte, text}` for the active
     /// buffer's non-empty selection; `{path: null}` when empty or no
     /// buffer is focused. The selection text is materialised from the
-    /// agent's view of the file (op-log replica when present, on-disk
+    /// agent's view of the file (layered-doc replica when present, on-disk
     /// bytes otherwise) — same source as `get_note(detail=full)` — so
     /// the byte range and text are derived from one consistent snapshot.
     /// Read-only.
@@ -147,9 +102,9 @@ impl App {
                 "path": serde_json::Value::Null,
             })));
         };
-        // Materialize the buffer text from the agent's own view (op-log
+        // Materialize the buffer text from the agent's own view (layered-doc
         // replica) so the slice matches what `get_note` would return.
-        // Fall back to on-disk bytes when there is no op-log doc yet.
+        // Fall back to on-disk bytes when there is no layered-doc doc yet.
         let content = match self.agent_view_content(&path)? {
             Some((text, _)) => text,
             None => self

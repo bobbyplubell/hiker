@@ -1,7 +1,7 @@
 //! Cluster-tree graph view (`cluster-editor-graph-view`). Renders a cluster
 //! tree (radial / vertical / horizontal / force-directed) through the shared
 //! `hiker_graph_view` engine. This panel is the cluster-specific
-//! [`graph_view::Source`] adapter: it maps `EditableNode` rows to colored,
+//! [`graph_view::source::Source`] adapter: it maps `EditableNode` rows to colored,
 //! sized nodes (color-by-policy, blended toward grey by summary staleness,
 //! sized by member count), owns the policy-color legend, and resolves leaf
 //! note bodies for the hover preview.
@@ -15,9 +15,9 @@ use std::collections::HashMap;
 use eframe::egui;
 
 use crate::state::AppState;
-use hiker_graph_view::graph_view::{
-    self, policy_legend, LayoutConfig, NodeDescriptor, NodeShape, Palette, Source, Style,
-};
+use hiker_graph_view::graph_view;
+use hiker_graph_view::graph_view::source::{LayoutConfig, NodeDescriptor, NodeShape, Source};
+use hiker_graph_view::graph_view::styling::{policy_legend, Palette, Style};
 use hiker_core::trees::types::{EditableNode, NodeKind, NodePolicy};
 use hiker_core::vault::Vault;
 use hiker_graph::{LayoutKind, LayoutTree};
@@ -30,11 +30,20 @@ const CLUSTER_CFG: LayoutConfig = LayoutConfig {
 };
 
 /// Per-tree panel state: the shared render engine + the tree's index data +
-/// the cluster-specific "Leaves" toggle.
+/// the cluster-specific "Leaves" toggle + the Ctrl+F find-popup state.
 pub struct ClusterView {
     engine: graph_view::State,
     data: ClusterData,
     show_leaves: bool,
+    /// "Find / jump to note" popup (Ctrl+F) — sibling parity with the vault
+    /// and code graphs (`graph_find.rs`).
+    find: crate::widgets::autocomplete_picker::PickerState,
+    /// Latched right-click menu: the right-clicked node's id + the pointer
+    /// position the popup opens at (the engine owns its pane response, so the
+    /// menu is hosted in a popup instead of `Response::context_menu`).
+    /// Right-click is a menu, never a direct action (`interaction.md`
+    /// [rightclick-menu-always]).
+    node_menu: Option<(String, egui::Pos2)>,
 }
 
 /// Stable node index for a tree shape. `ids[i]` ↔ position `i`; rebuilt when
@@ -53,6 +62,8 @@ impl ClusterView {
             engine: graph_view::State::new(Style::policy(), LayoutKind::Radial),
             data: ClusterData::default(),
             show_leaves: true,
+            find: Default::default(),
+            node_menu: None,
         }
     }
 }
@@ -165,6 +176,7 @@ pub fn show_with_nodes(
                 engine,
                 data,
                 show_leaves,
+                ..
             } = view;
             let source = ClusterSource::new(nodes, data, vault.as_ref(), *show_leaves, clickable_leaves);
             engine.recompute_layout(&source, CLUSTER_CFG);
@@ -218,13 +230,50 @@ pub fn show_with_nodes(
         relayout_cluster(app, tree_id, nodes, clickable_leaves);
     }
 
+    // Ctrl+F opens the "Find / jump to note" popup — sibling parity with the
+    // vault/code graphs (interaction.md [keyboard-esc-ladder]). Only where a
+    // leaf click opens (a pick navigates exactly like a click), so the
+    // review preview's non-clickable leaves don't get a dead popup.
+    if clickable_leaves
+        && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F))
+        && let Some(view) = app.panels.cluster_graph.get_mut(tree_id)
+    {
+        view.find.open();
+    }
+
     // Canvas (reserve a line at the bottom for the count summary).
     let clicked = render_canvas(ui, app, tree_id, nodes, clickable_leaves);
-    if let Some(path) = clicked {
+    node_menu_ui(ui, app, tree_id, nodes);
+    // A find-popup pick opens the chosen leaf's note exactly like a node
+    // click (same sticky-open routing).
+    let jumped = find_popup(ui, app, tree_id, nodes);
+    if let Some(path) = clicked.or(jumped) {
         crate::editor_pane::open_file(app, &path, /*sticky=*/ true);
     }
 
     summary_label(ui, nodes);
+}
+
+/// Drive one frame of the "Find / jump to note" popup over the tree's leaf
+/// note paths (the clickable nodes). Returns the picked rel-path for the
+/// caller to open — the same routing as a leaf click.
+fn find_popup(
+    ui: &mut egui::Ui,
+    app: &mut AppState,
+    tree_id: &str,
+    nodes: &[EditableNode],
+) -> Option<String> {
+    use crate::widgets::autocomplete_picker::{self, PickerOutcome};
+    let view = app.panels.cluster_graph.get_mut(tree_id)?;
+    if !view.find.is_open() {
+        return None;
+    }
+    let paths: Vec<String> = nodes.iter().filter_map(|n| n.note_path.clone()).collect();
+    let source = crate::panels::graph_find::VaultNodeFindSource::new(&paths);
+    match autocomplete_picker::show(ui, &mut view.find, &source) {
+        PickerOutcome::Selected(item) => Some(item.insert.to_string()),
+        PickerOutcome::Cancelled | PickerOutcome::Open => None,
+    }
 }
 
 /// Recompute positions in place after a layout-kind change.
@@ -237,6 +286,7 @@ fn relayout_cluster(app: &mut AppState, tree_id: &str, nodes: &[EditableNode], c
         engine,
         data,
         show_leaves,
+        ..
     } = view;
     let source = ClusterSource::new(nodes, data, vault.as_ref(), *show_leaves, clickable);
     engine.recompute_layout(&source, CLUSTER_CFG);
@@ -257,15 +307,84 @@ fn render_canvas(
         engine,
         data,
         show_leaves,
+        node_menu,
+        ..
     } = view;
     let source = ClusterSource::new(nodes, data, vault.as_ref(), *show_leaves, clickable);
     let size = egui::vec2(ui.available_width(), (ui.available_height() - 24.0).max(50.0));
-    ui.allocate_ui(size, |ui| {
-        engine.ui(ui, &source, |p: &egui::Painter, r: egui::Rect, t: &str, b: &str, a: egui::Pos2| {
-            crate::panels::graph::paint_preview_card(p, r, t, b, a);
+    let clicked = ui
+        .allocate_ui(size, |ui| {
+            engine.ui(ui, &source, |p: &egui::Painter, r: egui::Rect, t: &str, b: &str, a: egui::Pos2| {
+                crate::panels::graph::paint_preview_card(p, r, t, b, a);
+            })
         })
+        .inner;
+    // Right-click a node → latch its MENU (never a direct action, per
+    // `interaction.md` [rightclick-menu-always]); `node_menu_ui` renders it
+    // and applies the picked verb. Index-keyed (not `click_path`-keyed) so
+    // cluster nodes — which have no click path — get a menu too. Gated to the
+    // clickable-leaves entry point like the find popup: the review preview's
+    // leaf ids aren't necessarily resolvable, so it gets no dead menu.
+    if clickable
+        && let Some(idx) = engine.take_secondary_click_node()
+        && let Some(id) = data.ids.get(idx)
+    {
+        let pos = ui.ctx().pointer_latest_pos().unwrap_or_else(|| ui.min_rect().center());
+        *node_menu = Some((id.clone(), pos));
+    }
+    clicked
+}
+
+/// Build the right-click menu for a cluster-graph node (`interaction.md`
+/// [rightclick-menu-always]). A leaf is a note ref, so it gets the shared
+/// note-item base (Open · Reveal in file tree · Open in graph · Copy path ·
+/// Properties). A
+/// cluster node maps to frontmatter rows of the tree's own doc — and opening
+/// that doc routes straight back to this graph view (`cluster-tree-open-routing`)
+/// — so there is no openable note behind it; its menu is the minimal Copy name.
+fn build_node_menu(
+    node: &EditableNode,
+) -> egui_workbench::menu::Menu<crate::item_menu::ItemAction> {
+    use crate::item_menu::{note_item_base, BaseOpts};
+    if let Some(path) = node.note_path.as_deref() {
+        return note_item_base(path, BaseOpts { reveal: true }, |a| a);
+    }
+    let name = node.name.clone();
+    egui_workbench::menu::Menu::new().custom(move |ui| {
+        if ui.button("Copy name").clicked() {
+            ui.ctx().copy_text(name.clone());
+            ui.close();
+        }
+        None
     })
-    .inner
+}
+
+/// Render the latched node context menu and apply the picked verb (leaf base
+/// verbs dispatch through the shared `apply_item_action`; the cluster node's
+/// Copy name copies at render time and yields no action).
+fn node_menu_ui(ui: &mut egui::Ui, app: &mut AppState, tree_id: &str, nodes: &[EditableNode]) {
+    use crate::item_menu;
+    // Render under a short view borrow, then apply with `app` free.
+    let picked = {
+        let Some(view) = app.panels.cluster_graph.get_mut(tree_id) else { return };
+        let Some((node_id, _)) = view.node_menu.clone() else { return };
+        let Some(node) = nodes.iter().find(|n| n.id == node_id) else {
+            // The node vanished under the latch (re-cluster); drop the menu.
+            view.node_menu = None;
+            return;
+        };
+        let path = node.note_path.clone();
+        item_menu::latched_menu_popup(
+            ui,
+            egui::Id::new(("cluster-graph-node-menu", tree_id)),
+            &mut view.node_menu,
+            build_node_menu(node),
+        )
+        .zip(path)
+    };
+    if let Some((action, path)) = picked {
+        item_menu::apply_item_action(app, action, &path);
+    }
 }
 
 /// Cheap shape fingerprint over the `(id, parent)` edges. Changes on
@@ -376,8 +495,11 @@ impl Source for ClusterSource<'_> {
                 fill,
                 resting_stroke: egui::Stroke::NONE,
                 hover_stroke: egui::Stroke::new(1.5, egui::Color32::WHITE),
+                badge: None,
+                bug_badge: None,
                 label: is_cluster.then(|| n.name.clone()),
                 label_min_zoom: 0.55,
+                label_scale: 1.0,
                 click_path: if self.clickable_leaves {
                     n.note_path.clone()
                 } else {
@@ -538,4 +660,58 @@ fn blend(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
         lerp(a.b(), b.b()),
         a.a(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use egui_workbench::menu::Entry;
+    use hiker_core::trees::types::{EditableNode, NodeKind};
+
+    use super::build_node_menu;
+
+    fn node(kind: NodeKind, note_path: Option<&str>) -> EditableNode {
+        EditableNode {
+            id: "n1".to_string(),
+            parent: None,
+            kind,
+            note_path: note_path.map(str::to_string),
+            name: "Cluster name".to_string(),
+            summary: String::new(),
+            user_edited_name: false,
+            user_edited_summary: false,
+            policy: None,
+            centroid: None,
+            confidence: 1.0,
+            summary_membership_churn: 0,
+        }
+    }
+
+    /// Menu composition: a leaf is a note ref and gets the full shared
+    /// note-item base; a cluster node has no openable note behind it (its doc
+    /// routes back to this graph view) so it gets the minimal Copy-name menu.
+    #[test]
+    fn leaf_gets_note_base_and_cluster_gets_copy_name() {
+        let leaf = build_node_menu(&node(NodeKind::Leaf, Some("notes/a.md")));
+        let sections = leaf.sections();
+        assert_eq!(sections.len(), 1, "base verbs in one section");
+        assert_eq!(sections[0].len(), 5, "Open · Reveal · Open in graph · Copy path · Properties");
+        let labels: Vec<&str> = sections[0]
+            .iter()
+            .map(|e| match e {
+                Entry::Action { label, .. } => label.as_ref(),
+                Entry::Custom(_) => "(custom)",
+                _ => panic!("unexpected entry kind"),
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            ["Open", "Reveal in file tree", "Open in graph", "(custom)", "Properties"]
+        );
+
+        let cluster = build_node_menu(&node(NodeKind::Cluster, None));
+        let sections = cluster.sections();
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].len(), 1, "Copy name only");
+        assert!(matches!(sections[0][0], Entry::Custom(_)), "Copy name is a Custom entry");
+    }
 }

@@ -39,27 +39,23 @@ pub struct HikerState {
     /// `set_setting` command swaps the contents in place so flips in
     /// the settings UI apply without a vault restart.
     pub tools: Arc<std::sync::RwLock<hiker_core::config::sections::McpToolsConfig>>,
-    /// The vault's op log, when open. Agent write tools route their edits
+    /// The vault's layered doc, when open. Agent write tools route their edits
     /// into the pending queue here via `core::ops::op_writes`
     /// (`op-log-ops-producer-helpers`). Review-mode writes stage a pending
     /// op the user accepts/rejects in the hiker UI.
     ///
     /// status: staging-review-pending-response
-    pub oplog: Option<Arc<hiker_core::oplog::OpLog>>,
+    pub layered: Option<Arc<hiker_core::editing::LayeredDoc>>,
     pub audit: Arc<Log>,
     /// Shared task queue. When `[mcp] enabled`, the `task_*` tools are
     /// advertised; the queue itself lives in the UI layer and is plumbed
-    /// in here so all surfaces (basic chat agent, external rmcp clients)
-    /// see one in-memory queue.
+    /// in here so all surfaces (external rmcp clients, direct worker) see
+    /// one in-memory queue.
     pub tasks: Arc<TaskQueue>,
     /// Default lease seconds when a checkout doesn't specify, capped by
     /// `max_lease_secs`.
     pub default_lease_secs: u64,
     pub max_lease_secs: u64,
-    /// `[tasks] expose_to_chat_agent` — when false, the in-process
-    /// dispatcher silently omits `task_*` from `dispatch_tool`'s allowed
-    /// set so the chat agent can't pull queue work.
-    pub expose_tasks_to_chat_agent: bool,
     /// `[llm] enabled` — when false, the queue is meaningless (the
     /// direct worker can't run, and the queue's only purpose is LLM
     /// work), so the `task_*` tools are guarded with `1004 disabled`
@@ -77,33 +73,46 @@ pub struct HikerState {
     /// by the host's per-frame `refresh_ui_context_snapshot`. Read-only
     /// from the MCP handler's side; the host is the sole writer.
     pub ui_context: crate::ui_context::Shared,
+    /// status: mcp-registry-tools
+    /// The compiled kind registry. Each registered kind generates a typed
+    /// `create_<kind>` / `update_<kind>` write pair, built into the tool
+    /// router at handler construction so the pair advertises (and
+    /// regenerates) with the registry the session loaded.
+    pub kinds: Arc<hiker_core::kinds::Registry>,
 }
 
 #[derive(Clone)]
 pub struct App {
     state: Arc<HikerState>,
-    // Read by the `#[tool_handler]` macro expansion via `self.tool_router`;
-    // dead-code lint can't see the macro-generated reference.
-    #[allow(dead_code)]
+    // Read by the `#[tool_handler(router = ...)]` expansion below: the
+    // instance router is the static `#[tool_router]` surface plus the
+    // registry-generated kind tools merged in at construction.
     tool_router: ToolRouter<Self>,
 }
 
 impl App {
     pub fn new(state: Arc<HikerState>) -> Self {
-        Self {
-            state,
-            tool_router: Self::tool_router(),
+        // status: mcp-registry-tools
+        // Merge the registry-generated kind tools into the static router so
+        // they advertise through the same `tools/list` as every sibling.
+        let mut tool_router = Self::tool_router();
+        for route in dispatch::kinds::kind_tool_routes(&state.kinds) {
+            tool_router.add_route(route);
         }
+        Self { state, tool_router }
     }
 }
 
-#[tool_handler]
+// `router = self.tool_router` (vs. the default `Self::tool_router()`) so
+// dispatch and tools/list both read the per-instance router carrying the
+// generated kind tools. status: mcp-registry-tools
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for App {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("hiker", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Hiker MCP server. Read: search_notes, get_note, related_notes. \
+                "Hiker MCP server. Read: search_notes, get_note, related_notes, query. \
                  Write: write_note, edit_note, set_frontmatter, apply_tag, remove_tag. \
                  Review mode: when the server is configured with review_required = true, write tools STAGE a \
                  proposal instead of writing to disk — the response carries `status: \"staged\"` and a \

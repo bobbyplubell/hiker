@@ -1,16 +1,16 @@
 //! Canvas tab: a per-doc spatial editor over a `.canvas` JSON Canvas document.
 //!
 //! A `.canvas` file is a first-class vault document — it opens in its own tab,
-//! its edits ride the op-log exactly like a note, and it syncs across devices.
-//! This panel is the *spine*: it loads the file's JSON text through the op-log
+//! its edits ride the layered editing model exactly like a note, and it syncs across devices.
+//! This panel is the *spine*: it loads the file's JSON text through the layered-doc
 //! materialized buffer, parses it into a [`hiker_canvas::model::Canvas`], hosts
 //! the [`canvas_view::CanvasView`] editor widget, and persists every edit back
-//! through the same op-log user-save path boards use (`op_writes::user_save`),
+//! through the same layered-doc user-save path boards use (`op_writes::user_save`),
 //! so canvas edits are versioned, undoable, and mergeable like note bytes.
 //!
 //! A "View as: Canvas / JSON" toggle flips the pane between the spatial editor
 //! and the standard editor widget over the raw `.canvas` text (JSON syntax via
-//! the existing `tree-sitter-json`), both over the one op-log document —
+//! the existing `tree-sitter-json`), both over the one layered-doc document —
 //! mirroring the board view's `board-view-toggle`.
 //!
 //! ## Content seam
@@ -24,7 +24,7 @@
 //! heavyweight per-node state lives in a UI-thread-local store keyed by tab +
 //! node id, dropped on tab close via [`content::forget`].
 //!
-//! Implements: canvas-tab, canvas-view-toggle, canvas-oplog-binding,
+//! Implements: canvas-tab, canvas-view-toggle, canvas-layered-binding,
 //! canvas-nav-stack. The file-tree glyph / routing lives in
 //! `crate::files::sidebar`; the create flow in `crate::sidebar`.
 //
@@ -49,7 +49,7 @@ pub(crate) mod render;
 pub mod thumbnail;
 
 /// Which render the canvas pane shows. The toggle is a render choice over the
-/// one underlying op-log document, not two tabs — switching to `Json` hosts the
+/// one underlying layered-doc document, not two tabs — switching to `Json` hosts the
 /// live editor widget over the `.canvas` text inline (mirroring the board
 /// view's Markdown branch), so spatial edits and raw-text edits ride the same
 /// document. status: canvas-view-toggle
@@ -61,7 +61,7 @@ pub enum ViewMode {
 }
 
 /// Per-canvas-tab local state: the parsed document, the editor widget, the
-/// view-as mode, and the text last parsed (so the reverse op-log binding only
+/// view-as mode, and the text last parsed (so the reverse layered-doc binding only
 /// re-parses when the materialized JSON actually changed).
 pub struct Pane {
     /// The live parsed canvas. `None` until first load (or after a parse
@@ -77,7 +77,7 @@ pub struct Pane {
     /// The reverse binding compares the live buffer text against this each
     /// frame; a difference (a remote sync edit, an external file change, or our
     /// own JSON-view edit) triggers a re-parse. Selection + camera survive by
-    /// node id since the adapter keys on ids. status: canvas-oplog-binding
+    /// node id since the adapter keys on ids. status: canvas-layered-binding
     last_parsed_text: String,
     /// A clear parse-error message when the `.canvas` text isn't valid JSON
     /// Canvas, so the pane shows an error state (with a JSON escape hatch)
@@ -117,38 +117,12 @@ pub struct Pane {
     /// (and cleared) by `apply_pending_focus`, the same posture as `fit_pending`.
     /// status: canvas-appears-in
     focus_note_pending: Option<String>,
-    /// The Poincaré OVERVIEW graph-view state: a simplified graph of the canvas
-    /// (each card → a coloured node at its canvas position, canvas edges → graph
-    /// edges) rendered as a locked Poincaré disk. Drives the corner minimap and
-    /// the expand swap; navigating it + swapping back re-centers the canvas on the
-    /// focused node. View state only — never serialized. status: canvas-minimap
-    overview: hiker_graph_view::graph_view::State,
-    /// Whether the corner overview is shown. status: canvas-minimap
-    overview_enabled: bool,
-    /// Which pane corner the overview occupies. status: canvas-minimap
-    overview_corner: overview_layout::Corner,
-    /// Overview side as a fraction of the shorter viewport dimension
-    /// (`0.12..=0.5`). status: canvas-minimap
-    overview_size: f32,
-    /// The swap state: when `true` the overview promotes to fill the pane (the
-    /// canvas demotes); a swap back re-centers the canvas on the overview's
-    /// current focus. status: canvas-minimap
-    overview_expanded: bool,
-}
-
-/// Panel-owned overview placement config (the panel composes the corner inset
-/// itself rather than depending on canvas-view's old minimap fields). status: canvas-minimap
-pub mod overview_layout {
-    /// Which pane corner the overview is anchored to.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-    pub enum Corner {
-        TopLeft,
-        TopRight,
-        BottomLeft,
-        /// The default — bottom-right, out of the toolbar's way.
-        #[default]
-        BottomRight,
-    }
+    /// The Poincaré OVERVIEW minimap: a corner disk-of-dots of the canvas (each
+    /// card → a node at its canvas position, canvas edges → graph edges) with a
+    /// viewport-location indicator + click-to-expand swap, owned by the graph-view
+    /// engine. Navigating it + swapping back re-centers the canvas on the focused
+    /// node. View state only — never serialized. status: canvas-minimap
+    overview: hiker_graph_view::graph_view::minimap::Minimap,
 }
 
 impl Default for Pane {
@@ -166,33 +140,9 @@ impl Default for Pane {
             view_restored: false,
             followed: None,
             focus_note_pending: None,
-            overview: new_overview_state(),
-            overview_enabled: false,
-            overview_corner: overview_layout::Corner::default(),
-            overview_size: 0.26,
-            overview_expanded: false,
+            overview: hiker_graph_view::graph_view::minimap::Minimap::new(),
         }
     }
-}
-
-/// A fresh overview graph-view state configured for the canvas minimap: the
-/// locked Poincaré projection over a flat (one-color-fallback) style. The dot
-/// colors come per-node from the [`overview::CanvasGraphSource`], not the style,
-/// and positions are set directly each frame (never force-laid-out). status: canvas-minimap
-fn new_overview_state() -> hiker_graph_view::graph_view::State {
-    use hiker_graph::LayoutKind;
-    use hiker_graph_view::graph_view::{State, Style};
-    use hiker_projection::ProjectionKind;
-    let mut state = State::new(Style::flat(), LayoutKind::ForceDirected);
-    state.projection.kind = ProjectionKind::Poincare;
-    state.projection.strength = 1.0;
-    // The disk is locked to the pane — no view framing to do; never reset `nav`.
-    state.needs_fit = false;
-    // A minimap reads as bare dots — labels off so a large canvas's hundreds of
-    // titles never overlap into a text hairball in the corner.
-    state.toggles.show_labels = false;
-    state.toggles.show_preview = false;
-    state
 }
 
 /// Find-or-focus a canvas tab for `path`, opening one if none exists, and
@@ -345,9 +295,9 @@ pub fn show(
     path: &str,
     rt: &std::sync::Arc<tokio::runtime::Runtime>,
 ) {
-    // Ensure the op-log buffer is loaded so both views share the one document
+    // Ensure the layered-doc buffer is loaded so both views share the one document
     // (the JSON view hosts the editor widget over it; the Canvas view reads its
-    // live text for the reverse binding). status: canvas-oplog-binding
+    // live text for the reverse binding). status: canvas-layered-binding
     if !crate::editor_pane::ensure_vault_buffer_loaded(app, path) {
         ui.colored_label(render::error_color(), "Couldn't load this .canvas file.");
         return;
@@ -373,7 +323,7 @@ pub fn show(
         ViewMode::Canvas => render::canvas_body(ui, app, tab_id, path),
         ViewMode::Json => {
             // Host the live editor widget over the `.canvas` text inline, in
-            // this same tab — a render choice over the one op-log document, not
+            // this same tab — a render choice over the one layered-doc document, not
             // a separate buffer tab. JSON highlighting comes from the existing
             // `tree-sitter-json` by extension. status: canvas-view-toggle
             crate::panels::buffer::show(ui, app, path, rt);
@@ -383,11 +333,11 @@ pub fn show(
 
 impl Pane {
     /// Re-read the buffer's live text and re-parse into `canvas` when it differs
-    /// from `last_parsed_text`. The forward (edit → op-log) direction lives in
+    /// from `last_parsed_text`. The forward (edit → layered doc) direction lives in
     /// `render::canvas_body`; this is the reverse direction — a remote sync
     /// edit, an external file change, or our own JSON-view edit advancing the
     /// materialized text. Selection + camera survive because the adapter keys on
-    /// node ids, not text offsets. status: canvas-oplog-binding
+    /// node ids, not text offsets. status: canvas-layered-binding
     fn sync_from_text(&mut self, text: &str) {
         if self.canvas.is_some() && text == self.last_parsed_text {
             return;
@@ -455,8 +405,8 @@ pub fn list_canvases(vault: &hiker_core::vault::Vault) -> Vec<(String, String)> 
 /// uniquely-id'd pointer at a non-overlapping cascade position.
 ///
 /// Routing follows the dirty/save model the in-editor binding now uses
-/// (`canvas-oplog-binding`):
-/// - **Open canvas** → the edit is mirrored into the op-log `working` layer
+/// (`canvas-layered-binding`):
+/// - **Open canvas** → the edit is mirrored into the layered-doc `working` layer
 ///   (the buffer goes DIRTY) exactly like a spatial edit, and the user commits
 ///   it with Ctrl+S. The reverse binding re-parses the new working text next
 ///   frame, so the node appears on the open canvas immediately. We don't touch
@@ -486,7 +436,7 @@ pub fn add_file_node(app: &mut AppState, canvas_rel: &str, vault_rel: &str) {
     let node = build_file_pointer(&canvas, vault_rel);
     canvas.nodes.push(node);
     let json = canvas.to_canonical_json();
-    let log = &app.vault_session.services.oplog;
+    let log = &app.vault_session.services.layered;
     if is_open {
         // Open canvas: route through `working` so it's a dirty edit the user
         // saves with Ctrl+S, consistent with `render::persist_canvas`.
@@ -515,7 +465,7 @@ pub fn add_file_node(app: &mut AppState, canvas_rel: &str, vault_rel: &str) {
     }
     // Closed canvas: no dirty-buffer surface, so commit straight to disk.
     let result = hiker_core::ops::op_writes::user_save(
-        &app.vault_session.services.oplog,
+        &app.vault_session.services.layered,
         &app.vault_session.vault,
         canvas_rel,
         &json,

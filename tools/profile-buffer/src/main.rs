@@ -60,6 +60,13 @@ use hiker_app::panels::buffer::widgets::disk_cache::DiagramCacheCtx;
 use crate::stats::Stats;
 use crate::synth::DiagramKind;
 
+/// An always-empty per-table overflow map for the profiling rebuild (no overflow
+/// toggle / in-place cell edit here), borrowed `'static` so it isn't allocated
+/// per frame.
+static EMPTY_TABLE_OVERFLOW: std::sync::LazyLock<
+    hiker_app::panels::buffer::widgets::tables::TableViewMap,
+> = std::sync::LazyLock::new(hiker_app::panels::buffer::widgets::tables::TableViewMap::new);
+
 /// Parsed command-line configuration.
 struct Args {
     levels: Vec<usize>,
@@ -170,12 +177,16 @@ fn timed_rebuild(lvl: &mut Level, ctx: &egui::Context, screen: egui::Rect) -> st
     let mut rebuild = |ed: &Editor, vw: &mut ViewState| {
         let mut deco_ctx = DecoRebuildCtx {
             cache: &mut *cache,
+            conflict: None,
             folds,
             loaded_text,
+            // No git dirty-diff gutter in the profiling harness. status: git-dirty-diff-gutter
+            git_head_text: None,
             theme: Some(theme),
             live_preview: true,
             render_widgets: true,
             is_markdown: true,
+            code_language: None,
             dpr: 1.0,
             font_px,
             chunk_boundaries: false,
@@ -185,6 +196,9 @@ fn timed_rebuild(lvl: &mut Level, ctx: &egui::Context, screen: egui::Rect) -> st
             resolve_title: None,
             diagram_cache: Some(diagram_cache.clone()),
             chart_resolver: None,
+            image_resolver: None,
+            table_overflow: &EMPTY_TABLE_OVERFLOW,
+            editing_table: None,
         };
         let t0 = Instant::now();
         rebuild_editor_layers(ed, vw, &mut deco_ctx);

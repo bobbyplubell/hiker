@@ -1,5 +1,5 @@
 //! Per-file pill rendered above the editor widget when a buffer renders a
-//! pending-view off the op log. Status: patch-review-file-pill.
+//! pending-view off the layered doc. Status: patch-review-file-pill.
 //!
 //! Drives the bulk verbs (Accept all / Reject all) over the document's
 //! pending ops, a Next-hunk navigator that scrolls the editor to the next
@@ -15,7 +15,7 @@ use super::diff_overlay::HunkInfo;
 use hiker_theme as theme;
 
 /// Outcome of a pill-row interaction. Resolved by the buffer panel after
-/// the frame is drawn so accept/reject can call into the op log with the
+/// the frame is drawn so accept/reject can call into the layered doc with the
 /// buffer panel's `&mut` access to AppState.
 #[derive(Clone, Debug, Default)]
 pub struct PillAction {
@@ -30,7 +30,7 @@ pub struct PillAction {
 }
 
 /// Drift + per-session breakdown the pill renders alongside the hunk count.
-/// Computed by the buffer panel off the op log each frame.
+/// Computed by the buffer panel off the layered doc each frame.
 #[derive(Clone, Debug, Default)]
 pub struct PillMeta {
     /// Pending ops in the active session that have drifted — feeds the

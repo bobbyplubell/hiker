@@ -6,16 +6,17 @@ cursor isn't on it, Hiker replaces the source with the rendered picture. Move th
 cursor back into the block (or select it) and the source returns for editing,
 with a live preview floating alongside.
 
-Three families are supported, all rendered by Hiker's own pure-Rust engines (no
-browser, no JavaScript, no network):
+These blocks render in place, all by Hiker's own pure-Rust engines (no browser,
+no JavaScript, no network):
 
 | Widget | You write | Renders as |
 |---|---|---|
 | **Math** | `$…$` (inline) or `$$…$$` (display) | Typeset LaTeX |
 | **Mermaid** | a ` ```mermaid ` fenced block | A diagram (flowcharts, sequence, pie, …) |
 | **WaveDrom** | a ` ```wavedrom ` fenced block | A digital timing waveform or register layout |
+| **Tables** | a `\| … \|` pipe table | A grid whose cells can hold markdown, math, diagrams, or images |
 
-How the reveal works, for all three:
+How the reveal works, for all of them:
 
 - **Cursor away** → the source is hidden and the rendered widget is shown.
 - **Cursor inside** (or a selection touching it) → the source reappears for
@@ -611,6 +612,66 @@ inverted-output forms `~&` (NAND), `~|` (NOR), `~^` (XNOR).
   ]
 ]}
 ```
+
+---
+
+## Tables
+
+Standard Markdown pipe tables render as a clean grid — but a cell is not limited to
+plain text. It can hold **inline formatting**, and even a whole **rendered block** —
+a formula, a diagram, or an image.
+
+### Inline formatting in cells
+
+Bold, italic, `code`, strikethrough, and links all work inside a cell:
+
+| Style | Example |
+|---|---|
+| Emphasis | **bold** and *italic* |
+| Strikethrough | ~~no longer true~~ |
+| Code | `let x = 1;` |
+| Link | see the [manual index](README.md) |
+
+### Block content in cells
+
+A cell whose entire content is a single math expression, a **one-line** diagram
+fence, or an image renders that block right in the grid. Diagrams use the same
+languages as above, written on one line (a table cell is a single line) — and a
+literal `|` inside a diagram must be escaped as `\|`, since it would otherwise end
+the cell.
+
+| Kind | In a cell | Notes |
+|---|---|---|
+| Math | $$a^2 + b^2 = c^2$$ | inline `$…$` or display `$$…$$` |
+| Mermaid | ```mermaid graph LR; A-->B-->C``` | a small flowchart |
+| WaveDrom | ```wavedrom {"signal":[{"name":"clk","wave":"p..."}]}``` | a timing waveform |
+| Image | ![icon](images/icon.png) | a vault image, scaled to the column |
+
+Columns reserve room for the rendered block and the row grows to fit it; a large
+diagram scales down to its column rather than blowing out the grid.
+
+### Sizing & overflow
+
+Columns auto-size to their content and the table stretches to the full page width
+before any cell wraps. For a table too wide to fit — many columns, or a wide
+diagram — **right-click the table → Scrollable**: it lays out at natural width and
+scrolls horizontally *inside the table*, so the page itself never scrolls sideways.
+Right-click → Fit returns to wrapping.
+
+### Editing a cell in place
+
+By default, moving the cursor into a table reveals its raw `| … |` source, like any
+other widget. But you can also edit one cell without disturbing the rest:
+
+- **Double-click a math/diagram/image cell** — or **right-click → Edit diagram /
+  Edit cell** — to open a small editor on just that cell. The rest of the table
+  stays rendered: the whole table is framed and the active cell is outlined.
+- A **live preview** shows the formula or diagram updating as you type.
+- **Tab** / **Shift-Tab** move to the next / previous cell; **Esc** or a click
+  outside commits the change and re-renders the cell.
+
+Plain text cells still reveal-to-source on a click; the in-place editor is the
+default for block cells, and is available on any cell from the right-click menu.
 
 ---
 

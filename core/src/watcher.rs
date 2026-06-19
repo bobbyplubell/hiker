@@ -9,7 +9,7 @@
 //! like `core::vault::move_note` and `create_note` register a short-lived TTL
 //! on a vault-relative path; events for that path are dropped from the
 //! normalized stream until the TTL expires. See `watcher-suppress-self-writes`
-//! in docs/status.md.
+//! in docs/watcher.md.
 
 use std::collections::HashMap;
 use std::fs;
@@ -131,6 +131,16 @@ impl Watcher {
         let mut map = self.suppressed.lock().expect("suppress lock poisoned");
         map.insert(rel_path.into(), Instant::now());
         evict_expired(&mut map);
+    }
+
+    /// Test-only introspection: whether `rel_path` currently has a live
+    /// (non-expired) suppression entry. Lets self-write callers assert they
+    /// suppressed the watcher around their own write.
+    #[cfg(test)]
+    pub(crate) fn is_suppressed(&self, rel_path: &str) -> bool {
+        let mut map = self.suppressed.lock().expect("suppress lock poisoned");
+        evict_expired(&mut map);
+        map.contains_key(rel_path)
     }
 }
 
@@ -298,7 +308,7 @@ impl<'a> WatcherCtx<'a> {
             EventKind::Create(_) => {
                 let p = paths.first()?;
                 let rel = to_rel(vault_root, p)?;
-                (!is_ignored(&rel)).then_some(FileEvent::Created { path: rel })
+                (!event_ignored(vault_root, &rel, p)).then_some(FileEvent::Created { path: rel })
             }
             EventKind::Modify(notify::event::ModifyKind::Name(mode)) => {
                 // notify-debouncer-full pairs From+To into a single
@@ -310,7 +320,9 @@ impl<'a> WatcherCtx<'a> {
                     RenameMode::Both if paths.len() >= 2 => {
                         let from = to_rel(vault_root, &paths[0])?;
                         let to = to_rel(vault_root, &paths[1])?;
-                        if is_ignored(&from) && is_ignored(&to) {
+                        if event_ignored(vault_root, &from, &paths[0])
+                            && event_ignored(vault_root, &to, &paths[1])
+                        {
                             return None;
                         }
                         Some(FileEvent::Renamed { from, to })
@@ -318,12 +330,12 @@ impl<'a> WatcherCtx<'a> {
                     RenameMode::From => {
                         let p = paths.first()?;
                         let rel = to_rel(vault_root, p)?;
-                        (!is_ignored(&rel)).then_some(FileEvent::Deleted { path: rel })
+                        (!event_ignored(vault_root, &rel, p)).then_some(FileEvent::Deleted { path: rel })
                     }
                     RenameMode::To => {
                         let p = paths.first()?;
                         let rel = to_rel(vault_root, p)?;
-                        (!is_ignored(&rel)).then_some(FileEvent::Created { path: rel })
+                        (!event_ignored(vault_root, &rel, p)).then_some(FileEvent::Created { path: rel })
                     }
                     // RenameMode::Any / Other / Both-without-2-paths:
                     // best-effort. The two explicit cases above
@@ -358,16 +370,37 @@ impl<'a> WatcherCtx<'a> {
         if paths.len() >= 2 {
             let from = to_rel(vault_root, &paths[0])?;
             let to = to_rel(vault_root, &paths[1])?;
-            if is_ignored(&from) && is_ignored(&to) {
+            if event_ignored(vault_root, &from, &paths[0])
+                && event_ignored(vault_root, &to, &paths[1])
+            {
                 return None;
             }
             Some(FileEvent::Renamed { from, to })
         } else {
             let p = paths.first()?;
             let rel = to_rel(vault_root, p)?;
-            (!is_ignored(&rel)).then_some(FileEvent::Modified { path: rel })
+            (!event_ignored(vault_root, &rel, p)).then_some(FileEvent::Modified { path: rel })
         }
     }
+}
+
+/// Event-path ignore check: the composed matcher (hard-coded list +
+/// `.gitignore` + `.hikerignore` + config `ignored_paths`), so a live edit
+/// to a gitignored / hikerignored non-note file is dropped exactly as the
+/// indexer full-scan, the watch-registration walk, and the layered-doc seed walk
+/// now drop it — one ignore policy across every seam.
+///
+/// `is_dir` is read from `abs` so a directory-only ignore pattern (gitignore
+/// `build/`) matches the directory itself on a create / rename-to event;
+/// without it a rename/delete OF the ignored directory would leak through.
+/// On a delete / rename-from the path may already be gone, so the stat
+/// fails and we fall back to `false` — the matcher's
+/// `matched_path_or_any_parents` still catches a file beneath an ignored
+/// directory by walking its parents. Markdown notes stay protected by the
+/// matcher's note-protection invariant.
+fn event_ignored(vault_root: &Path, rel: &str, abs: &Path) -> bool {
+    let is_dir = std::fs::metadata(abs).map(|m| m.is_dir()).unwrap_or(false);
+    crate::ignore::is_ignored_in(vault_root, rel, is_dir)
 }
 
 fn evict_expired(map: &mut HashMap<String, Instant>) {
@@ -413,7 +446,11 @@ fn should_watch(vault_root: &Path, path: &Path) -> bool {
         return true;
     }
     match to_rel(vault_root, path) {
-        Some(rel) => !is_ignored(&rel),
+        // Consult the composed matcher (hard-coded list + .gitignore +
+        // .hikerignore + config) so gitignored build trees aren't watched
+        // — the same pruning the indexer applies. `is_dir` from the path so
+        // gitignore directory semantics apply (the walk only watches dirs).
+        Some(rel) => !crate::ignore::is_ignored_in(vault_root, &rel, path.is_dir()),
         None => false,
     }
 }
@@ -492,6 +529,36 @@ mod tests {
     use std::time::Instant;
     use tempfile::tempdir;
     use tokio::time::timeout;
+
+    /// A directory-only gitignore pattern (`build/`) must drop a
+    /// rename/delete event for the directory ITSELF, not just files beneath
+    /// it. `event_ignored` reads `is_dir` from the real path so the matcher
+    /// applies the `foo/` directory semantics — passing a hardcoded
+    /// `is_dir=false` would leak the directory's own event through.
+    #[test]
+    fn event_ignored_honors_directory_only_pattern() {
+        let td = tempdir().unwrap();
+        let root = td.path().canonicalize().unwrap();
+        fs::write(root.join(".gitignore"), "build/\n").unwrap();
+        let build = root.join("build");
+        fs::create_dir(&build).unwrap();
+        // Refresh the cached matcher so it picks up this tempdir's
+        // `.gitignore` (the registry is process-global, keyed by root).
+        crate::ignore::register(&root, &[]);
+
+        // The directory itself: ignored, because `event_ignored` stats it
+        // as a dir and the `build/` pattern matches directories.
+        assert!(
+            event_ignored(&root, "build", &build),
+            "directory-only pattern must match the directory itself",
+        );
+        // A file beneath it: ignored via the parent walk regardless.
+        let inner = build.join("out.o");
+        fs::write(&inner, "").unwrap();
+        assert!(event_ignored(&root, "build/out.o", &inner));
+        // A real note outside the pattern stays unignored.
+        assert!(!event_ignored(&root, "note.md", &root.join("note.md")));
+    }
 
     #[test]
     fn ignore_list_covers_documented_paths() {

@@ -605,8 +605,7 @@ fn results_section(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>) {
     let results = st.results.clone();
     let selected = st.selected_row;
     let mut to_open: Option<(String, bool, u32)> = None;
-    let mut reveal: Option<String> = None;
-    let mut props: Option<String> = None;
+    let mut base: Option<(crate::item_menu::ItemAction, String)> = None;
     let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
     if enter_pressed
         && let Some(idx) = selected
@@ -614,15 +613,15 @@ fn results_section(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>) {
     {
         to_open = Some((hit.path.clone(), true, hit.chunk_index));
     }
-    render_groups(ui, &results, selected, &mut to_open, &mut reveal, &mut props);
+    render_groups(ui, &results, selected, &mut to_open, &mut base);
     if let Some((rel, sticky, chunk_index)) = to_open {
         ctx.defer(move |app| open_at_chunk(app, &rel, sticky, chunk_index));
     }
-    if let Some(rel) = reveal {
-        ctx.defer(move |app| reveal_in_files(app, &rel));
-    }
-    if let Some(rel) = props {
-        ctx.defer(move |app| crate::files::sidebar::open_properties(app, &rel));
+    // Every non-Open base verb (Reveal / Open in graph / Properties) shares
+    // the one dispatch path; only Open stays special for its chunk routing.
+    // status: ctxmenu-item-base-apply
+    if let Some((action, rel)) = base {
+        ctx.defer(move |app| crate::item_menu::apply_item_action(app, action, &rel));
     }
     let zim_empty = render_zim_results(ui, ctx);
     if results.is_empty() && zim_empty {
@@ -703,8 +702,7 @@ fn render_groups(
     results: &[DiscoveryHit],
     selected: Option<usize>,
     to_open: &mut Option<(String, bool, u32)>,
-    reveal: &mut Option<String>,
-    props: &mut Option<String>,
+    base: &mut Option<(crate::item_menu::ItemAction, String)>,
 ) {
     let mut group_order: Vec<String> = Vec::new();
     let mut groups: std::collections::HashMap<String, Vec<usize>> =
@@ -739,17 +737,15 @@ fn render_groups(
             CardAction::Open { sticky } => {
                 *to_open = Some((hit.path.clone(), sticky, hit.chunk_index));
             }
-            // The shared base maps onto the same out-params the card has always
-            // dispatched through; Copy-path is the base's own `Custom` entry, so
-            // it never surfaces as a `CardAction` (status: ctxmenu-item-base).
+            // The shared base maps onto the card's out-params: Open keeps its
+            // chunk routing, every other verb rides the shared dispatch;
+            // Copy-path is the base's own `Custom` entry, so it never
+            // surfaces as a `CardAction` (status: ctxmenu-item-base).
             CardAction::Base(crate::item_menu::ItemAction::Open) => {
                 *to_open = Some((hit.path.clone(), false, hit.chunk_index));
             }
-            CardAction::Base(crate::item_menu::ItemAction::RevealInFiles) => {
-                *reveal = Some(hit.path.clone());
-            }
-            CardAction::Base(crate::item_menu::ItemAction::Properties) => {
-                *props = Some(hit.path.clone());
+            CardAction::Base(action) => {
+                *base = Some((action, hit.path.clone()));
             }
         }
         // Indented additional matches.
@@ -763,7 +759,13 @@ fn render_groups(
                     } else {
                         format!("> chunk {}", h.chunk_index)
                     };
-                    let resp = ui.add(egui::Button::selectable(highlighted, label));
+                    let resp = ui
+                        .add(
+                            egui::Button::selectable(highlighted, &label)
+                                .sense(egui::Sense::click_and_drag()),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    crate::widgets::note_row::note_drag_source(ui, &resp, &h.path, &label);
                     if let Some(action) = crate::item_menu::note_item_menu_response(
                         &resp,
                         &h.path,
@@ -773,16 +775,12 @@ fn render_groups(
                             crate::item_menu::ItemAction::Open => {
                                 *to_open = Some((h.path.clone(), false, h.chunk_index));
                             }
-                            crate::item_menu::ItemAction::RevealInFiles => {
-                                *reveal = Some(h.path.clone());
-                            }
-                            crate::item_menu::ItemAction::Properties => {
-                                *props = Some(h.path.clone());
-                            }
+                            other => *base = Some((other, h.path.clone())),
                         }
                     }
                     if resp.clicked() {
-                        let sticky = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
+                        let sticky =
+                            crate::widgets::note_row::open_sticky(ui.input(|i| i.modifiers));
                         *to_open = Some((h.path.clone(), sticky, h.chunk_index));
                     }
                 }
@@ -1047,40 +1045,52 @@ pub enum CardAction {
 /// Render a single result-card row (per `discovery-result-card`). Layout:
 /// title + score on the top line, vault-relative path subtitle below,
 /// optional heading-path breadcrumb, then the matched-chunk excerpt. The
-/// whole card is the click target.
+/// whole card is the click target — and the full note-row grammar applies:
+/// hover wash + pointer signal the open, mod-click opens sticky, the card is
+/// a drag source carrying the vault-relative path (`interaction.md`).
 pub fn result_card(ui: &mut egui::Ui, hit: &DiscoveryHit, allow_context: bool) -> CardAction {
     let mut action = CardAction::None;
-    let frame_resp = egui::Frame::default()
-        .fill(theme::active_bg())
+    // `Frame::begin` so the fill can be decided AFTER the card's response is
+    // known — the shared hover wash paints as the card background, behind the
+    // content, instead of a hand-rolled overlay ([hover-open-signal]).
+    let mut prepared = egui::Frame::default()
         .stroke(egui::Stroke::new(1.0, theme::divider()))
         .corner_radius(egui::CornerRadius::same(4))
         .inner_margin(egui::Margin::symmetric(8, 6))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            card_title_row(ui, hit);
-            // Path subtitle.
+        .begin(ui);
+    {
+        let ui = &mut prepared.content_ui;
+        ui.set_width(ui.available_width());
+        card_title_row(ui, hit);
+        // Path subtitle.
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(&hit.path).small().color(theme::muted()),
+            )
+            .truncate(),
+        );
+        // Heading-path breadcrumb (omitted when none).
+        if let Some(hp) = hit.heading_path.as_deref()
+            && !hp.is_empty()
+        {
             ui.add(
                 egui::Label::new(
-                    egui::RichText::new(&hit.path).small().color(theme::muted()),
+                    egui::RichText::new(hp).small().italics().color(theme::muted()),
                 )
                 .truncate(),
             );
-            // Heading-path breadcrumb (omitted when none).
-            if let Some(hp) = hit.heading_path.as_deref()
-                && !hp.is_empty()
-            {
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(hp).small().italics().color(theme::muted()),
-                    )
-                    .truncate(),
-                );
-            }
-            card_snippet(ui, &hit.snippet);
-        });
-    let resp = frame_resp.response.interact(egui::Sense::click());
+        }
+        card_snippet(ui, &hit.snippet);
+    }
+    let resp = prepared
+        .allocate_space(ui)
+        .interact(egui::Sense::click_and_drag());
+    prepared.frame.fill =
+        theme::open_signal_wash(false, resp.hovered()).unwrap_or(theme::active_bg());
+    prepared.paint(ui);
+    crate::widgets::note_row::note_drag_source(ui, &resp, &hit.path, &hit.title);
     if resp.clicked() {
-        let sticky = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
+        let sticky = crate::widgets::note_row::open_sticky(ui.input(|i| i.modifiers));
         action = CardAction::Open { sticky };
     }
     if resp.hovered() {

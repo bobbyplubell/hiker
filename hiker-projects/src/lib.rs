@@ -1,8 +1,7 @@
 //! hiker-projects — the sourcing/binding layer (`docs/hiker-projects.md`).
 //!
 //! A **project** is a vault note (`hiker.kind: project`) whose frontmatter binds N external
-//! **sources**: a code **repo** (→ `hiker-code`'s SCIP adapter), and later a read-only Jira
-//! mirror or a docs folder. This crate owns *where* a source lives and *how to reach it* — never
+//! **sources**: a code **repo** (→ `hiker-code`'s SCIP adapter), and later a docs folder. This crate owns *where* a source lives and *how to reach it* — never
 //! *what it means* (that's each adapter + the spec-engine graph).
 //!
 //! v1 resolves the **repo** source into a typed descriptor (parse → `repo_id`/index/scope/backend)
@@ -13,9 +12,7 @@
 
 pub mod git;
 pub mod glob;
-mod repo;
-
-pub use repo::{Backend, RepoSource, Scope};
+pub mod repo;
 
 use std::path::{Path, PathBuf};
 
@@ -30,8 +27,8 @@ pub struct Project {
 #[derive(Debug, Clone)]
 pub enum SourceBinding {
     /// A git-anchored code source (`kind: repo`) → analyzed by hiker-code.
-    Repo(RepoSource),
-    /// A recognized but not-yet-implemented source kind (`jira`, `docs`, …). Kept so a project
+    Repo(repo::Source),
+    /// A recognized but not-yet-implemented source kind (`docs`, …). Kept so a project
     /// note can declare the full source set today; bind these as adapters land.
     Unsupported { kind: String },
 }
@@ -68,7 +65,7 @@ impl Project {
     /// Parse a project note: read its file, extract the leading `---` YAML frontmatter, validate
     /// `hiker.kind: project`, and resolve every `sources[]` entry. Repo `repo_id`s are resolved
     /// here (frontmatter value, else git-derived, else path-based fallback — see
-    /// [`RepoSource`]/`repo-id-git-derived`), and `~`-prefixed paths are expanded.
+    /// [`repo::Source`]/`repo-id-git-derived`), and `~`-prefixed paths are expanded.
     pub fn load(note_path: &Path) -> Result<Self, ProjectError> {
         let text = std::fs::read_to_string(note_path)?;
         Self::parse(&text, note_path)
@@ -86,7 +83,7 @@ impl Project {
     }
 
     /// Just the repo sources (the v1 graph sources).
-    pub fn repo_sources(&self) -> impl Iterator<Item = &RepoSource> {
+    pub fn repo_sources(&self) -> impl Iterator<Item = &repo::Source> {
         self.sources.iter().filter_map(|s| match s {
             SourceBinding::Repo(r) => Some(r),
             _ => None,
@@ -97,7 +94,7 @@ impl Project {
 impl SourceBinding {
     fn from_raw(raw: RawSource) -> SourceBinding {
         match raw.kind.as_str() {
-            "repo" => SourceBinding::Repo(RepoSource::from_raw(raw)),
+            "repo" => SourceBinding::Repo(repo::Source::from_raw(raw)),
             other => SourceBinding::Unsupported { kind: other.to_string() },
         }
     }

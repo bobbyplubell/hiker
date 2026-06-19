@@ -262,7 +262,7 @@ fn splice_chart_block(base: &str, original_inner: &str, new_body: &str) -> Optio
 /// Splice the regenerated `new_body` back into the ```` ```chart ```` fence in
 /// `note` and persist it.
 ///
-/// The write goes through the op-log **working** layer (then commits), not
+/// The write goes through the layered-doc **working** layer (then commits), not
 /// straight to `accepted` via `user_save`: when the note is open in a buffer its
 /// per-frame editor binding tracks `materialize_working` and would otherwise
 /// *revert* an accepted-only out-of-band write on the next frame. Writing to
@@ -284,7 +284,7 @@ fn save_note_block(
     let new_text = splice_chart_block(&base, original_inner, new_body)
         .ok_or("couldn't locate the chart block in the note (was it edited?)")?;
 
-    let log = &app.vault_session.services.oplog;
+    let log = &app.vault_session.services.layered;
     let doc_id = log
         .doc_id_for_path(note)
         .map_err(|e| e.to_string())?

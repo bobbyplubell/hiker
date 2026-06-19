@@ -19,7 +19,7 @@ use walkdir::WalkDir;
 use crate::embed::{Embedder, Error as EmbedError};
 use crate::store::error::Error as StoreError;
 use crate::store::Store;
-use crate::watcher::{is_ignored, FileEvent};
+use crate::watcher::FileEvent;
 
 mod jobs;
 mod scheduler;
@@ -125,6 +125,14 @@ pub enum IndexJob {
     ///
     /// status: note-access-tracking
     TouchAccess { rel_path: String, ts: i64 },
+    /// Run the vault rules layer's `date-passed` sweep (`docs/rules.md`):
+    /// fire rules whose watched date key crossed since the per-rule
+    /// watermark, on the indexer task like every other rule pass. Enqueued
+    /// by the host at vault open and on a daily tick; redundant enqueues
+    /// are free (the watermark dedupes). No-op without an attached engine.
+    ///
+    /// status: rule-triggers
+    RulesDateSweep,
     /// Hot-swap the loaded embedder to `model_id`. The indexer loads the
     /// new `FastembedEmbedder` via `spawn_blocking`; on success it swaps
     /// the live `Arc<dyn Embedder>` (visible to the search-query embedder
@@ -227,13 +235,13 @@ pub struct Handle {
     /// empty — `core::trails::on_note_moved` handles the missing-watcher
     /// case as a best-effort no-suppress write.
     watcher_cell: Arc<OnceCell<Arc<crate::watcher::Watcher>>>,
-    /// Late-bound op-log handle. Filled by the host via `attach_oplog` after
-    /// both the indexer and the op log have opened. The file-lifecycle jobs
+    /// Late-bound layered-doc handle. Filled by the host via `attach_layered` after
+    /// both the indexer and the layered doc have opened. The file-lifecycle jobs
     /// (`Move` / `MoveFolder` / `DeleteNote`) record the rename / tombstone in
-    /// the op log through this so the `doc-index.db` mapping follows the move
-    /// and the history feed sees deletes. CLI / tests without an op log leave
-    /// it empty and the jobs skip the op-log update.
-    oplog_cell: Arc<OnceCell<Arc<crate::oplog::OpLog>>>,
+    /// the layered doc through this so the `doc-index.db` mapping follows the move
+    /// and tombstones deletes. CLI / tests without a layered doc leave
+    /// it empty and the jobs skip the layered-doc update.
+    layered_cell: Arc<OnceCell<Arc<crate::editing::LayeredDoc>>>,
     /// Late-bound inbox rule list, compiled once at vault open from
     /// `[inbox]` config. Filled by the host via `attach_inbox_rules`
     /// after `Config::load` succeeds. CLI / tests without inbox routing
@@ -241,6 +249,21 @@ pub struct Handle {
     ///
     /// status: inbox-rules
     inbox_cell: Arc<OnceCell<Arc<crate::inbox::Rules>>>,
+    /// Late-bound kind registry, compiled once at vault open from the
+    /// `[kinds]` config. Filled by the host via `attach_kind_registry`;
+    /// per-note lenient validation derives the problems report from it on
+    /// every ingest. CLI / tests without a registry leave it empty and
+    /// ingest skips validation.
+    ///
+    /// status: kind-lenient-validation
+    kinds_cell: Arc<OnceCell<Arc<crate::kinds::Registry>>>,
+    /// Late-bound vault rules engine, compiled once at vault open from the
+    /// `[rules]` config. Filled by the host via `attach_rules_engine`; the
+    /// ingest pipeline runs the post-index rule pass through it. CLI /
+    /// tests without rules leave it empty and the pass is a no-op.
+    ///
+    /// status: rule-triggers
+    rules_cell: Arc<OnceCell<Arc<crate::rules::Engine>>>,
 }
 
 /// Thin wrapper around the indexer's mpsc sender that auto-tracks Upsert
@@ -403,12 +426,12 @@ impl Handle {
         }
     }
 
-    /// Late-bind the op-log handle so the file-lifecycle jobs can record
+    /// Late-bind the layered-doc handle so the file-lifecycle jobs can record
     /// renames / tombstones. The host calls this after both the indexer and
-    /// the op log have opened. Idempotent first-write-wins per `OnceCell`.
-    pub fn attach_oplog(&self, oplog: Arc<crate::oplog::OpLog>) {
-        if self.oplog_cell.set(oplog).is_err() {
-            tracing::warn!("indexer: oplog_cell already attached; ignoring");
+    /// the layered doc have opened. Idempotent first-write-wins per `OnceCell`.
+    pub fn attach_layered(&self, layered: Arc<crate::editing::LayeredDoc>) {
+        if self.layered_cell.set(layered).is_err() {
+            tracing::warn!("indexer: layered_cell already attached; ignoring");
         }
     }
 
@@ -420,6 +443,28 @@ impl Handle {
     pub fn attach_inbox_rules(&self, rules: Arc<crate::inbox::Rules>) {
         if self.inbox_cell.set(rules).is_err() {
             tracing::warn!("indexer: inbox_cell already attached; ignoring");
+        }
+    }
+
+    /// Late-bind the compiled kind registry so ingest derives each note's
+    /// lenient-validation problems (`kind-lenient-validation`). Host calls
+    /// this once at vault open after `Config::load`. Idempotent
+    /// first-write-wins.
+    pub fn attach_kind_registry(&self, registry: Arc<crate::kinds::Registry>) {
+        if self.kinds_cell.set(registry).is_err() {
+            tracing::warn!("indexer: kinds_cell already attached; ignoring");
+        }
+    }
+
+    /// Late-bind the compiled vault rules engine (`docs/rules.md`) so the
+    /// ingest pipeline runs the post-index rule pass and the
+    /// `RulesDateSweep` job has an engine to sweep. Host calls this once
+    /// at vault open after `Config::load`. Idempotent first-write-wins.
+    ///
+    /// status: rule-triggers
+    pub fn attach_rules_engine(&self, engine: Arc<crate::rules::Engine>) {
+        if self.rules_cell.set(engine).is_err() {
+            tracing::warn!("indexer: rules_cell already attached; ignoring");
         }
     }
 
@@ -501,8 +546,10 @@ where
     });
 
     let watcher_cell: Arc<OnceCell<Arc<crate::watcher::Watcher>>> = Arc::new(OnceCell::new());
-    let oplog_cell: Arc<OnceCell<Arc<crate::oplog::OpLog>>> = Arc::new(OnceCell::new());
+    let layered_cell: Arc<OnceCell<Arc<crate::editing::LayeredDoc>>> = Arc::new(OnceCell::new());
     let inbox_cell: Arc<OnceCell<Arc<crate::inbox::Rules>>> = Arc::new(OnceCell::new());
+    let kinds_cell: Arc<OnceCell<Arc<crate::kinds::Registry>>> = Arc::new(OnceCell::new());
+    let rules_cell: Arc<OnceCell<Arc<crate::rules::Engine>>> = Arc::new(OnceCell::new());
 
     let progress_for_task = progress_tx.clone();
     let pending_for_task = pending.clone();
@@ -516,8 +563,10 @@ where
         pending: pending.clone(),
     };
     let watcher_cell_for_task = watcher_cell.clone();
-    let oplog_cell_for_task = oplog_cell.clone();
+    let layered_cell_for_task = layered_cell.clone();
     let inbox_cell_for_task = inbox_cell.clone();
+    let kinds_cell_for_task = kinds_cell.clone();
+    let rules_cell_for_task = rules_cell.clone();
     let join = tokio::spawn(
         crate::indexer::scheduler::IndexerLoop {
             vault,
@@ -531,8 +580,10 @@ where
             embedder_cell: embedder_cell_for_task,
             self_tx,
             watcher_cell: watcher_cell_for_task,
-            oplog_cell: oplog_cell_for_task,
+            layered_cell: layered_cell_for_task,
             inbox_cell: inbox_cell_for_task,
+            kinds_cell: kinds_cell_for_task,
+            rules_cell: rules_cell_for_task,
             tasks,
         }
         .run(),
@@ -546,8 +597,10 @@ where
         pending,
         embedder: embedder_cell,
         watcher_cell,
-        oplog_cell,
+        layered_cell,
         inbox_cell,
+        kinds_cell,
+        rules_cell,
     }
 }
 
@@ -620,12 +673,15 @@ struct ScanState<'a> {
 impl<'a> ScanState<'a> {
     fn walk_vault(&mut self) {
         let vault_root = self.vault_root;
+        // Composed ignore matcher (hard-coded list + .gitignore + .hikerignore
+        // + config `ignored_paths`), built once per vault. Markdown notes are
+        // never excluded by the gitignore layer (note-protection invariant).
+        let matcher = crate::ignore::matcher_for(vault_root);
         let walker = WalkDir::new(vault_root).follow_links(false).into_iter();
         for entry in walker.filter_entry(|e| {
             // Pre-filter: skip whole subtrees we never want to enter.
             // `walkdir`'s `filter_entry` runs with absolute paths, so
-            // resolve to a vault-relative form before consulting
-            // `is_ignored`.
+            // resolve to a vault-relative form before consulting the matcher.
             let path = e.path();
             if path == vault_root {
                 return true;
@@ -637,7 +693,7 @@ impl<'a> ScanState<'a> {
             if rel.is_empty() {
                 return true;
             }
-            !is_ignored(&rel)
+            !matcher.is_ignored(&rel, e.file_type().is_dir())
         }) {
             self.classify_entry(entry);
         }
@@ -666,7 +722,11 @@ impl<'a> ScanState<'a> {
                 return;
             }
         };
-        if is_ignored(&rel) {
+        // Files reaching here already survived the `filter_entry` prune, but
+        // re-check against the composed matcher (cheap Arc-cached lookup) so
+        // the filtered-count is accurate and a file directly excluded by an
+        // ignore-file pattern (not just a pruned directory) is dropped.
+        if crate::ignore::is_ignored_in(self.vault_root, &rel, false) {
             self.filtered_ignored += 1;
             return;
         }
@@ -813,6 +873,6 @@ pub(super) fn update_total_notes(status: &watch::Sender<IndexStatus>, store: &St
 
 // `frontmatter_hiker_id` retired with `note-id-stamping`. Under
 // path-as-identity (`store-path-is-identity`), `notes.id` is sourced from
-// the op-log's `doc-index.db` rather than from the note's frontmatter,
+// the layered doc's `doc-index.db` rather than from the note's frontmatter,
 // so the empty-`path_ids` fallback that read this helper is gone.
 

@@ -18,7 +18,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
     let abs = app.vault_session.vault_root.join(path);
     let meta = std::fs::metadata(&abs).ok();
 
-    // Indexer-backed metadata: pulled from the read store + op log so we
+    // Indexer-backed metadata: pulled from the read store + layered doc so we
     // surface the same fields the legacy `note_properties` command did
     // (note id, content hash, indexed_at, embedder version, chunk count,
     // last_accessed_at, change count, skipped state). The read store may be
@@ -29,8 +29,8 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
         .lock()
         .ok()
         .and_then(|s| s.note_properties(path).ok().flatten());
-    let change_count: Option<i64> = hiker_core::ops::op_writes::path_history(
-        &app.vault_session.services.oplog,
+    let change_count: Option<i64> = hiker_core::ops::op_writes::snapshot_history(
+        &app.vault_session.services.layered,
         path,
         usize::MAX,
     )
@@ -180,6 +180,8 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
             });
     }
 
+    render_epic_progress(ui, app, path);
+
     // Trail membership: list every trail that contains this note as a
     // waypoint, via the derived `trail_waypoints` reverse lookup. Per
     // `properties` spec — surfaces the note's role in user-curated
@@ -189,7 +191,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
             Ok(store) => hiker_core::trails::containing_note_with_paths(
                 &app.vault_session.vault,
                 &store,
-                &app.vault_session.services.oplog,
+                &app.vault_session.services.layered,
                 path,
             )
             .unwrap_or_default()
@@ -234,6 +236,62 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState, path: &str) {
                 }
             });
     }
+}
+
+/// Epic / plan rollup section (`pm-epic-rollup`'s properties-panel
+/// surface): a list-like note's progress, derived fresh from the boards on
+/// render — per-category counts + estimate sums over its members' derived
+/// statuses, never stored. Renders nothing for every other kind.
+fn render_epic_progress(ui: &mut egui::Ui, app: &AppState, path: &str) {
+    let Some(progress) = epic_progress_of(app, path) else { return };
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new("Progress").strong());
+    egui::Grid::new("props-epic")
+        .num_columns(2)
+        .spacing(egui::vec2(20.0, 4.0))
+        .show(ui, |ui| {
+            ui.label("members:");
+            ui.label(progress.summary());
+            ui.end_row();
+            let categories = [
+                ("backlog", &progress.backlog),
+                ("todo", &progress.todo),
+                ("in progress", &progress.in_progress),
+                ("done", &progress.done),
+                ("canceled", &progress.canceled),
+            ];
+            for (name, tally) in categories {
+                if tally.count == 0 {
+                    continue;
+                }
+                ui.label(format!("{name}:"));
+                if tally.estimate > 0.0 {
+                    ui.label(format!("{} (est {})", tally.count, tally.estimate));
+                } else {
+                    ui.label(format!("{}", tally.count));
+                }
+                ui.end_row();
+            }
+            if progress.conflicted > 0 {
+                ui.label("conflicted:");
+                ui.label(
+                    egui::RichText::new(format!("{} (on 2+ sprints)", progress.conflicted))
+                        .color(theme::warn()),
+                );
+                ui.end_row();
+            }
+        });
+}
+
+/// The epic rollup for `path` when it is a registered list-like note
+/// (`pm-epic-rollup`'s properties-panel surface): `None` for every other
+/// kind, when the store is offline, or when the rollup read fails.
+fn epic_progress_of(app: &AppState, path: &str) -> Option<hiker_core::pm::EpicProgress> {
+    let registry = app.vault_session.services.kinds.as_ref();
+    let store = app.vault_session.services.read_store.lock().ok()?;
+    let kind = store.meta_value(path, "hiker.kind").ok().flatten()?;
+    registry.list_like(&kind)?;
+    hiker_core::pm::epic_progress(&store, registry, path).ok()
 }
 
 struct ClusterMembership {

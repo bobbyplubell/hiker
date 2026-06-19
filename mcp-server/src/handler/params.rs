@@ -43,6 +43,13 @@ pub(crate) fn translate_hiker_err(e: HikerError) -> ErrorData {
         HikerError::AlreadyExists(p) => {
             ErrorData::invalid_params(format!("already exists: {p}"), None)
         }
+        // The one-sprint invariant refusing a card-add (stage-time guard or
+        // the apply-time flip re-check, `derived-status-rule`): the agent's
+        // request conflicts with current membership — invalid params, the
+        // same posture as `AlreadyExists` (which the stage-time guard uses).
+        HikerError::SprintConflict(msg) => {
+            ErrorData::invalid_params(format!("one-sprint invariant: {msg}"), None)
+        }
         HikerError::NotUtf8(msg) => ErrorData::invalid_params(format!("not utf-8: {msg}"), None),
         HikerError::Config(msg) => ErrorData::internal_error(format!("config: {msg}"), None),
         HikerError::Io(msg) => {
@@ -201,6 +208,29 @@ pub struct GetOpenNotes {}
 /// status: mcp-tool-get-selection
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct GetSelection {}
+
+// ---------- query tool params (status: query-mcp-tool) ----------
+
+/// Args for the generic `query` read tool: exactly one of `query_doc` (run
+/// a saved query-doc) or `filter` (an inline filter in the same closed
+/// grammar — same parser, same clause set).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RunQuery {
+    /// Vault-relative path of a saved query-doc (`hiker.kind: query`).
+    #[serde(default)]
+    pub query_doc: Option<String>,
+    /// Inline filter object in the query grammar (`kind` / `tags` / `path` /
+    /// `fields` / `board` / `order` / `limit`).
+    #[serde(default)]
+    pub filter: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Frontmatter keys to pack into each returned row's `fields`.
+    #[serde(default)]
+    pub select: Option<Vec<String>>,
+    /// Row cap. Default 100, server-capped at 500; a stricter limit inside
+    /// the query itself still wins.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
 
 // ---------- board tool params (status: board-mcp-tools) ----------
 
@@ -666,6 +696,17 @@ impl Serialize for ApplyTag {
         let mut m = s.serialize_struct("ApplyTag", 2)?;
         m.serialize_field("rel_path", &self.rel_path)?;
         m.serialize_field("tag", &self.tag)?;
+        m.end()
+    }
+}
+impl Serialize for RunQuery {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut m = s.serialize_struct("RunQuery", 4)?;
+        m.serialize_field("query_doc", &self.query_doc)?;
+        m.serialize_field("filter", &self.filter)?;
+        m.serialize_field("select", &self.select)?;
+        m.serialize_field("limit", &self.limit)?;
         m.end()
     }
 }

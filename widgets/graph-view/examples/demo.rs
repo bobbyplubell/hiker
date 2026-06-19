@@ -15,7 +15,8 @@ mod synthetic;
 
 use eframe::egui;
 use hiker_graph::LayoutKind;
-use hiker_graph_view::graph_view::{State, Style};
+use hiker_graph_view::graph_view::styling::Style;
+use hiker_graph_view::graph_view::State;
 use hiker_projection::{Mobius, ProjectionKind};
 use synthetic::SyntheticGraph;
 

@@ -1,4 +1,4 @@
-//! The per-frame editor binding for an op-log-backed vault buffer: the
+//! The per-frame editor binding for a layered-doc-backed vault buffer: the
 //! forward/reverse direction tying the editor's change sets to the document's
 //! `working` text layer, plus the overlay refresh that drives inline review.
 //!
@@ -13,7 +13,7 @@
 //! `working` layer with no coordinate translation; the cursor only ever needs
 //! mapping when `working` itself advances out-of-band (an accepted agent op or
 //! an external edit), handled in the reverse step. This is the "single generic
-//! editor + suggestion-as-overlay" shape: the editor crate stays op-log-agnostic;
+//! editor + suggestion-as-overlay" shape: the editor crate stays layered-doc-agnostic;
 //! this binding is the only adapter.
 
 use eframe::egui;
@@ -114,7 +114,7 @@ fn change_set_between(old: &str, new: &str) -> editor_core::change::Set {
     Set::of(old.len(), edits)
 }
 
-/// The editor binding for an op-log-backed vault buffer (per
+/// The editor binding for a layered-doc-backed vault buffer (per
 /// `op-log-editor-binding`). The editable buffer *is* `materialize_working`;
 /// the agent's pending ops live in the overlay, not the buffer text. Three
 /// steps, run once per frame after the widget applied this frame's input:
@@ -140,8 +140,8 @@ pub(crate) fn run(
     path: &str,
     txns: &[editor_core::transaction::Transaction],
 ) {
-    let log = app.vault_session.services.oplog.clone();
-    // Only op-log-backed vault buffers participate; others (snapshot / pending
+    let log = app.vault_session.services.layered.clone();
+    // Only layered-doc-backed vault buffers participate; others (snapshot / pending
     // / trash previews, or a path with no doc yet) keep their disk-only flow.
     let Some(buffer) = app.session.buffers.get_mut(path) else { return };
     if !matches!(buffer.source, crate::tab::BufferSource::Vault { .. }) {
@@ -215,14 +215,14 @@ pub(super) fn handle_undo_redo(
     }
 }
 
-/// The forward/reverse/overlay binding for one op-log-backed buffer, factored
-/// out of [`run`] so it operates on a plain `(&OpLog, &mut Buffer)` pair — no
+/// The forward/reverse/overlay binding for one layered-doc-backed buffer, factored
+/// out of [`run`] so it operates on a plain `(&LayeredDoc, &mut Buffer)` pair — no
 /// `AppState` container — which lets the merge scenarios be exercised
 /// end-to-end in tests. [`run`] is the thin `AppState` adapter (buffer lookup +
 /// `Vault`-source gate + `doc_id` resolution); everything below is the actual
 /// binding. `path` is used only for log context.
 fn apply_binding(
-    log: &hiker_core::oplog::OpLog,
+    log: &hiker_core::editing::LayeredDoc,
     buffer: &mut crate::buffer::Buffer,
     doc_id: &str,
     path: &str,
@@ -262,13 +262,13 @@ fn apply_binding(
                 tracing::error!(
                     error = %e,
                     path,
-                    "oplog: apply_working_edit failed; forcing working resync from editor text"
+                    "layered: apply_working_edit failed; forcing working resync from editor text"
                 );
                 if let Err(re) = resync_working_to_editor(log, doc_id, &editor_text) {
                     tracing::error!(
                         error = %re,
                         path,
-                        "oplog: working resync after forward-apply failure also failed"
+                        "layered: working resync after forward-apply failure also failed"
                     );
                 }
                 // `working` was re-derived from the editor's *full* current
@@ -352,10 +352,10 @@ fn apply_binding(
 /// so the result is byte-identical to the editor. The replace seeds `working` as
 /// a clone of `accepted`, then overwrites `[0, accepted_len)` with `editor_text`.
 fn resync_working_to_editor(
-    log: &hiker_core::oplog::OpLog,
+    log: &hiker_core::editing::LayeredDoc,
     doc_id: &str,
     editor_text: &str,
-) -> Result<(), hiker_core::oplog::error::Error> {
+) -> Result<(), hiker_core::editing::error::Error> {
     log.discard_working(doc_id)?;
     let accepted_len = log.materialize_accepted(doc_id)?.text.len();
     log.apply_working_edit(doc_id, 0, accepted_len, editor_text)
@@ -443,7 +443,7 @@ mod tests {
 
 #[cfg(test)]
 mod merge_scenarios {
-    //! End-to-end coverage for the binding driven against a *real* `OpLog` +
+    //! End-to-end coverage for the binding driven against a *real* `LayeredDoc` +
     //! real `Buffer`: each test simulates the widget applying a keystroke
     //! (mutate `editor.doc`, build the matching change set), runs the actual
     //! [`apply_binding`] forward/reverse/overlay seam, and asserts the working
@@ -458,18 +458,18 @@ mod merge_scenarios {
     use editor_core::change::Set;
     use editor_core::transaction::Transaction;
     use hiker_core::ops::op_writes::{self, AgentEdit};
-    use hiker_core::oplog::OpLog;
+    use hiker_core::editing::LayeredDoc;
     use hiker_core::vault::Vault;
     use tempfile::TempDir;
 
     use super::{apply_binding, resync_working_to_editor};
     use crate::buffer::Buffer;
 
-    /// A real op-log-backed vault + editable `Buffer` for `a.md`, seeded from
+    /// A real layered-doc-backed vault + editable `Buffer` for `a.md`, seeded from
     /// `initial` on disk exactly as `bootstrap` does at vault open.
     struct Fixture {
         td: TempDir,
-        log: Arc<OpLog>,
+        log: Arc<LayeredDoc>,
         vault: Vault,
         buffer: Buffer,
         doc_id: String,
@@ -484,7 +484,7 @@ mod merge_scenarios {
         std::fs::write(td.path().join("a.md"), initial).unwrap();
         std::fs::write(td.path().join("target.md"), "# Target\n").unwrap();
         let vault = Vault::open(td.path()).unwrap();
-        let log = Arc::new(OpLog::open(td.path()).unwrap());
+        let log = Arc::new(LayeredDoc::open(td.path()).unwrap());
         op_writes::bootstrap(&vault, &log).unwrap();
         let doc_id = log.doc_id_for_path("a.md").unwrap().unwrap();
         let vault_handle =
@@ -1074,9 +1074,9 @@ mod merge_scenarios {
     }
 
     #[test]
-    fn typing_double_bracket_on_an_oplog_buffer_opens_completion_and_survives_the_binding() {
+    fn typing_double_bracket_on_a_layered_buffer_opens_completion_and_survives_the_binding() {
         // Repro for "autocomplete doesn't appear when typing `[[` on a note that
-        // was open from a prior session." A restored note is an op-log-backed
+        // was open from a prior session." A restored note is a layered-doc-backed
         // buffer: every frame runs `apply_binding` AFTER the widget applied the
         // keystroke. This drives the REAL input path (`command::handle`, with the
         // wikilink source registered) for `[` then `[`, running the binding after

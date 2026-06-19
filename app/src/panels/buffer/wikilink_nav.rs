@@ -12,6 +12,7 @@ use eframe::egui;
 use editor_view::viewport::{ClickAction, ClickZone};
 use hiker_core::store::Store;
 use hiker_core::wikilink::{self, AmbiguityPolicy, Resolution};
+use spec_engine::{DerivedNodeSource, SourceId};
 
 use crate::state::{AppState, ToastLevel};
 
@@ -32,12 +33,29 @@ pub(crate) fn title_resolver(
     _read_store: Arc<Mutex<Store>>,
 ) -> impl Fn(&str) -> Option<String> {
     move |target: &str| {
+        // A `[[code:<repo_id>/<symbol>]]` spec→code link renders with a friendly label derived
+        // from the moniker (`Builder::top_level_split` for an impl-qualified body) so the pill
+        // shows resolved (not broken-red); the stored body stays the canonical short-sym form.
+        // Cheap by design — no adapter binding per frame; the click path does the real
+        // resolution. status: spec-code-link · status: wikilink-code-pretty-label
+        if let Some((_, symbol)) = wikilink::parse_code_target(target) {
+            return Some(wikilink::code_link_label(symbol));
+        }
+        // A `[[spec:<slug>]]` spec link renders with the slug as its label; the click path
+        // resolves through the store's spec-anchor index. status: wikilink-spec-links
+        if let Some(slug) = wikilink::parse_spec_target(target) {
+            return Some(slug.to_string());
+        }
         // Strip any `#section` anchor so the pill shows the page title, not the
         // raw `Page#Heading` body. status: wikilink-headings-blocks
         let (page, section) = wikilink::split_target_section(target);
         if page.is_empty() {
-            // A same-document `[[#Heading]]` anchor: label it with the heading.
-            return section.map(str::to_string);
+            // A same-document anchor: label it with the heading, or with the
+            // block id (sans `^`) for a `[[#^block]]` anchor.
+            // status: wikilink-block-anchors
+            return section.map(|s| {
+                wikilink::block_anchor_id(s).map_or_else(|| s.to_string(), str::to_string)
+            });
         }
         Some(wikilink::title_for_path(page).to_string())
     }
@@ -88,7 +106,98 @@ fn open_at(app: &mut AppState, text: &str, offset: usize, sticky: bool) {
         .map(|l| l.target)
         .or_else(|| markdown_link_dest_at(text, offset));
     let Some(target) = target else { return };
+    // Spec→code link (`[[code:<repo_id>/<symbol>]]`): resolve through the code-intelligence port and
+    // navigate to the code graph instead of a vault path. status: spec-code-link
+    if let Some((repo_id, symbol)) = wikilink::parse_code_target(&target) {
+        open_code_target(app, repo_id, symbol);
+        return;
+    }
+    // Spec link (`[[spec:<slug>]]`): resolve the slug through the store's spec-anchor
+    // index and open the defining note at the anchor line. status: wikilink-spec-links
+    if let Some(slug) = wikilink::parse_spec_target(&target) {
+        open_spec_target(app, slug, sticky);
+        return;
+    }
     open_target(app, text, &target, sticky);
+}
+
+/// Navigate a `[[spec:<slug>]]` link: look the slug up in the `spec_anchors` index (one
+/// indexed query — no vault walk; the indexer re-derives anchors on every ingest), open
+/// the defining note, and scroll to the `[slug]` anchor line. When more than one note
+/// defines the anchor, the referrer's folder wins, else the lexicographically first path —
+/// deterministic, mirroring the spec engine's resolution posture. A slug the index doesn't
+/// know yields a toast (the vault may simply not have finished indexing).
+/// status: wikilink-spec-links
+fn open_spec_target(app: &mut AppState, slug: &str, sticky: bool) {
+    let paths = match app.vault_session.services.read_store.lock() {
+        Ok(store) => store.spec_anchor_paths(slug).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let Some(path) = pick_anchor_path(&paths, active_buffer_path(app).as_deref()) else {
+        app.push_toast(format!("spec slug not found: {slug}"), ToastLevel::Warn);
+        return;
+    };
+    crate::editor_pane::open_file(app, &path, sticky);
+    // Land on the anchor line, found live in the (possibly just-opened) buffer text —
+    // robust against any index/disk lag, same funnel as heading anchors.
+    let Some(text) = app
+        .session
+        .buffers
+        .get(&path)
+        .map(crate::buffer::Buffer::current_text)
+    else {
+        return;
+    };
+    if let Some(byte) = wikilink::find_slug_anchor_byte(&text, slug) {
+        scroll_buffer_to_byte(app, &path, byte);
+    }
+}
+
+/// Pick the note a multi-defined spec anchor resolves to: a path sharing the referrer's
+/// parent folder first, else the first (the store returns them sorted).
+fn pick_anchor_path(paths: &[String], referrer: Option<&str>) -> Option<String> {
+    if let Some(referrer) = referrer {
+        let dir = referrer.rsplit_once('/').map_or("", |(d, _)| d);
+        if let Some(p) = paths
+            .iter()
+            .find(|p| p.rsplit_once('/').map_or("", |(d, _)| d) == dir)
+        {
+            return Some(p.clone());
+        }
+    }
+    paths.first().cloned()
+}
+
+/// Navigate a `[[code:<repo_id>/<symbol>]]` link (`spec-code-link`, Phase A): bind the repo's SCIP
+/// adapter (lazily, via the registry), resolve the symbol through the `DerivedNodeSource` port, open
+/// the project's code-graph tab, and surface the resolved location via a toast (+ best-effort
+/// preselect of the node). Authoring + drift UI are later phases.
+fn open_code_target(app: &mut AppState, repo_id: &str, symbol: &str) {
+    let Some((adapter, note)) = crate::code_sources::resolve_or_bind(app, repo_id) else {
+        app.push_toast(format!("no project binds repo '{repo_id}'"), ToastLevel::Warn);
+        return;
+    };
+    let src = SourceId(repo_id.to_string());
+    let Some(handle) = adapter.resolve(symbol, &src) else {
+        app.push_toast(
+            format!("code symbol not found: {symbol} in {repo_id}"),
+            ToastLevel::Warn,
+        );
+        return;
+    };
+    crate::panels::code_graph::open(app, crate::tab::CodeSource::Project(note.clone()));
+    // Best-effort preselect: if the graph view for this source is already built, point its selection
+    // at the resolved node so the detail line shows it. A not-yet-built (lazy) view is fine — the
+    // toast below is sufficient for Phase A.
+    let key = crate::tab::CodeSource::Project(note).key();
+    if let Some(view) = app.panels.code_graph.get_mut(&key) {
+        view.preselect(handle.id.clone());
+    }
+    let loc = adapter
+        .locate(&handle)
+        .map(|l| format!("{}:{}", l.file, l.start_line + 1))
+        .unwrap_or_else(|| "?".to_string());
+    app.push_toast(format!("code: {symbol} @ {loc}"), ToastLevel::Info);
 }
 
 /// The destination of a `[label](dest)` markdown link whose `[` is at `offset`,
@@ -116,24 +225,25 @@ fn markdown_link_dest_at(text: &str, offset: usize) -> Option<String> {
 
 /// Resolve a wikilink / markdown-link `target` (which may carry a `#section`
 /// anchor) against the active buffer's `text` and open it, scrolling to the
-/// heading when a section is present.
+/// anchor when a section is present.
 ///
-/// Three cases (`wikilink-headings-blocks`):
-/// - A bare `#Section` (empty page) is a same-document anchor: stay in the
-///   current buffer and scroll to the heading; no note open.
-/// - `Page#Section` opens the page (or creates it when unresolved) and scrolls
-///   to the heading once the new buffer's height map is built.
+/// An anchor is either a heading slug (`#Heading`, `wikilink-headings-blocks`)
+/// or a block id (`#^blockid`, `wikilink-block-anchors`); `anchor_byte` picks
+/// the right finder. Three cases:
+/// - A bare `#Section` / `#^block` (empty page) is a same-document anchor: stay
+///   in the current buffer and scroll to the anchor; no note open.
+/// - `Page#Section` / `Page#^block` opens the page (or creates it when
+///   unresolved) and scrolls to the anchor once the new buffer's height map is
+///   built.
 /// - `Page` (no section) is the existing page-level open.
-///
-/// status: wikilink-headings-blocks
 fn open_target(app: &mut AppState, text: &str, target: &str, sticky: bool) {
     let (page, section) = wikilink::split_target_section(target);
 
-    // Same-document anchor: `[[#Section]]` / `[text](#Section)`.
+    // Same-document anchor: `[[#Section]]` / `[[#^block]]` / `[text](#Section)`.
     if page.is_empty() {
         if let Some(section) = section
             && let Some(active) = active_buffer_path(app)
-            && let Some(byte) = wikilink::find_heading_byte(text, section)
+            && let Some(byte) = anchor_byte(text, section)
         {
             scroll_buffer_to_byte(app, &active, byte);
         }
@@ -188,10 +298,11 @@ fn scroll_buffer_to_byte(app: &mut AppState, path: &str, byte: usize) {
     }
 }
 
-/// After opening `path`, find the heading matching `section` in its (possibly
+/// After opening `path`, find the anchor matching `section` in its (possibly
 /// just-loaded) buffer text and scroll to it. A `section` that matches no
-/// heading is a graceful no-op — the note simply opens at the top.
+/// anchor is a graceful no-op — the note simply opens at the top.
 /// status: wikilink-headings-blocks
+/// status: wikilink-block-anchors
 fn scroll_open_buffer_to_section(app: &mut AppState, path: &str, section: &str) {
     let Some(text) = app
         .session
@@ -201,8 +312,20 @@ fn scroll_open_buffer_to_section(app: &mut AppState, path: &str, section: &str) 
     else {
         return;
     };
-    if let Some(byte) = wikilink::find_heading_byte(&text, section) {
+    if let Some(byte) = anchor_byte(&text, section) {
         scroll_buffer_to_byte(app, path, byte);
+    }
+}
+
+/// Byte offset of the anchor `section` names in `text`: a block (`^blockid`)
+/// when the anchor is `^`-prefixed and well-formed, otherwise a heading by
+/// slug. One funnel so the same-document and post-open scroll paths agree on
+/// how a `#section` is interpreted. `None` when nothing matches (graceful
+/// no-op for the caller). status: wikilink-block-anchors
+fn anchor_byte(text: &str, section: &str) -> Option<usize> {
+    match wikilink::block_anchor_id(section) {
+        Some(blockid) => wikilink::find_block_byte(text, blockid),
+        None => wikilink::find_heading_byte(text, section),
     }
 }
 
@@ -243,6 +366,204 @@ fn create_and_open(app: &mut AppState, name: &str, sticky: bool) {
         }
         Err(e) => app.push_toast(format!("Couldn't create {rel}: {e}"), ToastLevel::Error),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Block-anchor auto-injection — [wikilink-block-anchor-autoinject]
+// ---------------------------------------------------------------------------
+
+/// A block-anchor reference parsed out of the active buffer: the page part
+/// (empty = same-document) and the block id (sans `^`).
+struct BlockRef {
+    page: String,
+    id: String,
+}
+
+/// After an edit authored a `[[Page#^id]]` / `[text](Page#^id)` link to a
+/// not-yet-anchored block, inject ` ^id` onto the matching block in the target
+/// note so the link resolves. The id is content-addressed
+/// (`wikilink::fresh_block_id`), so the target block is re-located from the id
+/// alone: the matching un-anchored block is the one whose freshly-derived id
+/// equals the link's. An id that already marks a block — or matches no block —
+/// is left untouched (the picker reuses existing ids; a hand-typed id the user
+/// hasn't placed yet is none of our business). status: wikilink-block-anchor-autoinject
+pub(crate) fn reconcile_block_anchors(app: &mut AppState, path: &str) {
+    let Some(text) = app
+        .session
+        .buffers
+        .get(path)
+        .map(crate::buffer::Buffer::current_text)
+    else {
+        return;
+    };
+    // Cheap gate: most edits carry no block anchor at all.
+    if !text.contains("#^") {
+        return;
+    }
+    for block_ref in collect_block_refs(&text) {
+        inject_for_ref(app, path, &block_ref);
+    }
+}
+
+/// Every `#^id` block-anchor reference in `text`, from both `[[…]]` wikilinks
+/// and `[label](dest)` markdown links.
+fn collect_block_refs(text: &str) -> Vec<BlockRef> {
+    let mut out = Vec::new();
+    for link in wikilink::parse_links(text) {
+        push_block_ref(&mut out, &link.target);
+    }
+    for dest in markdown_link_dests(text) {
+        push_block_ref(&mut out, &dest);
+    }
+    out
+}
+
+/// If `target` carries a `#^id` block anchor, push its `(page, id)` onto `out`.
+fn push_block_ref(out: &mut Vec<BlockRef>, target: &str) {
+    let (page, section) = wikilink::split_target_section(target);
+    if let Some(section) = section
+        && let Some(id) = wikilink::block_anchor_id(section)
+    {
+        out.push(BlockRef { page: page.to_string(), id: id.to_string() });
+    }
+}
+
+/// Inject the marker for one block reference: resolve its target note, find the
+/// un-anchored block whose content-addressed id matches, and append ` ^id`
+/// there. Same-document / open-target buffers are edited in place; a target
+/// only on disk is rewritten through the core injection op.
+fn inject_for_ref(app: &mut AppState, current: &str, block_ref: &BlockRef) {
+    let target_path = if block_ref.page.is_empty() {
+        current.to_string()
+    } else {
+        match resolve_page(app, current, &block_ref.page) {
+            Some(p) => p,
+            None => return,
+        }
+    };
+    // The body to scan: the live buffer text if the target is open, else disk.
+    let open_body = app
+        .session
+        .buffers
+        .get(&target_path)
+        .map(crate::buffer::Buffer::current_text);
+    let body = match open_body
+        .clone()
+        .or_else(|| app.vault_session.vault.read_file(&target_path).ok())
+    {
+        Some(b) => b,
+        None => return,
+    };
+    // Already anchored (the picker reused an existing id) → nothing to inject.
+    if wikilink::find_block_byte(&body, &block_ref.id).is_some() {
+        return;
+    }
+    let Some(range) = matching_block_range(&body, &block_ref.id) else {
+        return;
+    };
+    if open_body.is_some() {
+        inject_into_open_buffer(app, &target_path, &range, &block_ref.id);
+    } else {
+        inject_into_disk_note(app, &target_path, &range, &block_ref.id);
+    }
+}
+
+/// Byte range of the un-anchored block in `body` whose freshly-derived id
+/// equals `id`, or `None` when no such block exists.
+fn matching_block_range(body: &str, id: &str) -> Option<std::ops::Range<usize>> {
+    wikilink::scan_blocks(body).into_iter().find_map(|b| {
+        if b.existing_id.is_none() && wikilink::fresh_block_id(body, &b.range) == id {
+            Some(b.range)
+        } else {
+            None
+        }
+    })
+}
+
+/// Resolve a non-empty page part to a concrete vault path (lex-first on
+/// ambiguity, matching the picker's resolution), or `None`.
+fn resolve_page(app: &AppState, current: &str, page: &str) -> Option<String> {
+    let paths = app.vault_session.vault.walk_indexable_files("").unwrap_or_default();
+    match wikilink::resolve_path(&paths, page, AmbiguityPolicy::LexFirst, Some(current)) {
+        Resolution::Resolved(p) => Some(p),
+        Resolution::Unresolved | Resolution::Ambiguous(_) => None,
+    }
+}
+
+/// Inject ` ^id` into an open buffer's editor text (same-document or an
+/// already-loaded target) via an `Input` transaction, so the marker rides the
+/// buffer's own undo / layered-doc path like any user edit (the next frame's
+/// `editor_binding::run` mirrors it onto `working`) and the user's caret maps
+/// through the insert rather than being clobbered.
+fn inject_into_open_buffer(
+    app: &mut AppState,
+    target_path: &str,
+    range: &std::ops::Range<usize>,
+    id: &str,
+) {
+    let Some(buffer) = app.session.buffers.get_mut(target_path) else {
+        return;
+    };
+    let body = buffer.editor.doc.to_string();
+    // The marker is inserted after the block line's trailing-trimmed end.
+    let line = match body.get(range.clone()) {
+        Some(l) => l,
+        None => return,
+    };
+    let insert_at = range.start + line.trim_end().len();
+    let changes = editor_core::change::Set::of(
+        buffer.editor.doc.len_bytes(),
+        std::iter::once((insert_at..insert_at, format!(" ^{id}"))),
+    );
+    let tx = editor_core::transaction::Transaction::new(changes)
+        .with_edit_type(editor_core::transaction::EditType::Input);
+    buffer.editor = buffer.editor.apply(tx);
+}
+
+/// Inject ` ^id` into a target note that is only on disk, via the core op that
+/// suppresses the watcher and reindexes — the same cross-note write path the
+/// rename-rewrite pass uses.
+fn inject_into_disk_note(
+    app: &AppState,
+    target_path: &str,
+    range: &std::ops::Range<usize>,
+    id: &str,
+) {
+    let watcher = app.vault_session.services.watcher.clone();
+    let jobs = app.vault_session.services.indexer.job_sender();
+    let vault = app.vault_session.vault.clone();
+    let target = target_path.to_string();
+    let range = range.clone();
+    let id = id.to_string();
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let result = handle.block_on(async {
+            hiker_core::ops::file::inject_block_marker(
+                &watcher, &jobs, &vault, &target, &range, &id,
+            )
+            .await
+        });
+        if let Err(e) = result {
+            tracing::warn!(error = %e, path = %target,
+                "block-anchor auto-inject: write failed");
+        }
+    }
+}
+
+/// Every `[label](dest)` markdown-link destination in `text` (one-line links),
+/// used to find block anchors authored in the markdown-link form.
+fn markdown_link_dests(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'[' && (i == 0 || bytes[i - 1] != b'[') {
+            if let Some(dest) = markdown_link_dest_at(text, i) {
+                out.push(dest);
+            }
+        }
+        i += 1;
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -316,6 +637,18 @@ fn resolve_target_path(app: &AppState, path: &str, offset: usize) -> Option<Stri
     let link = wikilink::parse_links(&text)
         .into_iter()
         .find(|l| l.span.start == offset)?;
+    // A spec link previews its defining note (resolved through the spec-anchor
+    // index, same pick rule as the click path). status: wikilink-spec-links
+    if let Some(slug) = wikilink::parse_spec_target(&link.target) {
+        let anchor_paths = app
+            .vault_session
+            .services
+            .read_store
+            .lock()
+            .ok()
+            .and_then(|s| s.spec_anchor_paths(slug).ok())?;
+        return pick_anchor_path(&anchor_paths, Some(path));
+    }
     let paths = app
         .vault_session
         .vault
@@ -330,5 +663,47 @@ fn resolve_target_path(app: &AppState, path: &str, offset: usize) -> Option<Stri
     match wikilink::resolve_path(&paths, &link.target, policy, Some(path)) {
         Resolution::Resolved(p) => Some(p),
         Resolution::Unresolved | Resolution::Ambiguous(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod block_anchor_tests {
+    use super::{collect_block_refs, matching_block_range, markdown_link_dests};
+
+    #[test]
+    fn collects_block_refs_from_both_link_forms() {
+        let text = "see [[Page#^abc]] and [Doc](other#^xyz) and [[Plain]] and [[P#Head]]\n";
+        let refs = collect_block_refs(text);
+        let pairs: Vec<(&str, &str)> =
+            refs.iter().map(|r| (r.page.as_str(), r.id.as_str())).collect();
+        // Only the two `#^id` block anchors; the plain link and the heading
+        // anchor are excluded.
+        assert_eq!(pairs, vec![("Page", "abc"), ("other", "xyz")]);
+    }
+
+    #[test]
+    fn collects_same_document_block_ref() {
+        let refs = collect_block_refs("anchor [[#^local]] here\n");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].page, "");
+        assert_eq!(refs[0].id, "local");
+    }
+
+    #[test]
+    fn matching_block_range_finds_un_anchored_block_by_content_id() {
+        let body = "intro\n\nThe target paragraph.\n\ntail\n";
+        let blocks = hiker_core::wikilink::scan_blocks(body);
+        let target = blocks.iter().find(|b| b.preview == "The target paragraph.").unwrap();
+        let id = hiker_core::wikilink::fresh_block_id(body, &target.range);
+        let found = matching_block_range(body, &id).expect("re-locates the block by id");
+        assert_eq!(found, target.range);
+        // An id matching no block's content yields nothing.
+        assert!(matching_block_range(body, "nope99").is_none());
+    }
+
+    #[test]
+    fn markdown_link_dests_extracts_destinations() {
+        let dests = markdown_link_dests("a [x](one) b [[y]] c [z](two#^id)\n");
+        assert_eq!(dests, vec!["one".to_string(), "two#^id".to_string()]);
     }
 }

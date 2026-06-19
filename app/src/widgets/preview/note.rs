@@ -128,8 +128,12 @@ thread_local! {
     /// persist across frames for the previewed note; it's recreated when the
     /// previewed path changes. Parked off `AppState` so [`render_note_preview`]
     /// can hold `&mut app` and `&mut embed` at once without aliasing — exactly
-    /// the `show_file_edit` trick.
-    static PREVIEW_EMBED: RefCell<Option<(String, EmbeddedView)>> = const { RefCell::new(None) };
+    /// the `show_file_edit` trick. The third slot is the epic rollup line
+    /// (`pm-epic-rollup`'s "4/9 done" hover surface), computed once per
+    /// previewed path so the per-member derived-status reads don't rerun
+    /// every frame.
+    static PREVIEW_EMBED: RefCell<Option<(String, EmbeddedView, Option<String>)>> =
+        const { RefCell::new(None) };
 }
 
 /// Draw the one pending note preview, if any, AFTER the sidebar has rendered.
@@ -177,15 +181,29 @@ pub(crate) fn render_note_preview(ctx: &egui::Context, app: &mut AppState) {
         let mut slot = cell.borrow_mut();
         // Recreate the embed when the previewed note changes (its scroll / paint
         // caches are per-note).
-        let needs_new = slot.as_ref().is_none_or(|(p, _)| p != &req.path);
+        let needs_new = slot.as_ref().is_none_or(|(p, _, _)| p != &req.path);
         if needs_new {
-            *slot = Some((req.path.clone(), EmbeddedView::new()));
+            let pm_line = epic_summary_line(app, &req.path);
+            *slot = Some((req.path.clone(), EmbeddedView::new(), pm_line));
         }
-        let Some((_, embed)) = slot.as_mut() else {
+        let Some((_, embed, pm_line)) = slot.as_mut() else {
             return;
         };
-        paint_note_area(ctx, app, &req, embed);
+        let pm_line = pm_line.clone();
+        paint_note_area(ctx, app, &req, embed, pm_line.as_deref());
     });
+}
+
+/// The epic rollup one-liner for a previewed list-like note
+/// (`pm-epic-rollup`'s hover surface — "4/9 done"): `None` for every other
+/// kind, so plain notes pay nothing.
+fn epic_summary_line(app: &AppState, path: &str) -> Option<String> {
+    let registry = app.vault_session.services.kinds.as_ref();
+    let store = app.vault_session.services.read_store.lock().ok()?;
+    let kind = store.meta_value(path, "hiker.kind").ok().flatten()?;
+    registry.list_like(&kind)?;
+    let progress = hiker_core::pm::epic_progress(&store, registry, path).ok()?;
+    Some(progress.summary())
 }
 
 /// Place + paint the note preview's `Area`, rendering the note read-only into the
@@ -200,6 +218,7 @@ fn paint_note_area(
     app: &mut AppState,
     req: &NotePreviewRequest,
     embed: &mut EmbeddedView,
+    pm_line: Option<&str>,
 ) {
     let pad = NOTE_PREVIEW_PAD;
     let draw = NOTE_PREVIEW_SIZE;
@@ -219,6 +238,15 @@ fn paint_note_area(
             egui::Frame::popup(ui.style())
                 .inner_margin(egui::Margin::same(pad as i8))
                 .show(ui, |ui| {
+                    // Epic rollup line ("4/9 done") above the body for
+                    // list-like notes. status: pm-epic-rollup
+                    if let Some(line) = pm_line {
+                        ui.label(
+                            egui::RichText::new(line)
+                                .small()
+                                .color(hiker_theme::muted()),
+                        );
+                    }
                     let (rect, _) = ui.allocate_exact_size(draw, egui::Sense::hover());
                     let mut child = ui.new_child(
                         egui::UiBuilder::new().max_rect(rect).layout(*ui.layout()),

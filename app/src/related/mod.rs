@@ -138,12 +138,15 @@ fn render_body(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>) {
         // markdown hover-preview, in place of the old rich snippet card. The
         // preview is the affordance for "what's in this note" now, so the row
         // stays terse. [feature-related-migration]
+        let label = related_label(hit);
         let resp = ui
-            .add(egui::Button::image_and_text(
-                icons::ICONS.image(icons::Icon::File),
-                related_label(hit),
-            ))
-            .on_hover_text(&hit.path);
+            .add(
+                egui::Button::image_and_text(icons::ICONS.image(icons::Icon::File), &label)
+                    .sense(egui::Sense::click_and_drag()),
+            )
+            .on_hover_text(&hit.path)
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        crate::widgets::note_row::note_drag_source(ui, &resp, &hit.path, &label);
         if resp.hovered() {
             crate::widgets::preview::register_note_hover(ui, resp.rect, &hit.path);
         }
@@ -154,8 +157,9 @@ fn render_body(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>) {
             crate::item_menu::BaseOpts { reveal: true },
         );
         if resp.clicked() {
+            let sticky = crate::widgets::note_row::open_sticky(ui.input(|i| i.modifiers));
             let path = hit.path.clone();
-            ctx.defer(move |app| editor_pane::open_file(app, &path, /* sticky */ false));
+            ctx.defer(move |app| editor_pane::open_file(app, &path, sticky));
         }
     }
 }

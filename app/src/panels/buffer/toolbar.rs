@@ -11,7 +11,7 @@ use eframe::egui;
 use super::{format, open_diff_vs_disk, toolbar_menus, BufCtx};
 use crate::editor_pane;
 use crate::icons;
-use crate::state::ToastLevel;
+use crate::state::{AppState, ToastLevel};
 use hiker_theme as theme;
 
 /// The pending-rewrite agent banner shows a compact strip
@@ -23,7 +23,7 @@ impl BufCtx<'_> {
         let ui = &mut *self.ui;
         let app = &mut *self.app;
         let path: &str = self.path;
-        // Reads the per-frame op-log cache populated in
+        // Reads the per-frame layered-doc cache populated in
         // `main::refresh_whole_file_proposals`. The most recent whole-file op for
         // the path is the one surfaced (`note-open-routes-to-pending-review`); the
         // list is already sorted newest-first.
@@ -157,7 +157,7 @@ impl BufCtx<'_> {
                     });
                     // Agent-diff toggle: jump to the whole-file review-preview
                     // tab when a write-shaped proposal is in flight against this
-                    // note. Reads the op-log-backed whole-file-proposal cache
+                    // note. Reads the layered-doc-backed whole-file-proposal cache
                     // (anchored `edit_note` hunks already review inline via
                     // `agent_proposal`; this button is the whole-file surface).
                     // Mutually-exclusive with the user-diff button above per
@@ -263,7 +263,7 @@ impl BufCtx<'_> {
                 let target = target_path.clone();
                 // Drift: Accept disabled with reason in tooltip, Reject active —
                 // per `write-note-review-conflicted-display`. Read off the
-                // op-log cache so the gate matches the listing.
+                // layered-doc cache so the gate matches the listing.
                 let drifted = app
                     .ui_cache
                     .whole_file_proposals
@@ -322,6 +322,74 @@ impl BufCtx<'_> {
                     None => Some(crate::tab::DiffSource::Disk { path: buffer.path().to_string() }),
                 };
             }
+        }
+    }
+}
+
+/// Staging-proposal accept/reject verbs for the toolbars above (the
+/// read-only source toolbar and the pending-rewrite banner). Methods on
+/// `AppState`, beside their only call sites.
+impl AppState {
+    /// Accept a pending whole-file proposal: flip the op to `accepted` via
+    /// the checked flip seam (`AppState::flip_ops_checked`, carrying the
+    /// apply-time one-sprint re-check, → `LayeredDoc::accept_pending`), which
+    /// applies its text edit to `accepted` and atomically rewrites the `.md`.
+    /// `proposal_id` is the pending op id; `target_path` the note it targets.
+    /// On success, navigate to the target as a preview tab per
+    /// `staging-accept-navigates-to-preview`.
+    ///
+    /// A per-doc accept of an op that belongs to a multi-doc batch (the
+    /// `op-log-reorg-batch` / sprint-close shape) splits the batch, so it
+    /// warns and names the sibling docs left pending — the Patch review tab
+    /// reviews such batches as one row instead.
+    ///
+    /// status: write-note-review-surface
+    pub(super) fn accept_staging_proposal(&mut self, proposal_id: &str, target_path: &str) {
+        let log = self.vault_session.services.layered.clone();
+        let batch_siblings =
+            hiker_core::ops::op_writes::pending_batch_siblings(log.as_ref(), proposal_id)
+                .unwrap_or_default();
+        match self.flip_ops_checked(
+            target_path,
+            std::slice::from_ref(&proposal_id.to_string()),
+            /* accept */ true,
+        ) {
+            Ok(_) => {
+                if batch_siblings.is_empty() {
+                    self.push_toast(
+                        format!("Accepted proposal for {}", target_path),
+                        ToastLevel::Info,
+                    );
+                } else {
+                    self.push_toast(
+                        format!(
+                            "Accepted 1 op of a multi-doc batch — still pending: {}. \
+                             Review the rest in Patch review.",
+                            batch_siblings.join(", "),
+                        ),
+                        ToastLevel::Warn,
+                    );
+                }
+                editor_pane::open_file(self, target_path, /* sticky */ true);
+            }
+            Err(err) => self.push_toast(format!("Accept failed: {}", err), ToastLevel::Error),
+        }
+    }
+
+    /// Reject a pending whole-file proposal: flip the op to `rejected` via
+    /// the checked flip seam (→ `LayeredDoc::reject_pending`), writing
+    /// a rejected audit row and dropping the op from the queue. Disk content is
+    /// untouched.
+    ///
+    /// status: write-note-review-surface
+    pub(super) fn reject_staging_proposal(&mut self, proposal_id: &str, target_path: &str) {
+        match self.flip_ops_checked(
+            target_path,
+            std::slice::from_ref(&proposal_id.to_string()),
+            /* accept */ false,
+        ) {
+            Ok(()) => self.push_toast("Proposal rejected".to_string(), ToastLevel::Info),
+            Err(err) => self.push_toast(format!("Reject failed: {}", err), ToastLevel::Error),
         }
     }
 }

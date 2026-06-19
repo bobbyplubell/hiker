@@ -34,6 +34,34 @@ pub fn stable_id(root: &Path) -> std::io::Result<String> {
     Ok(id)
 }
 
+/// Write `bytes` to `abs` via a sibling temp file: create parents, write,
+/// fsync, rename. Same save discipline as the layered doc's atomic writes
+/// (`op-log-atomic-write`), applied to user-content writes so a crash
+/// mid-write never leaves a truncated note — the rename either lands whole
+/// or not at all. The `.tmp` suffix keeps the sibling inside the watcher's
+/// hard-coded ignore list, so no spurious event fires for it.
+pub(crate) fn write_atomic(abs: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = abs.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = abs.with_extension(match abs.extension() {
+        Some(ext) => format!("{}.tmp", ext.to_string_lossy()),
+        None => "tmp".to_string(),
+    });
+    {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, abs)?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryKind {
@@ -174,8 +202,11 @@ impl Vault {
             // root as a vault lets the user expand into a build tree
             // from the sidebar, which then caches a `DirEntryDto` per
             // file in `SidebarState.dir_cache` — easily millions of
-            // entries on a Rust monorepo.
-            if crate::watcher::is_ignored(&rel_path) {
+            // entries on a Rust monorepo. Uses the composed matcher so
+            // .gitignore/.hikerignore/config exclusions hide build/vendor
+            // noise from the file tree too — while markdown notes are
+            // never hidden (note-protection invariant).
+            if crate::ignore::is_ignored_in(&self.root, &rel_path, matches!(kind, EntryKind::Dir)) {
                 continue;
             }
             // mtime: best-effort. A failed metadata/system-time call is not a
@@ -229,10 +260,7 @@ impl Vault {
 
     pub fn write_file(&self, rel: &str, contents: &str) -> Result<(), HikerError> {
         let abs = self.resolve(rel)?;
-        if let Some(parent) = abs.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&abs, contents)?;
+        write_atomic(&abs, contents.as_bytes())?;
         Ok(())
     }
 
@@ -242,6 +270,22 @@ impl Vault {
         expected_hash: &str,
         contents: &str,
     ) -> Result<String, HikerError> {
+        self.verify_disk_hash(rel, expected_hash)?;
+        let abs = self.resolve(rel)?;
+        write_atomic(&abs, contents.as_bytes())?;
+        Ok(hash_string(contents))
+    }
+
+    /// The read half of [`write_file_checked`](Self::write_file_checked):
+    /// error `DiskDrift` when the on-disk content's hash differs from
+    /// `expected_hash`. A missing file passes only when `expected_hash` is
+    /// empty (the create case). Write paths that commit through the layered doc
+    /// instead of a direct vault write run this check standalone.
+    pub fn verify_disk_hash(
+        &self,
+        rel: &str,
+        expected_hash: &str,
+    ) -> Result<(), HikerError> {
         let abs = self.resolve(rel)?;
         match fs::read(&abs) {
             Ok(bytes) => {
@@ -265,11 +309,7 @@ impl Vault {
             }
             Err(e) => return Err(e.into()),
         }
-        if let Some(parent) = abs.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&abs, contents)?;
-        Ok(hash_string(contents))
+        Ok(())
     }
 
     /// Walk a vault subtree for `.md` files and return their vault-relative
@@ -310,7 +350,14 @@ impl Vault {
                 if rel_str.is_empty() {
                     return true; // root entry
                 }
-                !crate::watcher::is_ignored(&rel_str)
+                // The composed matcher (hard-coded list + .gitignore +
+                // .hikerignore + config), so the layered-doc seed / reconcile /
+                // bulk-op walk prunes identically to the indexer full-scan
+                // and the watcher registration walk — one ignore policy,
+                // every seam. A `.gitignore`/`.hikerignore`'d build tree or
+                // test-fixture dir no longer gets seeded as layered docs;
+                // markdown notes stay protected by the matcher's invariant.
+                !crate::ignore::is_ignored_in(&self.root, &rel_str, e.file_type().is_dir())
             });
         for entry in walker {
             let entry = entry.map_err(|e| HikerError::Io(e.to_string()))?;
@@ -356,6 +403,41 @@ impl Vault {
         fs::write(&abs, "")?;
         Ok(rel.to_string())
     }
+}
+
+/// The first free `<folder>/<stem>.md` path (auto-suffixing `-N`,
+/// 1..1000, on collision). Filesystem-read-only — the caller does the
+/// create. Shared by `boards::ops::plan_new_board`, the freeform-card
+/// promote's note-create step, and the vault rules layer's `create_note`
+/// verb (the same collision rule everywhere).
+///
+/// status: board-create
+/// status: rule-closed-verbs
+pub fn next_free_md_path(
+    vault: &Vault,
+    folder: &str,
+    stem: &str,
+) -> Result<String, HikerError> {
+    let candidate_at = |n: Option<u32>| -> String {
+        let base = match n {
+            None => stem.to_string(),
+            Some(n) => format!("{stem}-{n}"),
+        };
+        if folder.is_empty() {
+            format!("{base}.md")
+        } else {
+            format!("{folder}/{base}.md")
+        }
+    };
+    for attempt in std::iter::once(None).chain((1..1000).map(Some)) {
+        let candidate = candidate_at(attempt);
+        if !vault.abs_path(&candidate)?.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(HikerError::AlreadyExists(format!(
+        "ran out of {stem}-N candidates"
+    )))
 }
 
 /// A note's *companion folder* path (`note-companion-folder` in
@@ -486,7 +568,11 @@ pub fn move_note(
         let from_dir_abs = vault.resolve(from_dir)?;
         let to_dir_abs = vault.resolve(to_dir)?;
         if let Err(e) = fs::rename(&from_dir_abs, &to_dir_abs) {
-            let _ = fs::rename(&to_abs, &from_abs);
+            if let Err(rb) = fs::rename(&to_abs, &from_abs) {
+                tracing::error!(error = %rb, %from, %to,
+                    "move rollback failed: note left at destination while \
+                     companion folder stayed at source — note/folder desynced");
+            }
             return Err(HikerError::Io(format!(
                 "move companion folder {from_dir} -> {to_dir}: {e}"
             )));
@@ -526,7 +612,11 @@ pub fn move_note(
     if !companion_members.is_empty()
         && let Err(e) = store.rename_notes_by_paths(&companion_members)
     {
-        let _ = store.rename_note_by_path(to, from);
+        if let Err(rb) = store.rename_note_by_path(to, from) {
+            tracing::error!(error = %rb, %from, %to,
+                "move rollback failed: store kept the renamed note path \
+                 while the member remap was reverted");
+        }
         rollback_companion(vault, &companion, &to_abs, &from_abs);
         return Err(HikerError::Io(e.to_string()));
     }
@@ -534,7 +624,10 @@ pub fn move_note(
 }
 
 /// Best-effort fs rollback of a companion-folder move + the note rename,
-/// used when a store remap fails after the fs renames committed.
+/// used when a store remap fails after the fs renames committed. Best-effort
+/// means a rollback failure can't change the error the caller returns — but
+/// it must never be silent: a failed rollback leaves disk and index
+/// disagreeing, which the user can only repair if they know it happened.
 fn rollback_companion(
     vault: &Vault,
     companion: &Option<(String, String)>,
@@ -544,10 +637,16 @@ fn rollback_companion(
     if let Some((from_dir, to_dir)) = companion
         && let (Ok(from_dir_abs), Ok(to_dir_abs)) =
             (vault.resolve(from_dir), vault.resolve(to_dir))
+        && let Err(e) = fs::rename(&to_dir_abs, &from_dir_abs)
     {
-        let _ = fs::rename(&to_dir_abs, &from_dir_abs);
+        tracing::error!(error = %e, %from_dir, %to_dir,
+            "move rollback failed: companion folder left at destination");
     }
-    let _ = fs::rename(to_abs, from_abs);
+    if let Err(e) = fs::rename(to_abs, from_abs) {
+        tracing::error!(error = %e, from = %from_abs.display(), to = %to_abs.display(),
+            "move rollback failed: note left at destination while the index \
+             rename was reverted — disk and index disagree on this path");
+    }
 }
 
 /// Atomic folder rename: fs rename of the whole folder + bulk index path
@@ -721,9 +820,9 @@ pub fn delete_note(
             w.suppress(rel);
         }
         let mut entry = trash.move_file_in(vault.root(), rel)?;
-        // Record the op-log doc_id (when the note was tracked) so a later
-        // restore can rebind `path → doc_id` and recover the doc's retained
-        // `.ops` history rather than minting a fresh import. status: vault-trash-restore
+        // Record the layered-doc doc_id (when the note was tracked) so a later
+        // restore can rebind `path → doc_id` and recover the doc's original
+        // identity rather than minting a fresh import. status: vault-trash-restore
         entry.doc_id = doc_id;
         if let Some(w) = watcher {
             // Re-suppress so the TTL window starts close to when notify
@@ -844,6 +943,41 @@ use crate::store::Store;
         assert_eq!(p, "alpha.md");
         let bytes = fs::read(dir.path().join("alpha.md")).unwrap();
         assert!(bytes.is_empty());
+    }
+
+    /// `walk_indexable_files` (the layered-doc seed / reconcile / bulk-op seam)
+    /// honors the composed ignore matcher — `.hikerignore` drops non-note
+    /// files (the test-fixture over-capture fix) while the note-protection
+    /// invariant keeps even a hikerignored markdown note indexable. Locks the
+    /// seam to the same policy the indexer full-scan already used.
+    #[test]
+    fn walk_indexable_files_honors_composed_ignore_matcher() {
+        let (dir, vault) = test_helpers::test_vault();
+        let root = dir.path();
+        fs::write(root.join(".hikerignore"), "fixtures/\n*.gen.txt\nsecret.md\n").unwrap();
+        fs::write(root.join("keep.md"), b"# note").unwrap();
+        fs::write(root.join("keep.txt"), b"plain").unwrap();
+        fs::write(root.join("data.gen.txt"), b"generated").unwrap();
+        fs::write(root.join("secret.md"), b"# protected note").unwrap();
+        fs::create_dir_all(root.join("fixtures")).unwrap();
+        fs::write(root.join("fixtures/golden.txt"), b"fixture").unwrap();
+        // Force the per-vault matcher to (re)read the ignore file we just
+        // wrote, rather than a lazily-cached empty one.
+        crate::ignore::register(root, &[]);
+
+        let mut got = vault.walk_indexable_files("").unwrap();
+        got.sort();
+
+        assert!(got.contains(&"keep.md".to_string()), "note kept: {got:?}");
+        assert!(got.contains(&"keep.txt".to_string()), "unignored txt kept: {got:?}");
+        // Note-protection: a hikerignored markdown note still indexes.
+        assert!(got.contains(&"secret.md".to_string()), "note protected from .hikerignore: {got:?}");
+        // The over-capture fix: hikerignored non-note files are not seeded.
+        assert!(!got.contains(&"data.gen.txt".to_string()), "glob-ignored txt dropped: {got:?}");
+        assert!(
+            !got.contains(&"fixtures/golden.txt".to_string()),
+            "txt under ignored dir dropped: {got:?}"
+        );
     }
 
     #[test]

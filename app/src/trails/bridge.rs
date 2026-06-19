@@ -45,14 +45,14 @@ pub fn list(ctx: &SurfaceCtx<'_>) -> Vec<TrailListItem> {
     let Ok(store) = ctx.services.read_store.lock() else {
         return Vec::new();
     };
-    trails::list(ctx.vault, &store, &ctx.services.oplog).unwrap_or_default()
+    trails::list(ctx.vault, &store, &ctx.services.layered).unwrap_or_default()
 }
 
 /// Fetch the full detail bundle for `trail_doc_rel` (ordered, resolved
 /// waypoints + append cursor + body). `None` on any read/parse error.
 pub fn get_trail(ctx: &SurfaceCtx<'_>, trail_doc_rel: &str) -> Option<TrailDetail> {
     let store = ctx.services.read_store.lock().ok()?;
-    trails::get_trail(ctx.vault, &store, &ctx.services.oplog, trail_doc_rel).ok()
+    trails::get_trail(ctx.vault, &store, &ctx.services.layered, trail_doc_rel).ok()
 }
 
 /// Pre-compute the cascade size for a remove-waypoint confirm dialog
@@ -67,7 +67,7 @@ pub fn descendant_count(ctx: &SurfaceCtx<'_>, trail_doc_rel: &str, waypoint_path
 pub fn create_trail(ctx: &mut SurfaceCtx<'_>, name: &str) -> Result<String, HikerError> {
     let watcher = ctx.services.watcher.clone();
     let jobs = ctx.services.indexer.job_sender();
-    let log = ctx.services.oplog.clone();
+    let log = ctx.services.layered.clone();
     let vault = ctx.vault.clone();
     let trails_cfg = ctx
         .config
@@ -103,7 +103,7 @@ pub fn set_append_cursor(
 pub fn delete_trail(ctx: &mut SurfaceCtx<'_>, trail_doc_rel: &str) -> Result<(), HikerError> {
     let watcher = ctx.services.watcher.clone();
     let jobs = ctx.services.indexer.job_sender();
-    let log = ctx.services.oplog.clone();
+    let log = ctx.services.layered.clone();
     let vault = ctx.vault.clone();
     let trash = hiker_core::trash::Trash::open(ctx.vault.root());
     let trail_doc_rel = trail_doc_rel.to_string();

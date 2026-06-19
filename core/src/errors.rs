@@ -15,6 +15,12 @@ pub enum HikerError {
     DiskDrift { expected: String, found: String },
     #[error("already exists: {0}")]
     AlreadyExists(String),
+    /// The one-sprint invariant (`derived-status-rule`) refused an
+    /// apply-time flip: accepting the op would land a note card on a
+    /// second sprint-kind board. The message names the note and the
+    /// holding sprint(s); the refused op stays pending.
+    #[error("one-sprint invariant: {0}")]
+    SprintConflict(String),
     #[error("not found: {0}")]
     NotFound(String),
     #[error("config: {0}")]

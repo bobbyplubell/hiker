@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::sections::TrailsConfig;
 use crate::errors::HikerError;
 use crate::indexer::{IndexJob, IndexJobTx};
-use crate::oplog::OpLog;
+use crate::editing::LayeredDoc;
 use crate::store::Store;
 use crate::trash::{Trash, Entry};
 use crate::vault::Vault;
@@ -20,8 +20,7 @@ use time::OffsetDateTime;
 // Only the most heavily-used parent items are imported; the rest are
 // reached via explicit `super::` paths at their use sites so this file
 // doesn't lean on a wide slice of its parent's namespace (per
-// `check-splits` super-reach). The migration helpers near the bottom of
-// the file are the main consumers of the rarer parent items.
+// `check-splits` super-reach).
 use super::{parse_trail_doc_for, write_trail_doc_frontmatter, WaypointEntry};
 
 // ---------------------------------------------------------------------------
@@ -30,7 +29,7 @@ use super::{parse_trail_doc_for, write_trail_doc_frontmatter, WaypointEntry};
 
 /// Outcome of a successful `create_trail` call. `trail_doc_rel` is the
 /// vault-relative path of the just-written trail-doc; `trail_id` is the
-/// op-log `doc_id` for that path (read after the write, since op-log
+/// layered-doc `doc_id` for that path (read after the write, since the layered doc
 /// minted it during ingest of the new file).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateTrailOutcome {
@@ -39,7 +38,7 @@ pub struct CreateTrailOutcome {
 }
 
 /// Outcome of a successful `append_waypoint` call. The waypoint is
-/// addressed by its vault-relative path; the optional op-log `doc_id`
+/// addressed by its vault-relative path; the optional layered-doc `doc_id`
 /// for the waypoint-note is surfaced for callers that still need the
 /// internal id (e.g. trail-graph viewers).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,7 +73,7 @@ pub struct RemoveWaypointOutcome {
 pub async fn create_trail(
     watcher: &Watcher,
     jobs: &IndexJobTx,
-    log: &OpLog,
+    log: &LayeredDoc,
     vault: &Vault,
     config: &TrailsConfig,
     name: &str,
@@ -91,7 +90,7 @@ pub async fn create_trail(
     }
 
     // Minimal valid trail-doc frontmatter — no `hiker.id` per
-    // `trail-doc-shape` (the trail's storage key is the op-log's
+    // `trail-doc-shape` (the trail's storage key is the layered doc's
     // doc_id, read from `doc-index.db` after the write).
     let body = "---\nhiker:\n  kind: trail\n  waypoints: []\n---\n".to_string();
 
@@ -133,13 +132,13 @@ pub async fn create_trail(
         })?
     };
 
-    // Read the op-log's doc_id for the trail-doc path; this is the
+    // Read the layered doc's doc_id for the trail-doc path; this is the
     // trail's storage key for the waypoint folder under `.hiker/trails/`.
-    // op-log mints it on first ingest (`op-log-doc-id-bootstrap`); the
+    // The layered doc mints it on first ingest (`op-log-doc-id-bootstrap`); the
     // file we just wrote exists on disk, but the bootstrap pass may not
     // have run yet on this path — call into `commit_working` /
     // `external_edit`-equivalent semantics via the standard read after
-    // the file is on disk. The `OpLog::doc_id_for_path` only returns
+    // the file is on disk. The `LayeredDoc::doc_id_for_path` only returns
     // Some once seeded; if it isn't, seed by reading the just-written
     // file as a fresh document via the bootstrap routine.
     let trail_id =
@@ -187,7 +186,7 @@ pub async fn create_trail(
 pub struct AppendWaypointArgs<'a> {
     pub watcher: &'a Watcher,
     pub jobs: &'a IndexJobTx,
-    pub log: &'a OpLog,
+    pub log: &'a LayeredDoc,
     pub vault: &'a Vault,
     pub trail_doc_rel: &'a str,
     pub source_rel: &'a str,
@@ -216,7 +215,7 @@ pub async fn append_waypoint(
     // status: store-path-is-identity
     // No source-side id stamping — `note-id-stamping` retired with
     // path-as-identity. The source is referenced by its vault path; the
-    // op-log keeps the path↔doc_id mapping internally.
+    // layered doc keeps the path↔doc_id mapping internally.
 
     // 1. Read the trail-doc + look up its doc_id (the trail's identity).
     let trail_src = vault.read_file(trail_doc_rel)?;
@@ -474,14 +473,14 @@ pub fn descendant_count(
 ///
 /// `log` is retained in the signature for callers that pass it, but the
 /// cascade scope is now derived from the trail-doc *path* (its companion
-/// folder), not the op-log doc_id.
+/// folder), not the layered-doc doc_id.
 ///
 /// status: trail-delete-cascade
 /// status: note-companion-folder
 pub async fn delete_trail(
     watcher: &Watcher,
     jobs: &IndexJobTx,
-    _log: &OpLog,
+    _log: &LayeredDoc,
     vault: &Vault,
     _trash: &Trash,
     trail_doc_rel: &str,
@@ -521,8 +520,6 @@ pub async fn delete_trail(
 /// Under path-as-identity (`trail-path-references`) the reference IS a
 /// vault path, so resolution collapses to a two-branch yes/no: either
 /// the path lives in the index (`Resolved`) or it doesn't (`Orphan`).
-/// The legacy `SelfHeal` and `PathConflict` branches retire — there's
-/// no id half left to disagree with the path.
 ///
 /// status: trail-reference-resolution
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -598,7 +595,7 @@ pub fn resolve_reference(
 pub async fn on_note_moved(
     watcher: Option<&Watcher>,
     jobs: Option<&IndexJobTx>,
-    log: Option<&OpLog>,
+    log: Option<&LayeredDoc>,
     vault: &Vault,
     store: &mut Store,
     old_rel: &str,

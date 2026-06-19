@@ -31,7 +31,7 @@
 //!   delete/restore flows.
 //! - [`agent`] — MCP-routed writes (`write_note`,
 //!   `set_frontmatter`, `apply_tag`, `remove_tag`) +
-//!   `WriteCtx`. Queue as pending op-log ops authored `agent:<client_id>`
+//!   `WriteCtx`. Queue as pending layered-doc ops authored `agent:<client_id>`
 //!   when review mode is on.
 //!
 //! Every entry from the prior `core::ops` flat module re-exports here so

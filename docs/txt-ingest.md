@@ -5,7 +5,13 @@ Strategy for ingesting and rendering plain-text files. Scope is `.txt` only — 
 The headline decisions:
 
 - `.txt` files are indexed alongside `.md` (one more extension the indexer accepts; nothing else changes about the pipeline). [txt-extension-recognized]
+status:: done
+implements:: [[code:hiker/indexer/INDEXABLE_EXTENSIONS]]
+note:: walker, watcher router, and per-file chunker dispatch all consult `is_indexable_path`; `Chunker` trait + `MarkdownChunker`/`TxtChunker` live under `core::chunker` · evidence: `core/src/indexer.rs` (`is_indexable_path`, `process_upsert` chunker dispatch)
 - The editor renders `.txt` with markdown formatting by default, with a per-vault disable toggle. A lot of "txt" content is markdown with the wrong extension; rendering it nicely is a free win and the user can turn it off when it isn't. [txt-render-as-markdown-default]
+status:: done
+touches:: [[code:hiker/panels/buffer]]
+note:: per-vault default loaded from `editor.render_txt_as_markdown`; session override is [[spec:view-render-txt-as-markdown-toggle]] · evidence: `app/src/panels/buffer/mod.rs` (language selection by path, seeded from settings on vault open)
 - No source rewriting, ever. The file on disk stays exactly as the user typed or pasted it.
 - The chunker uses cheap deterministic heuristics — paragraph splits, structure detection, sentence packing. No LLMs in the ingest path. More expensive techniques are deferred (see "Deferred future options").
 
@@ -23,11 +29,11 @@ render_txt_as_markdown = true   # default
 
 When `false`, `.txt` opens with the language compartment set to `null` (plain text — no markdown parsing, no decorations, no live preview). Useful for vaults that genuinely contain plain-text content (logs, transcripts, dumps).
 
-Until `settings-vault-config-toml` lands, the flag has no loader — implementations should hardcode the default (`true`) and wire the config read in once the settings surface exists. The slug `txt-render-as-markdown-default` covers both the default and the eventual config-driven override.
+Until [[spec:settings-vault-config-toml]] lands, the flag has no loader — implementations should hardcode the default (`true`) and wire the config read in once the settings surface exists. The slug [[spec:txt-render-as-markdown-default]] covers both the default and the eventual config-driven override.
 
 Per-note override is deferred. If a single `.txt` in an otherwise-markdown vault needs different rendering, the right answer is to rename the extension, not to track per-file render state. Revisit if real usage shows this is too rigid.
 
-A *vault-session* override — flip the per-vault default for the current app session, no file mutation, no persistence — is reserved as `view-render-txt-as-markdown-toggle` in `editor.md`'s view-options menu. Different scope from the per-note override above, and consistent with the never-mutate rule.
+A *vault-session* override — flip the per-vault default for the current app session, no file mutation, no persistence — is reserved as [[spec:view-render-txt-as-markdown-toggle]] in `editor.md`'s view-options menu. Different scope from the per-note override above, and consistent with the never-mutate rule.
 
 **No autodetection.** We do not sniff `.txt` content to decide whether it "looks like markdown" and switch modes. Two reasons: (1) heuristics here are flaky on the boundary cases (a file with one `# header` line and 200 lines of plain prose), and (2) silently re-classifying a user's file is exactly the trust violation we avoid elsewhere. The user controls the extension; we render based on the extension and the vault flag, nothing else.
 
@@ -39,12 +45,18 @@ Three layers, applied in order. Each layer's output feeds the next.
 ### Layer 1: Paragraph splits
 
 Split the file on blank-line runs (one or more empty lines between paragraphs). This is the workhorse — emails, articles, READMEs, meeting notes, anything written for human reading separates ideas with blank lines, and that gives the chunker clean boundaries for free. [txt-chunker-paragraph-splits]
+status:: done
+implements:: [[code:hiker/chunker/txt/Txt]]
+note:: Layer 1 baseline subsumed by Layer 3 sentence-packing within sections · evidence: `core/src/chunker/txt.rs` (`chunk_txt`, `build_sections`)
 
 Empty `.txt` files produce zero chunks (matching the `.md` behavior in `index.md`).
 
 ### Layer 2: Heuristic structure detection
 
 Within the paragraph stream, recognize lightweight structural signals and treat them as virtual markdown elements for chunking purposes only — the source file is never modified. [txt-chunker-structure-heuristics]
+status:: done
+implements:: [[code:hiker/chunker/txt/chunk]]
+note:: ALL-CAPS + setext `===`/`---`; lists/blockquotes flow as content per spec · evidence: `core/src/chunker/txt.rs` (`detect_headings`, `is_setext_underline`, `looks_like_all_caps_heading`)
 
 Virtual headings populate `heading_path` on the resulting chunks the same way markdown headings do. If no virtual heading is detected anywhere in the file, chunks emit an empty `heading_path` — we do not synthesize a filename-derived breadcrumb, and downstream ranking treats empty paths as "no structure" rather than a sentinel.
 
@@ -58,11 +70,17 @@ Recognized patterns:
 ### Layer 3: Sentence pack within sections
 
 Inside each section produced by Layer 2 (a heading + the text that follows), accumulate sentences into chunks until reaching the same ~1200-char soft cap as the markdown chunker. This matches `index.md`'s chunking discipline so chunk sizes stay comparable across `.md` and `.txt` content. [txt-chunker-sentence-pack]
+status:: done
+implements:: [[code:hiker/chunker/txt/chunk]]
+note:: ~1200-char soft cap shared with markdown chunker · evidence: `core/src/chunker/txt.rs` (`sentence_pack_range`, `segment_sentences`)
 
 Sentence segmentation rules (deterministic, no library):
 
 - A sentence ends at `.`, `?`, or `!` *followed by whitespace and a capital letter* (or end of input). The trailing-space + capital rule rejects code operators (`foo.bar`, `obj.method()`) and abbreviations followed by lowercase tokens.
 - Common abbreviations checked against a small allowlist (`Mr.`, `Dr.`, `e.g.`, `i.e.`, `etc.`, `vs.`, ...) so they don't terminate sentences. Allowlist lives in `core::txt::abbreviations`. [txt-abbreviation-allowlist]
+status:: done
+implements:: [[code:hiker/chunker/txt/impl#[`ChunkerCtx<'a>`]is_abbrev_at]]
+note:: `Mr.`/`Dr.`/`e.g.`/`i.e.`/`etc.`/... · evidence: `core/src/chunker/txt.rs` (`abbreviations::ALL`, `is_abbreviation_ending_at`)
 - A period preceded by an unbroken digit run at line start (with optional leading whitespace) is a numbered-list prefix, not a sentence terminator — see Layer 2's list note above.
 - If a "section" has no detectable sentence terminators (e.g. a code paste with no real sentences), pack by line until the soft cap.
 
@@ -70,6 +88,9 @@ Sentence segmentation rules (deterministic, no library):
 ## Heuristic guardrails
 
 Layer 2's heuristics are eager by default — left unchecked they produce false-positive headings on any file with capitalized lines or `:`-suffixed paragraphs. Three guardrails: [txt-chunker-guardrails]
+status:: done
+implements:: [[code:hiker/chunker/txt/chunk]]
+note:: code-region exclusion + max-one ALL-CAPS promotion per 5-line window; period+space rule lives in `segment_sentences` · evidence: `core/src/chunker/txt.rs` (`detect_code_regions`, `last_caps_promotion` window)
 
 - **Max-promotions-per-window.** No more than one ALL-CAPS-heading promotion per rolling 5-line window. A file where every line is short and capitalized (a scream-cased poem, a list of acronyms) gets at most a few virtual headings, not one per line.
 - **Period-plus-space sentence rule** — the Layer 3 segmentation rule, which also prevents `obj.method` from being seen as a sentence break.
@@ -89,7 +110,7 @@ The other touch point is the walker / discovery filter that decides which paths 
 
 - **Files with no blank lines at all** (a wall of text or a log file). Layer 1 produces one giant paragraph; Layer 2 may find no headings; Layer 3 sentence-packs the whole file. Acceptable degradation — the file is still indexed and searchable, just with coarser granularity. If this proves too lossy in practice, the deferred TextTiling option (below) is the fix.
 - **Files that are mostly empty lines** (something poorly exported). Layer 1 produces lots of tiny paragraphs; Layer 3 packs them up to the soft cap. Works fine.
-- **Leading `---` block in a `.txt` file.** Not stripped. The markdown chunker's `chunker-frontmatter-strip` is markdown-only — for `.txt` (and any future non-`.md` format), a `---...---` block at the top is treated as content and chunked normally. If a user wants real frontmatter-style metadata on a non-markdown note, the right answers are (a) rename to `.md`, or (b) use a sidecar metadata file (the same strategy we'll adopt for every non-`.md` format that lands later — `.org`, `.pdf`, etc.). We don't sniff frontmatter into non-markdown formats because once we did, every format would grow its own subtle exception.
+- **Leading `---` block in a `.txt` file.** Not stripped. The markdown chunker's [[spec:chunker-frontmatter-strip]] is markdown-only — for `.txt` (and any future non-`.md` format), a `---...---` block at the top is treated as content and chunked normally. If a user wants real frontmatter-style metadata on a non-markdown note, the right answers are (a) rename to `.md`, or (b) use a sidecar metadata file (the same strategy we'll adopt for every non-`.md` format that lands later — `.org`, `.pdf`, etc.). We don't sniff frontmatter into non-markdown formats because once we did, every format would grow its own subtle exception.
 - **Mixed-encoding or non-UTF-8 content.** The reader is UTF-8-only. Files that fail UTF-8 decode are skipped with a warning, matching the `.md` behavior. If users hit this, a `--lossy` flag on `hiker reindex` could be added later (replaces invalid sequences with U+FFFD).
 - **Very large `.txt` files** (>5MB). Same sanity cap as `.md` per `index.md` — log and skip. Likely an accidentally-imported log dump.
 
@@ -100,7 +121,7 @@ Listed for forward-pointer / "we considered this":
 
 - **TextTiling** (Hearst 1997) — deterministic semantic-cohesion-based chunk boundaries via sliding window of bag-of-words cosine similarity. Useful when Layer 1 + 2 produce poor boundaries on long unbroken prose.
 - **Embedder-based semantic boundaries** — embed sentences with the existing embedder, place chunk boundaries where similarity to the running chunk centroid drops below a threshold. Reuses the embedder we already have but adds N embed calls per file just for chunking.
-- **LLM rewrite to markdown** — most flexible, most expensive, lossy in subtle ways. Lands as `editor.md`'s `note-mutation-reformat-as-markdown` action; routes through `core::tasks` per `task-queue.md` (single-shot `Direct`-shape task). Result lands in the active editor buffer as a single editor transaction; user saves to accept or Ctrl-Z to revert. Opt-in user action, not an ingest default.
+- **LLM rewrite to markdown** — most flexible, most expensive, lossy in subtle ways. Lands as `editor.md`'s [[spec:note-mutation-reformat-as-markdown]] action; routes through `core::tasks` per `task-queue.md` (single-shot `Direct`-shape task). Result lands in the active editor buffer as a single editor transaction; user saves to accept or Ctrl-Z to revert. Opt-in user action, not an ingest default.
 - **Content-shape fingerprinting** — a per-note structural fingerprint (code-byte share, detected languages, table/list/link density, heading count, frontmatter presence) computed deterministically from the chunk pass. Tells you *what shape* a note is — mostly code, mostly prose, link-heavy, tabular — without understanding what it's about. Cheap to compute (no LLM, no embedder), unlocks UI badges, search filters, and a clustering signal, and would let the chunker pick a strategy by shape (e.g. code-heavy `.txt` skips Layer 2 and uses line-packed chunks). Not specced; speculative until there's a concrete use that justifies the surface.
 
 These are not on the v1 roadmap. Reach for one only when the cheap layers prove inadequate on real content.

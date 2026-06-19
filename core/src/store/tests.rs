@@ -590,9 +590,9 @@ fn rename_trail_waypoint_paths_rewrites_prefix() {
 }
 
 // status: trail-reference-resolution / store-path-is-identity
-// Path-by-id round-trip retired with the `path_ids` table. The op-log
+// Path-by-id round-trip retired with the `path_ids` table. The layered doc
 // now owns the path↔doc_id mapping (`doc-index.db`), so this test moved
-// to `core::oplog::tests` (`doc_index_maps_path_to_id`).
+// to `core::editing::tests` (`doc_index_maps_path_to_id`).
 
 #[test]
 fn at_autocomplete_skips_skipped_rows() {
@@ -658,7 +658,7 @@ fn query_notes_equals_and_tag_membership() {
     let q = NoteQuery {
         filters: vec![MetaFilter::Equals {
             key: "status".into(),
-            value: "active".into(),
+            values: vec!["active".into()],
         }],
         ..Default::default()
     };
@@ -670,7 +670,7 @@ fn query_notes_equals_and_tag_membership() {
     let q = NoteQuery {
         filters: vec![MetaFilter::Equals {
             key: "tags".into(),
-            value: "project".into(),
+            values: vec!["project".into()],
         }],
         ..Default::default()
     };
@@ -704,14 +704,16 @@ fn query_notes_multi_filter_folder_order_limit() {
         filters: vec![
             MetaFilter::Equals {
                 key: "status".into(),
-                value: "active".into(),
+                values: vec!["active".into()],
             },
             MetaFilter::Equals {
                 key: "tags".into(),
-                value: "project".into(),
+                values: vec!["project".into()],
             },
         ],
         folder: Some("projects".into()),
+        path_glob: None,
+        path_eq: None,
         order: Some(NoteOrder::Mtime { dir: OrderDir::Desc }),
         limit: Some(1),
         select: vec![],
@@ -800,19 +802,206 @@ fn replace_note_metadata_overwrites_prior() {
     let active = NoteQuery {
         filters: vec![MetaFilter::Equals {
             key: "status".into(),
-            value: "active".into(),
+            values: vec!["active".into()],
         }],
         ..Default::default()
     };
     let done = NoteQuery {
         filters: vec![MetaFilter::Equals {
             key: "status".into(),
-            value: "done".into(),
+            values: vec!["done".into()],
         }],
         ..Default::default()
     };
     assert!(store.query_notes(&active).unwrap().is_empty());
     assert_eq!(store.query_notes(&done).unwrap().len(), 1);
+}
+
+/// Finding 3: `meta_value` for a list-valued key (multiple rows under one
+/// key) must return a deterministic row. The query builds the same vault
+/// twice with the list elements inserted in opposite orders; the value
+/// `meta_value` returns must be identical (the `ORDER BY value` minimum),
+/// not whichever row the engine happens to surface first.
+#[test]
+fn meta_value_is_deterministic_for_list_valued_keys() {
+    let build = |elems: &[&str]| {
+        let (_dir, mut store) = fresh_store();
+        let meta: Vec<(&str, &str, Option<f64>)> =
+            elems.iter().map(|e| ("tags", *e, None)).collect();
+        put_note(&mut store, "a.md", 1, &meta);
+        store.meta_value("a.md", "tags").unwrap()
+    };
+    let forward = build(&["alpha", "beta", "gamma"]);
+    let reverse = build(&["gamma", "beta", "alpha"]);
+    assert_eq!(forward, reverse, "list-valued meta_value must be order-independent");
+    assert_eq!(forward.as_deref(), Some("alpha"), "deterministic minimum by value");
+
+    // Missing key still yields None.
+    let (_dir, store) = fresh_store();
+    assert_eq!(store.meta_value("a.md", "nope").unwrap(), None);
+}
+
+// ---- query-layer store extensions (query-filter-grammar) ----
+
+#[test]
+fn query_notes_equals_value_list_is_any_of() {
+    let (_dir, mut store) = fresh_store();
+    let a = put_note(&mut store, "a.md", 1, &[("status", "active", None)]);
+    let b = put_note(&mut store, "b.md", 2, &[("status", "blocked", None)]);
+    put_note(&mut store, "c.md", 3, &[("status", "done", None)]);
+
+    let q = NoteQuery {
+        filters: vec![MetaFilter::Equals {
+            key: "status".into(),
+            values: vec!["active".into(), "blocked".into()],
+        }],
+        order: Some(NoteOrder::Path { dir: OrderDir::Asc }),
+        ..Default::default()
+    };
+    let ids: Vec<String> = store.query_notes(&q).unwrap().into_iter().map(|r| r.note_id).collect();
+    assert_eq!(ids, vec![a, b]);
+
+    // An empty value list matches nothing (and must not be a SQL error).
+    let q = NoteQuery {
+        filters: vec![MetaFilter::Equals { key: "status".into(), values: vec![] }],
+        ..Default::default()
+    };
+    assert!(store.query_notes(&q).unwrap().is_empty());
+}
+
+#[test]
+fn query_notes_board_membership_filter() {
+    let (_dir, mut store) = fresh_store();
+    let a = put_note(&mut store, "work/a.md", 1, &[]);
+    let b = put_note(&mut store, "work/b.md", 2, &[]);
+    put_note(&mut store, "work/c.md", 3, &[]);
+    let card = |path: &str, column: &str| crate::store::dto::BoardCardRow {
+        board_id: "boards/q3.md".into(),
+        board_path: "boards/q3.md".into(),
+        card_note_path: path.into(),
+        column_name: column.into(),
+        ordinal: 0,
+    };
+    store
+        .replace_board_cards("boards/q3.md", &[card("work/a.md", "Doing"), card("work/b.md", "Done")])
+        .unwrap();
+
+    // Board-only clause: every note card on the board.
+    let q = NoteQuery {
+        filters: vec![MetaFilter::Board { board_path: "boards/q3.md".into(), columns: None }],
+        order: Some(NoteOrder::Path { dir: OrderDir::Asc }),
+        ..Default::default()
+    };
+    let ids: Vec<String> = store.query_notes(&q).unwrap().into_iter().map(|r| r.note_id).collect();
+    assert_eq!(ids, vec![a.clone(), b]);
+
+    // Column-restricted clause.
+    let q = NoteQuery {
+        filters: vec![MetaFilter::Board {
+            board_path: "boards/q3.md".into(),
+            columns: Some(vec!["Doing".into()]),
+        }],
+        ..Default::default()
+    };
+    let ids: Vec<String> = store.query_notes(&q).unwrap().into_iter().map(|r| r.note_id).collect();
+    assert_eq!(ids, vec![a.clone()]);
+
+    // Multi-column set (the category-expansion shape,
+    // `kind-column-state-map`): an IN over the names; an empty set
+    // matches nothing.
+    let q = NoteQuery {
+        filters: vec![MetaFilter::Board {
+            board_path: "boards/q3.md".into(),
+            columns: Some(vec!["Doing".into(), "Done".into()]),
+        }],
+        order: Some(NoteOrder::Path { dir: OrderDir::Asc }),
+        ..Default::default()
+    };
+    assert_eq!(store.query_notes(&q).unwrap().len(), 2);
+    let q = NoteQuery {
+        filters: vec![MetaFilter::Board {
+            board_path: "boards/q3.md".into(),
+            columns: Some(Vec::new()),
+        }],
+        ..Default::default()
+    };
+    assert!(store.query_notes(&q).unwrap().is_empty());
+
+    // A different board path matches nothing.
+    let q = NoteQuery {
+        filters: vec![MetaFilter::Board { board_path: "boards/other.md".into(), columns: None }],
+        ..Default::default()
+    };
+    assert!(store.query_notes(&q).unwrap().is_empty());
+}
+
+/// `all_board_cards` returns every board's rows in one pass, ordered by
+/// `(board_path, column_name, ordinal)` — the whole-table read the vault
+/// graph's board-membership edge union builds from (`vault-graph-typed-edges`).
+#[test]
+fn all_board_cards_spans_every_board() {
+    let (_dir, mut store) = fresh_store();
+    let card = |board: &str, path: &str, column: &str, ordinal: i64| {
+        crate::store::dto::BoardCardRow {
+            board_id: board.into(),
+            board_path: board.into(),
+            card_note_path: path.into(),
+            column_name: column.into(),
+            ordinal,
+        }
+    };
+    store
+        .replace_board_cards(
+            "boards/q3.md",
+            &[card("boards/q3.md", "work/b.md", "Doing", 1), card("boards/q3.md", "work/a.md", "Doing", 0)],
+        )
+        .unwrap();
+    store
+        .replace_board_cards("boards/ideas.md", &[card("boards/ideas.md", "work/c.md", "Inbox", 0)])
+        .unwrap();
+
+    let rows = store.all_board_cards().unwrap();
+    let got: Vec<(String, String)> = rows
+        .into_iter()
+        .map(|r| (r.board_path, r.card_note_path))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("boards/ideas.md".to_string(), "work/c.md".to_string()),
+            ("boards/q3.md".to_string(), "work/a.md".to_string()),
+            ("boards/q3.md".to_string(), "work/b.md".to_string()),
+        ],
+        "every board, ordered by (board_path, column, ordinal)"
+    );
+}
+
+#[test]
+fn query_notes_path_glob() {
+    let (_dir, mut store) = fresh_store();
+    let a = put_note(&mut store, "work/proj/a.md", 1, &[]);
+    put_note(&mut store, "personal/b.md", 2, &[]);
+
+    let q = NoteQuery {
+        path_glob: Some("work/**".into()),
+        ..Default::default()
+    };
+    let ids: Vec<String> = store.query_notes(&q).unwrap().into_iter().map(|r| r.note_id).collect();
+    assert_eq!(ids, vec![a]);
+}
+
+#[test]
+fn meta_key_has_num_probes_numeric_mirror() {
+    let (_dir, mut store) = fresh_store();
+    put_note(
+        &mut store,
+        "a.md",
+        1,
+        &[("priority", "3", Some(3.0)), ("status", "active", None)],
+    );
+    assert!(store.meta_key_has_num("priority").unwrap());
+    assert!(!store.meta_key_has_num("status").unwrap());
+    assert!(!store.meta_key_has_num("missing").unwrap());
 }
 
 // ---- vault-view lens projection (vault-view-source-groups) ----
@@ -898,5 +1087,206 @@ fn all_trail_waypoints_orders_by_trail_then_tree_path() {
     assert_eq!(
         order,
         vec![("A", "1"), ("A", "2"), ("B", "1"), ("B", "1.1")],
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Spec-anchor index — [spec-anchor-index]
+// ---------------------------------------------------------------------------
+
+#[test]
+fn spec_anchors_replace_query_and_lifecycle() {
+    let (_dir, mut store) = fresh_store();
+    store
+        .upsert_note(&NoteUpsert {
+            path: "docs/a.md",
+            content_hash: "h1",
+            mtime: 1,
+            size: 1,
+            indexed_at: 1,
+            embedder_version: "v",
+            chunks: Vec::new(),
+        })
+        .unwrap();
+
+    store
+        .replace_spec_anchors("docs/a.md", &["my-slug".into(), "other-slug".into()])
+        .unwrap();
+    store.replace_spec_anchors("docs/b.md", &["my-slug".into()]).unwrap();
+    let mut paths = store.spec_anchor_paths("my-slug").unwrap();
+    assert_eq!(paths, vec!["docs/a.md".to_string(), "docs/b.md".to_string()], "sorted");
+
+    // Re-derive overwrites: the slug set shrinks with the content.
+    store.replace_spec_anchors("docs/a.md", &["other-slug".into()]).unwrap();
+    paths = store.spec_anchor_paths("my-slug").unwrap();
+    assert_eq!(paths, vec!["docs/b.md".to_string()]);
+
+    // Rename re-keys the anchors with the note.
+    store.rename_note_by_path("docs/a.md", "docs/renamed.md").unwrap();
+    assert_eq!(store.spec_anchor_paths("other-slug").unwrap(), vec!["docs/renamed.md".to_string()]);
+
+    // Delete clears them.
+    store.delete_note_by_path("docs/renamed.md").unwrap();
+    assert!(store.spec_anchor_paths("other-slug").unwrap().is_empty());
+
+    // Skip clears too (a skipped file isn't indexed).
+    store.upsert_skipped("docs/b.md", "not UTF-8", 1, 1).unwrap();
+    assert!(store.spec_anchor_paths("my-slug").unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Lenient-validation problems — [kind-lenient-validation]
+// ---------------------------------------------------------------------------
+
+#[test]
+fn note_problems_replace_query_and_lifecycle() {
+    use crate::store::dto::NoteProblem;
+    let (_dir, mut store) = fresh_store();
+    put_note(&mut store, "work/a.md", 1, &[("hiker.kind", "story", None)]);
+
+    let p = |field: &str, message: &str| NoteProblem {
+        field: field.into(),
+        message: message.into(),
+    };
+    store
+        .replace_note_problems(
+            "work/a.md",
+            &[p("priority", "expected a number, found `soon`"), p("due", "required field is missing")],
+        )
+        .unwrap();
+    let probs = store.note_problems("work/a.md").unwrap();
+    assert_eq!(probs.len(), 2);
+    assert_eq!(store.notes_with_problems().unwrap(), vec![("work/a.md".to_string(), 2)]);
+
+    // Re-derive overwrites: the note cleaned up on its next ingest.
+    store.replace_note_problems("work/a.md", &[p("due", "required field is missing")]).unwrap();
+    assert_eq!(store.note_problems("work/a.md").unwrap().len(), 1);
+
+    // Rename re-keys the report with the note.
+    store.rename_note_by_path("work/a.md", "work/renamed.md").unwrap();
+    assert!(store.note_problems("work/a.md").unwrap().is_empty());
+    assert_eq!(store.note_problems("work/renamed.md").unwrap().len(), 1);
+
+    // An empty replace clears (a clean note keeps no rows).
+    store.replace_note_problems("work/renamed.md", &[]).unwrap();
+    assert!(store.notes_with_problems().unwrap().is_empty());
+
+    // Delete and skip clear any remaining rows.
+    store.replace_note_problems("work/renamed.md", &[p("x", "y")]).unwrap();
+    store.delete_note_by_path("work/renamed.md").unwrap();
+    assert!(store.note_problems("work/renamed.md").unwrap().is_empty());
+    put_note(&mut store, "work/b.md", 1, &[]);
+    store.replace_note_problems("work/b.md", &[p("x", "y")]).unwrap();
+    store.upsert_skipped("work/b.md", "not UTF-8", 1, 1).unwrap();
+    assert!(store.note_problems("work/b.md").unwrap().is_empty());
+}
+
+/// `list_refs` lifecycle (`pm-epic-derived-table`): replace is
+/// clear-then-reinsert keyed by list path, `members_of` returns list
+/// order, `lists_containing_note` is the reverse lookup, deletes clear by
+/// list, and the rename helpers re-key member edges / the list's own key.
+#[test]
+fn list_refs_replace_query_delete_and_rename() {
+    let (_dir, mut store) = fresh_store();
+    store
+        .replace_list_refs(
+            "epics/e1.md",
+            &["b.md".to_string(), "a.md".to_string()],
+        )
+        .unwrap();
+    store
+        .replace_list_refs("plans/p.md", &["a.md".to_string()])
+        .unwrap();
+
+    // Order is the list's own order (position), not name order.
+    let members = store.members_of("epics/e1.md").unwrap();
+    assert_eq!(
+        members.iter().map(|m| m.member_path.as_str()).collect::<Vec<_>>(),
+        ["b.md", "a.md"],
+    );
+    assert_eq!(members[1].position, 1);
+
+    // Reverse lookup spans lists; ordered by list path.
+    let containing = store.lists_containing_note("a.md").unwrap();
+    assert_eq!(
+        containing.iter().map(|h| h.list_path.as_str()).collect::<Vec<_>>(),
+        ["epics/e1.md", "plans/p.md"],
+    );
+
+    // Replace is clear-then-reinsert: dropped members leave no stale rows.
+    store
+        .replace_list_refs("epics/e1.md", &["c.md".to_string()])
+        .unwrap();
+    assert_eq!(store.members_of("epics/e1.md").unwrap().len(), 1);
+    assert_eq!(store.lists_containing_note("b.md").unwrap().len(), 0);
+
+    // Rename helpers: member edge re-key + list-doc re-key.
+    store.rename_list_ref_member_paths("c.md", "moved/c.md").unwrap();
+    assert_eq!(store.lists_containing_note("moved/c.md").unwrap().len(), 1);
+    store
+        .rename_list_refs_for_list("epics/e1.md", "epics/renamed.md")
+        .unwrap();
+    assert!(store.members_of("epics/e1.md").unwrap().is_empty());
+    assert_eq!(store.members_of("epics/renamed.md").unwrap().len(), 1);
+
+    // Delete clears by list only; the other list is untouched.
+    assert_eq!(store.delete_list_refs_by_list("epics/renamed.md").unwrap(), 1);
+    assert!(store.members_of("epics/renamed.md").unwrap().is_empty());
+    assert_eq!(store.members_of("plans/p.md").unwrap().len(), 1);
+}
+
+/// The whole-table read behind the vault graph's list-membership edges
+/// (`vault-graph-typed-edges`, Phase D): every list's rows in one pass,
+/// ordered by `(list_path, position)` — list order inside each list, lists
+/// in path order.
+#[test]
+fn all_list_refs_spans_every_list() {
+    let (_dir, mut store) = fresh_store();
+    store
+        .replace_list_refs("plans/p.md", &["epics/e1.md".to_string()])
+        .unwrap();
+    store
+        .replace_list_refs(
+            "epics/e1.md",
+            &["work/b.md".to_string(), "work/a.md".to_string()],
+        )
+        .unwrap();
+
+    let rows = store.all_list_refs().unwrap();
+    let got: Vec<(String, String)> = rows
+        .into_iter()
+        .map(|r| (r.list_path, r.member_path))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("epics/e1.md".to_string(), "work/b.md".to_string()),
+            ("epics/e1.md".to_string(), "work/a.md".to_string()),
+            ("plans/p.md".to_string(), "epics/e1.md".to_string()),
+        ],
+    );
+}
+
+/// The whole-table anchor read behind the vault graph's spec edges
+/// (`vault-graph-spec-edges`): every `(slug, note_path)` pair in one pass,
+/// slug-ordered, multi-defined slugs yielding one row per defining note.
+#[test]
+fn all_spec_anchors_spans_every_note() {
+    let (_dir, mut store) = fresh_store();
+    store
+        .replace_spec_anchors("docs/b.md", &["shared-slug".into()])
+        .unwrap();
+    store
+        .replace_spec_anchors("docs/a.md", &["a-slug".into(), "shared-slug".into()])
+        .unwrap();
+
+    let rows = store.all_spec_anchors().unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("a-slug".to_string(), "docs/a.md".to_string()),
+            ("shared-slug".to_string(), "docs/a.md".to_string()),
+            ("shared-slug".to_string(), "docs/b.md".to_string()),
+        ],
     );
 }

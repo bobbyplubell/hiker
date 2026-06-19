@@ -24,6 +24,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use hiker_core::queries::SmartFolder;
 use hiker_core::store::dto::{NoteMetaRow, WaypointRow};
 
 /// What a node represents — drives icon choice in the renderer and lets
@@ -42,6 +43,13 @@ pub enum NodeKind {
     Waypoint,
     /// A chat session note.
     Session,
+    /// A query-doc rendered as a smart-folder header (`smart-folder-view`).
+    Query,
+    /// A note appearing under a smart folder as a virtual member — marked
+    /// (italic + badge) as a reference, never a residence.
+    QueryMember,
+    /// A smart folder's loud error row (malformed filter / unreadable doc).
+    QueryError,
     /// Any other ordinary note.
     Note,
 }
@@ -211,7 +219,11 @@ fn is_imported_session(row: &NoteMetaRow) -> bool {
 /// status: vault-view-trail-nesting
 /// status: vault-view-sidecar-surfacing
 /// status: vault-view-source-groups
-pub fn build_composed(notes: &[NoteMetaRow], waypoints: &[WaypointRow]) -> Vec<VaultNode> {
+pub fn build_composed(
+    notes: &[NoteMetaRow],
+    waypoints: &[WaypointRow],
+    folders: &[SmartFolder],
+) -> Vec<VaultNode> {
     let by_id: HashMap<&str, &NoteMetaRow> =
         notes.iter().map(|n| (n.id.as_str(), n)).collect();
     let by_path: HashMap<&str, &NoteMetaRow> =
@@ -227,10 +239,55 @@ pub fn build_composed(notes: &[NoteMetaRow], waypoints: &[WaypointRow]) -> Vec<V
     let mut roots: Vec<VaultNode> = Vec::new();
 
     roots.extend(build_trail_nodes(waypoints, &by_id, &by_path, &by_stem, &mut consumed));
+    roots.extend(build_smart_folder_nodes(folders, &mut consumed));
     roots.extend(build_crawl_nodes(notes, &by_id, &mut consumed));
     roots.extend(build_sidecar_nodes(notes, &by_path, &mut consumed));
     roots.extend(build_source_groups(notes, &consumed));
     roots
+}
+
+/// Smart folders: one virtual folder per query-doc. The header row IS the
+/// query-doc (consumed so it renders exactly once, like a trail-doc) and
+/// carries the live match count; member rows are *virtual* — their paths
+/// are deliberately NOT consumed, so a match also keeps appearing in every
+/// other grouping that claims it. A query-doc whose filter failed renders
+/// a loud error child instead of an empty (or match-all) folder.
+///
+/// status: smart-folder-view
+fn build_smart_folder_nodes(
+    folders: &[SmartFolder],
+    consumed: &mut HashSet<String>,
+) -> Vec<VaultNode> {
+    let mut out = Vec::new();
+    for folder in folders {
+        consumed.insert(folder.rel_path.clone());
+        let (label, children) = match &folder.result {
+            Ok(rows) => (
+                format!("{}  ({})", folder.title, rows.len()),
+                rows.iter()
+                    .map(|r| VaultNode::leaf(&r.path, NodeKind::QueryMember))
+                    .collect(),
+            ),
+            Err(e) => (
+                folder.title.clone(),
+                // The error row opens the query-doc so the fix is one
+                // click away.
+                vec![VaultNode {
+                    label: format!("query error: {e}"),
+                    path: Some(folder.rel_path.clone()),
+                    kind: NodeKind::QueryError,
+                    children: Vec::new(),
+                }],
+            ),
+        };
+        out.push(VaultNode {
+            label,
+            path: Some(folder.rel_path.clone()),
+            kind: NodeKind::Query,
+            children,
+        });
+    }
+    out
 }
 
 /// Trail-nesting: one node per trail-doc, waypoints nested by the resolved
@@ -594,7 +651,7 @@ mod tests {
         // A stray file in the folder with NO parent stamp must NOT nest.
         let stray = note("S1", "captures/job/stray.md");
 
-        let forest = build_composed(&[job, child, stray], &[]);
+        let forest = build_composed(&[job, child, stray], &[], &[]);
         // job (with 1 child) + stray surfaces top-level via source groups.
         let job_node = forest
             .iter()
@@ -614,7 +671,7 @@ mod tests {
     fn dangling_parent_stamp_is_not_nested() {
         let mut child = note("C1", "orphan.md");
         child.parent = Some("NOPE".into()); // no note with this id
-        let forest = build_composed(&[child], &[]);
+        let forest = build_composed(&[child], &[], &[]);
         // Appears as a normal top-level note (under a source group), not lost.
         let all = flatten(&forest);
         assert_eq!(all.iter().filter(|p| *p == "orphan.md").count(), 1);
@@ -631,7 +688,7 @@ mod tests {
             wp("T1", "w2", "research/b.md", Some("w1"), "1.1"), // side trail under w1
             wp("T1", "w3", "research/c.md", None, "2"),
         ];
-        let forest = build_composed(&[trail], &waypoints);
+        let forest = build_composed(&[trail], &waypoints, &[]);
         let t = forest
             .iter()
             .find(|n| n.kind == NodeKind::Trail)
@@ -649,7 +706,7 @@ mod tests {
     #[test]
     fn sidecar_pairs_with_synthetic_source() {
         let sidecar = note("S1", "docs/rm0090.pdf.md");
-        let forest = build_composed(&[sidecar], &[]);
+        let forest = build_composed(&[sidecar], &[], &[]);
         let src = forest
             .iter()
             .find(|n| n.path.as_deref() == Some("docs/rm0090.pdf"))
@@ -673,7 +730,7 @@ mod tests {
         let session = note("SE1", "chats/2026-05-30-01ABCDEF.md");
         let imported = note("SE2", "chats/imported/2026-05-29-01ZZZZZZ.md");
 
-        let forest = build_composed(&[mine, agent, session, imported], &[]);
+        let forest = build_composed(&[mine, agent, session, imported], &[], &[]);
         let labels: Vec<&str> = forest.iter().map(|n| n.label.as_str()).collect();
         assert!(labels.iter().any(|l| l.starts_with("My notes")));
         assert!(labels.iter().any(|l| l.starts_with("Agent-authored")));
@@ -697,6 +754,77 @@ mod tests {
             .find(|c| c.kind == NodeKind::Session)
             .unwrap();
         assert!(dated.label.starts_with("2026-05-30"));
+    }
+
+    fn folder(
+        rel: &str,
+        title: &str,
+        result: Result<Vec<&str>, hiker_core::queries::Error>,
+    ) -> SmartFolder {
+        SmartFolder {
+            rel_path: rel.into(),
+            title: title.into(),
+            result: result.map(|paths| {
+                paths
+                    .into_iter()
+                    .map(|p| hiker_core::store::dto::NoteQueryRow {
+                        note_id: p.into(),
+                        path: p.into(),
+                        title: display_label(p),
+                        mtime: 0,
+                        fields: Default::default(),
+                    })
+                    .collect()
+            }),
+        }
+    }
+
+    #[test]
+    fn smart_folder_members_are_virtual_and_header_is_consumed() {
+        let mut doc = note("Q1", "queries/rust.md");
+        doc.kind = Some("query".into());
+        let mut member = note("M1", "notes/lang.md");
+        member.author = Some("user-authored".into());
+        let folders = vec![folder("queries/rust.md", "rust", Ok(vec!["notes/lang.md"]))];
+
+        let forest = build_composed(&[doc, member], &[], &folders);
+        let header = forest
+            .iter()
+            .find(|n| n.kind == NodeKind::Query)
+            .expect("smart-folder header");
+        // Header row IS the query-doc, with the live match count.
+        assert_eq!(header.path.as_deref(), Some("queries/rust.md"));
+        assert_eq!(header.label, "rust  (1)");
+        assert_eq!(header.children.len(), 1);
+        assert_eq!(header.children[0].kind, NodeKind::QueryMember);
+        assert_eq!(header.children[0].path.as_deref(), Some("notes/lang.md"));
+
+        let all = flatten(&forest);
+        // Membership is virtual: the member ALSO stays in its source group
+        // (two appearances), while the query-doc renders exactly once.
+        assert_eq!(all.iter().filter(|p| *p == "notes/lang.md").count(), 2);
+        assert_eq!(all.iter().filter(|p| *p == "queries/rust.md").count(), 1);
+    }
+
+    #[test]
+    fn smart_folder_error_renders_loud_error_row() {
+        let mut doc = note("Q1", "queries/broken.md");
+        doc.kind = Some("query".into());
+        let folders = vec![folder(
+            "queries/broken.md",
+            "broken",
+            Err(hiker_core::queries::Error::UnknownClause("nonsense".into())),
+        )];
+        let forest = build_composed(&[doc], &[], &folders);
+        let header = forest.iter().find(|n| n.kind == NodeKind::Query).unwrap();
+        // No match count on a failed query; one error child naming the
+        // failure, opening the query-doc.
+        assert_eq!(header.label, "broken");
+        assert_eq!(header.children.len(), 1);
+        let err = &header.children[0];
+        assert_eq!(err.kind, NodeKind::QueryError);
+        assert!(err.label.contains("nonsense"), "{}", err.label);
+        assert_eq!(err.path.as_deref(), Some("queries/broken.md"));
     }
 
     /// Collect every note path (leaves with a path) in the forest.

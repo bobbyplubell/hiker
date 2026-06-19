@@ -9,7 +9,7 @@
 //! Navigating the overview (Möbius drag + click fly-to) and swapping back to the
 //! canvas re-centers the canvas viewport on the focused node.
 //!
-//! [`CanvasGraphSource`] is the [`hiker_graph_view::graph_view::Source`] adapter;
+//! [`CanvasGraphSource`] is the [`hiker_graph_view::graph_view::source::Source`] adapter;
 //! [`Model`] is the egui-free, unit-testable spine (the id↔index map, the
 //! edge index pairs, viewport membership, and the focused-node pick) it reads
 //! from. The panel sets the graph view's `positions` to the card centers directly
@@ -19,11 +19,11 @@
 use eframe::egui;
 
 use canvas_view::palette::resolve_node;
-use hiker_canvas::geometry::{node_bounds, Rect as CanvasRect};
+use hiker_canvas::geometry::node_bounds;
 use hiker_canvas::model::{Canvas, NodeKind};
 use hiker_graph::{LayoutKind, LayoutTree};
-use hiker_graph_view::graph_view::{NodeDescriptor, NodeShape, Source, Style};
-use hiker_projection::{forward, Complex, Mobius, ProjectionConfig, ProjectionKind};
+use hiker_graph_view::graph_view::source::{NodeDescriptor, NodeShape, Source};
+use hiker_graph_view::graph_view::styling::Style;
 
 /// Radius (world units) every overview dot draws at. Small — the overview reads
 /// as dots, never cards.
@@ -113,60 +113,26 @@ impl Model {
     pub fn id_at(&self, i: usize) -> Option<&str> {
         self.cards.get(i).map(|c| c.id.as_str())
     }
-
-    /// Which cards lie within the canvas viewport's world rect — the viewport
-    /// indicator: a `true` flag means the overview should highlight that node so
-    /// the disk shows WHERE the canvas viewport currently sits. A card counts as
-    /// inside when its center is within `rect`.
-    #[must_use]
-    pub fn viewport_membership(&self, rect: CanvasRect) -> Vec<bool> {
-        self.cards
-            .iter()
-            .map(|c| rect.contains(hiker_canvas::geometry::Point::new(f64::from(c.center.x), f64::from(c.center.y))))
-            .collect()
-    }
-
-    /// The card whose projected disk point is nearest the disk origin under the
-    /// overview's current `nav` + projection — the node a swap-back should center
-    /// the canvas on. `None` for an empty overview. [the swap that moves the canvas]
-    #[must_use]
-    pub fn focused_card(&self, cfg: ProjectionConfig, nav: Mobius) -> Option<&str> {
-        let (focus, scale) = centroid_scale(&self.positions());
-        self.cards
-            .iter()
-            .min_by(|a, b| {
-                let da = disk_point(a.center, focus, scale, cfg, nav).abs();
-                let db = disk_point(b.center, focus, scale, cfg, nav).abs();
-                da.total_cmp(&db)
-            })
-            .map(|c| c.id.as_str())
-    }
 }
 
-/// The graph-view [`Source`] over an [`Model`]: emits one coloured dot
-/// per card with its title label + click path, brightening cards inside the
-/// canvas viewport so the overview marks where the viewport sits. Positions are
-/// supplied by the panel (the card centers), never force-laid-out, so
-/// `layout_tree` is trivial and `preview_for` is `None`.
+/// The graph-view [`Source`] over an [`Model`]: emits one coloured dot per card
+/// with its title label + click path. Positions are supplied by the panel (the
+/// card centers), never force-laid-out, so `layout_tree` is trivial and
+/// `preview_for` is `None`. The viewport-location indicator + focus pick are
+/// applied by the engine [`Minimap`](hiker_graph_view::graph_view::minimap::Minimap), so
+/// this source stays a plain data provider. status: canvas-minimap
 pub struct CanvasGraphSource<'a> {
     model: &'a Model,
-    /// Per-node viewport-membership flag, aligned to the index order — `true`
-    /// brightens the node (the viewport indicator).
-    in_viewport: Vec<bool>,
-    /// Brighter highlight stroke for in-viewport nodes.
-    highlight: egui::Color32,
+    /// Hover-ring colour for the dots (the theme selection accent).
+    hover: egui::Color32,
 }
 
 impl<'a> CanvasGraphSource<'a> {
-    /// Build the source from the overview model + the canvas viewport world rect
-    /// (for the indicator) + the active visuals (for the highlight color).
+    /// Build the source from the overview model + the active visuals (for the
+    /// dot hover-ring colour).
     #[must_use]
-    pub fn new(model: &'a Model, viewport_world: CanvasRect, visuals: &egui::Visuals) -> Self {
-        Self {
-            model,
-            in_viewport: model.viewport_membership(viewport_world),
-            highlight: visuals.selection.stroke.color,
-        }
+    pub const fn new(model: &'a Model, visuals: &egui::Visuals) -> Self {
+        Self { model, hover: visuals.selection.stroke.color }
     }
 }
 
@@ -180,29 +146,21 @@ impl Source for CanvasGraphSource<'_> {
             .cards
             .iter()
             .enumerate()
-            .map(|(index, card)| {
-                let hot = self.in_viewport.get(index).copied().unwrap_or(false);
-                // In-viewport cards read brighter (the indicator); the world
-                // position comes from the panel-supplied `positions`.
-                let fill = if hot { brighten(card.fill) } else { card.fill };
-                let resting = if hot {
-                    egui::Stroke::new(2.0, self.highlight)
-                } else {
-                    egui::Stroke::NONE
-                };
-                NodeDescriptor {
-                    index,
-                    world_pos: positions.get(index).copied().unwrap_or(card.center),
-                    radius: if hot { DOT_RADIUS * 1.4 } else { DOT_RADIUS },
-                    shape: NodeShape::Circle,
-                    fill,
-                    resting_stroke: resting,
-                    hover_stroke: egui::Stroke::new(2.0, self.highlight),
-                    label: (!card.title.is_empty()).then(|| card.title.clone()),
-                    label_min_zoom: LABEL_MIN_ZOOM,
-                    click_path: Some(card.id.clone()),
-                    tooltip: (!card.title.is_empty()).then(|| card.title.clone()),
-                }
+            .map(|(index, card)| NodeDescriptor {
+                index,
+                world_pos: positions.get(index).copied().unwrap_or(card.center),
+                radius: DOT_RADIUS,
+                shape: NodeShape::Circle,
+                fill: card.fill,
+                resting_stroke: egui::Stroke::NONE,
+                hover_stroke: egui::Stroke::new(2.0, self.hover),
+                badge: None,
+                bug_badge: None,
+                label: (!card.title.is_empty()).then(|| card.title.clone()),
+                label_min_zoom: LABEL_MIN_ZOOM,
+                label_scale: 1.0,
+                click_path: Some(card.id.clone()),
+                tooltip: (!card.title.is_empty()).then(|| card.title.clone()),
             })
             .collect()
     }
@@ -241,12 +199,6 @@ fn dot_fill(color: Option<&hiker_canvas::color::Color>, visuals: &egui::Visuals)
     }
 }
 
-/// A brighter variant of `c` for the in-viewport indicator: blend toward white.
-fn brighten(c: egui::Color32) -> egui::Color32 {
-    let mix = |v: u8| (u16::from(v) + (255 - u16::from(v)) * 6 / 10) as u8;
-    egui::Color32::from_rgb(mix(c.r()), mix(c.g()), mix(c.b()))
-}
-
 /// A cheap one-line title for a card, mirroring the canvas paint layer's LOD
 /// title: a File yields its basename (no dir, no `.md`), a Text its first
 /// non-empty line, a Link its host. Groups never reach the overview.
@@ -267,38 +219,6 @@ fn card_title(node: &hiker_canvas::model::Node) -> String {
             after.split(['/', '?', '#']).next().unwrap_or(after).to_string()
         }
         NodeKind::Group { .. } => String::new(),
-    }
-}
-
-/// The centroid + normalising scale of a set of world positions, mirroring the
-/// graph view's private `Lens` framing so [`focused_card`](Model::focused_card)
-/// projects exactly as the rendered overview does.
-fn centroid_scale(positions: &[egui::Vec2]) -> (egui::Vec2, f32) {
-    if positions.is_empty() {
-        return (egui::Vec2::ZERO, 1.0);
-    }
-    let mut sum = egui::Vec2::ZERO;
-    for &p in positions {
-        sum += p;
-    }
-    let centroid = sum / positions.len() as f32;
-    let scale = positions
-        .iter()
-        .map(|&p| (p - centroid).length())
-        .fold(0.0_f32, f32::max)
-        .max(1.0);
-    (centroid, scale)
-}
-
-/// The post-nav Poincaré disk point of a world position, mirroring the graph
-/// view's `Lens::disk`: `forward((w − focus) / scale)` then the Möbius `nav`.
-fn disk_point(w: egui::Vec2, focus: egui::Vec2, scale: f32, cfg: ProjectionConfig, nav: Mobius) -> Complex {
-    let rel = (w - focus) / scale;
-    let z = forward(Complex::from([rel.x, rel.y]), cfg);
-    if cfg.kind == ProjectionKind::Poincare {
-        nav.apply(z)
-    } else {
-        z
     }
 }
 
@@ -384,7 +304,7 @@ mod tests {
         // Colors resolve: the colored card gets a vivid (non-muted) dot, the
         // uncolored one falls back to muted.
         let visuals = egui::Visuals::dark();
-        let src = CanvasGraphSource::new(&model, CanvasRect::new(-1.0, -1.0, 1.0, 1.0), &visuals);
+        let src = CanvasGraphSource::new(&model, &visuals);
         let descs = src.nodes(&pos, &Style::flat());
         assert_eq!(descs.len(), 3);
         let muted = visuals.weak_text_color();
@@ -394,54 +314,5 @@ mod tests {
         assert_eq!(src.node_key(2).as_deref(), Some("c"));
         // click_path carries the id for navigation.
         assert_eq!(descs[2].click_path.as_deref(), Some("c"));
-    }
-
-    #[test]
-    fn viewport_membership_marks_visible_cards() {
-        let canvas = sample();
-        let model = Model::build(&canvas, &egui::Visuals::dark());
-        // A viewport rect covering only card `a`'s center (50, 50).
-        let rect = CanvasRect::new(0.0, 0.0, 200.0, 200.0);
-        let flags = model.viewport_membership(rect);
-        assert_eq!(flags, vec![true, false, false], "only `a` is inside the rect");
-        // A rect covering b's center (1050, 50) but not a or c.
-        let rect2 = CanvasRect::new(1000.0, 0.0, 200.0, 200.0);
-        assert_eq!(model.viewport_membership(rect2), vec![false, true, false]);
-    }
-
-    #[test]
-    fn focused_card_is_nearest_disk_center() {
-        let canvas = sample();
-        let model = Model::build(&canvas, &egui::Visuals::dark());
-        let cfg = ProjectionConfig {
-            kind: ProjectionKind::Poincare,
-            strength: 1.2,
-            ..Default::default()
-        };
-        // With identity nav the focus is the centroid; the card nearest the
-        // centroid projects nearest the origin.
-        let (focus, scale) = centroid_scale(&model.positions());
-        let nearest = (0..model.node_count())
-            .min_by(|&a, &b| {
-                disk_point(model.positions()[a], focus, scale, cfg, Mobius::identity())
-                    .abs()
-                    .total_cmp(&disk_point(model.positions()[b], focus, scale, cfg, Mobius::identity()).abs())
-            })
-            .unwrap();
-        assert_eq!(
-            model.focused_card(cfg, Mobius::identity()),
-            model.id_at(nearest),
-            "identity-nav focus is the centroid-nearest card"
-        );
-        // Recenter the disk on card `c`'s pre-nav disk point: a swap-back must
-        // then pick `c`.
-        let c_idx = 2;
-        let target = disk_point(model.positions()[c_idx], focus, scale, cfg, Mobius::identity());
-        let nav = Mobius::from_point_pair(target, Complex::ORIGIN);
-        assert_eq!(
-            model.focused_card(cfg, nav),
-            Some("c"),
-            "navigating to c's disk point makes c the focus"
-        );
     }
 }

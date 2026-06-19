@@ -78,56 +78,6 @@ fn workbench_runs_clean_for_three_frames() {
     }
 }
 
-/// Render a tool-call card through the structured path — JSON args with a
-/// markdown `content` field (which embeds a read-only editor preview) plus
-/// a JSON result — for a few frames. Guards the embed's first-frame /
-/// settled-height handoff and the JSON-shaping helpers against panics.
-#[test]
-fn tool_card_structured_render_runs_clean() {
-    use crate::chat::state::{ChatRole, ChatSession, ChatTurn, ToolCard};
-
-    let (mut state, runtime) = open_temp_vault();
-    let _guard = runtime.enter();
-
-    let session_id = "smoke".to_string();
-    let session = ChatSession {
-        id: session_id.clone(),
-        turns: vec![ChatTurn {
-            role: ChatRole::Tool,
-            text: String::new(),
-            tool: Some(ToolCard {
-                tool_name: "write_note".to_string(),
-                args: r##"{"path":"a/b.md","content":"# Title\n\nSome **bold** text.\n\n- one\n- two\n"}"##
-                    .to_string(),
-                result: Some(r#"{"status":"written","path":"a/b.md"}"#.to_string()),
-                ok: true,
-                produced_write: true,
-                target_path: Some("a/b.md".to_string()),
-            }),
-        }],
-        ..ChatSession::default()
-    };
-    state.chat_state.registry.sessions.insert(session_id.clone(), session);
-    state.chat_state.registry.active = Some(session_id.clone());
-
-    let mut harness = egui_kittest::Harness::builder()
-        .with_size(egui::vec2(1400.0, 900.0))
-        .build(|ctx: &egui::Context| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                crate::chat::render::show(
-                    ui,
-                    &mut state,
-                    Some(&session_id),
-                    crate::chat::render::Layout::FullTab,
-                );
-            });
-        });
-
-    for _ in 0..3 {
-        harness.run();
-    }
-}
-
 /// Closing a clean tab via the dirty-guard removes it immediately (no modal).
 /// Pins the relocated `editor_pane::close_tab_with_dirty_guard` (was
 /// `tabs::close_tab_with_dirty_guard` before the legacy dock engine was
@@ -291,12 +241,12 @@ fn snapshot_open_and_back_round_trips_in_the_active_tab() {
     use crate::editor_pane;
     use crate::state::NavTarget;
     let (mut state, _rt) = open_vault_with_note("note.md", "version one\n");
-    let log = state.vault_session.services.oplog.clone();
+    let log = state.vault_session.services.layered.clone();
     let vault = state.vault_session.vault.clone();
     // A second accepted version, so there's a prior op to snapshot to.
     hiker_core::ops::op_writes::user_save(&log, &vault, "note.md", "version two\n").unwrap();
-    let history = hiker_core::ops::op_writes::path_history(&log, "note.md", 10).unwrap();
-    let op_id = history.first().expect("an accepted op").op_id.clone();
+    let history = hiker_core::ops::op_writes::snapshot_history(&log, "note.md", 10).unwrap();
+    let op_id = history.first().expect("a snapshot version").snapshot_id.clone();
 
     // Open the live note in a tab.
     editor_pane::open_file(&mut state, "note.md", /* sticky */ true);
@@ -394,14 +344,14 @@ fn returning_to_live_from_a_snapshot_loads_the_buffer() {
     // must (re)load it, not leave a blank "Couldn't load the buffer" tab.
     use crate::editor_pane;
     let (mut state, _rt) = open_vault_with_note("note.md", "version one\n");
-    let log = state.vault_session.services.oplog.clone();
+    let log = state.vault_session.services.layered.clone();
     let vault = state.vault_session.vault.clone();
     hiker_core::ops::op_writes::user_save(&log, &vault, "note.md", "version two\n").unwrap();
-    let op_id = hiker_core::ops::op_writes::path_history(&log, "note.md", 10)
+    let op_id = hiker_core::ops::op_writes::snapshot_history(&log, "note.md", 10)
         .unwrap()
         .first()
         .unwrap()
-        .op_id
+        .snapshot_id
         .clone();
 
     editor_pane::open_file(&mut state, "note.md", true);

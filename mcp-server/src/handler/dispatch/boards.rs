@@ -21,11 +21,16 @@ impl App {
         let store = self.state.read_store.lock().map_err(|_| {
             ErrorData::internal_error("read_store mutex poisoned", None)
         })?;
-        let op_log = self.state.oplog.as_ref().ok_or_else(|| {
+        let layered = self.state.layered.as_ref().ok_or_else(|| {
             ErrorData::internal_error("boards_list requires an open op log", None)
         })?;
-        let rows = hiker_core::boards::list(&self.state.vault, &store, op_log)
-            .map_err(translate_hiker_err)?;
+        let rows = hiker_core::boards::list(
+            &self.state.vault,
+            &store,
+            layered,
+            Some(self.state.kinds.as_ref()),
+        )
+        .map_err(translate_hiker_err)?;
         Ok(structured(
             serde_json::to_value(&rows).unwrap_or(serde_json::Value::Null),
         ))
@@ -38,11 +43,15 @@ impl App {
         let store = self.state.read_store.lock().map_err(|_| {
             ErrorData::internal_error("read_store mutex poisoned", None)
         })?;
-        let op_log = self.state.oplog.as_ref().ok_or_else(|| {
+        let layered = self.state.layered.as_ref().ok_or_else(|| {
             ErrorData::internal_error("board_get requires an open op log", None)
         })?;
         let detail = hiker_core::boards::get_board(
-            &self.state.vault, &store, op_log, &p.rel_path,
+            &self.state.vault,
+            &store,
+            layered,
+            &p.rel_path,
+            Some(self.state.kinds.as_ref()),
         )
         .map_err(translate_hiker_err)?;
         Ok(structured(
@@ -52,7 +61,7 @@ impl App {
 
     /// status: board-mcp-tools
     /// Add a note as a card to a board column. In review-required mode the
-    /// board-doc frontmatter edit STAGES as one op-log pending op (like every
+    /// board-doc frontmatter edit STAGES as one layered-doc pending op (like every
     /// other agent write); in direct mode it commits via the same
     /// `core::boards::ops::add_card` user-save path the UI uses. Idempotent
     /// per board — a note already on the board returns `status: "noop"`.
@@ -69,7 +78,7 @@ impl App {
             .unwrap_or(false);
 
         if review_required {
-            let op_log = self.state.oplog.as_ref().ok_or_else(|| {
+            let layered = self.state.layered.as_ref().ok_or_else(|| {
                 ErrorData::internal_error(
                     "review mode requires an open op log".to_string(),
                     None,
@@ -77,52 +86,42 @@ impl App {
             })?;
             // Compute the board-doc's new frontmatter (card appended) without
             // writing, then stage it as one anchorless pending op authored
-            // `agent:<client>` — the same review path note writes use.
-            let new_src = hiker_core::boards::add_card_preview(
-                &self.state.vault,
-                &p.board_rel_path,
-                &p.column,
-                &p.source_rel_path,
-            )
-            .map_err(translate_hiker_err)?;
+            // `agent:<client>` — the same review path note writes use. The
+            // store read backs the one-sprint membership check
+            // (`derived-status-rule`); the guard drops before any await.
+            let new_src = self
+                .add_card_preview_guarded(&p.board_rel_path, &p.column, &p.source_rel_path)?;
             let Some(new_src) = new_src else {
                 return Ok(structured(serde_json::json!({
                     "board_rel_path": p.board_rel_path,
                     "status": "noop",
                 })));
             };
-            let proposal_id = self.stage_whole_body(op_log, &p.board_rel_path, &new_src)?;
+            let proposal_id = self.stage_whole_body(layered, &p.board_rel_path, &new_src)?;
             Ok(structured(serde_json::json!({
                 "board_rel_path": p.board_rel_path,
                 "status": "staged",
                 "proposal_id": proposal_id,
             })))
         } else {
-            let op_log = self.state.oplog.as_ref().ok_or_else(|| {
+            let layered = self.state.layered.as_ref().ok_or_else(|| {
                 ErrorData::internal_error(
                     "board_add_card requires an open op log".to_string(),
                     None,
                 )
             })?;
             // Compute the new board source under the lock, then drop it before
-            // the op-log write so no `!Send` `Store` guard crosses an await
-            // (the rmcp tool future must be `Send`). The card stores the
-            // source note's current ULID (empty when unstamped — the path half
-            // still anchors it; the derived-table flow heals later).
-            let new_src = hiker_core::boards::add_card_preview(
-                &self.state.vault,
-                &p.board_rel_path,
-                &p.column,
-                &p.source_rel_path,
-            )
-            .map_err(translate_hiker_err)?;
+            // the layered-doc write so no `!Send` `Store` guard crosses an await
+            // (the rmcp tool future must be `Send`).
+            let new_src = self
+                .add_card_preview_guarded(&p.board_rel_path, &p.column, &p.source_rel_path)?;
             let Some(new_src) = new_src else {
                 return Ok(structured(serde_json::json!({
                     "board_rel_path": p.board_rel_path,
                     "status": "noop",
                 })));
             };
-            op_writes::user_save(op_log, &self.state.vault, &p.board_rel_path, &new_src)
+            op_writes::user_save(layered, &self.state.vault, &p.board_rel_path, &new_src)
                 .map_err(translate_hiker_err)?;
             let _ = self
                 .state
@@ -137,6 +136,32 @@ impl App {
                 "status": "written",
             })))
         }
+    }
+
+    /// `core::boards::add_card_preview` under a scoped read-store lock —
+    /// the store backs the at-most-one-sprint check (`derived-status-rule`)
+    /// and the registry extends the parse gate to sprint-kind boards
+    /// (`sprint-board-subtype`). The guard never crosses an await.
+    fn add_card_preview_guarded(
+        &self,
+        board_rel_path: &str,
+        column: &str,
+        source_rel_path: &str,
+    ) -> Result<Option<String>, ErrorData> {
+        let store = self
+            .state
+            .read_store
+            .lock()
+            .map_err(|_| ErrorData::internal_error("read_store mutex poisoned", None))?;
+        hiker_core::boards::add_card_preview(
+            &self.state.vault,
+            &store,
+            Some(self.state.kinds.as_ref()),
+            board_rel_path,
+            column,
+            source_rel_path,
+        )
+        .map_err(translate_hiker_err)
     }
 
     /// Whether `review_required` is on. Reads the live shared config so a flip
@@ -165,7 +190,7 @@ impl App {
         new_src: Option<String>,
         extra: serde_json::Value,
     ) -> Result<CallToolResult, ErrorData> {
-        let op_log = self.state.oplog.as_ref().ok_or_else(|| {
+        let layered = self.state.layered.as_ref().ok_or_else(|| {
             ErrorData::internal_error("board write requires an open op log".to_string(), None)
         })?;
         let Some(new_src) = new_src else {
@@ -181,13 +206,13 @@ impl App {
             }
         }
         if self.review_required() {
-            let proposal_id = self.stage_whole_body(op_log, board_rel_path, &new_src)?;
+            let proposal_id = self.stage_whole_body(layered, board_rel_path, &new_src)?;
             if let Some(obj) = body.as_object_mut() {
                 obj.insert("status".into(), "staged".into());
                 obj.insert("proposal_id".into(), serde_json::to_value(proposal_id).unwrap_or(serde_json::Value::Null));
             }
         } else {
-            op_writes::user_save(op_log, &self.state.vault, board_rel_path, &new_src)
+            op_writes::user_save(layered, &self.state.vault, board_rel_path, &new_src)
                 .map_err(translate_hiker_err)?;
             let _ = self
                 .state
@@ -222,10 +247,10 @@ impl App {
     /// status: mcp-tool-board-create
     /// Create a new board-doc (default Todo/Doing/Done columns) at the
     /// configured `[boards] new_board_dir`. Commits directly via
-    /// `core::boards::ops::create_board`, even in review mode: the op-log
+    /// `core::boards::ops::create_board`, even in review mode: the layered-doc
     /// whole-file-create staging path seeds the document by writing an empty
     /// `.md` to disk before queueing the content as a pending op (see
-    /// `op_writes::doc_id_or_seed` → `OpLog::create_document` → `write_md_file`),
+    /// `op_writes::doc_id_or_seed` → `LayeredDoc::create_document` → `write_md_file`),
     /// which would leave a phantom empty board-doc visible in the vault until
     /// the user accepted. Creates are a structural action — there is no
     /// existing content to overwrite — so the safest choice is to commit
@@ -237,16 +262,17 @@ impl App {
         p: &BoardCreate,
     ) -> Result<CallToolResult, ErrorData> {
         self.guard_tool("board_create")?;
-        let op_log = self.state.oplog.as_ref().ok_or_else(|| {
+        let layered = self.state.layered.as_ref().ok_or_else(|| {
             ErrorData::internal_error("board_create requires an open op log", None)
         })?;
         let outcome = hiker_core::boards::ops::create_board(
             &self.state.watcher,
             &self.state.jobs,
-            op_log,
+            layered,
             &self.state.vault,
             &self.state.boards_config,
             &p.name,
+            None,
         )
         .await
         .map_err(translate_hiker_err)?;
@@ -265,6 +291,7 @@ impl App {
         let card_id = hiker_core::store::dto::new_id();
         let preview = hiker_core::boards::ops::preview_edit(
             &self.state.vault,
+            Some(self.state.kinds.as_ref()),
             &p.board_rel_path,
             &hiker_core::boards::ops::BoardEdit::AddTextCard {
                 column: &p.column,
@@ -292,6 +319,7 @@ impl App {
         // `card_id`; core disambiguates by shape.
         let preview = hiker_core::boards::ops::preview_move_card(
             &self.state.vault,
+            Some(self.state.kinds.as_ref()),
             &p.board_rel_path,
             &p.card_id,
             &p.to_column,
@@ -315,6 +343,7 @@ impl App {
     ) -> Result<CallToolResult, ErrorData> {
         let preview = hiker_core::boards::ops::preview_edit(
             &self.state.vault,
+            Some(self.state.kinds.as_ref()),
             &p.board_rel_path,
             &hiker_core::boards::ops::BoardEdit::SetCardText {
                 card_id: &p.card_id,
@@ -338,6 +367,7 @@ impl App {
     ) -> Result<CallToolResult, ErrorData> {
         let preview = hiker_core::boards::ops::preview_edit(
             &self.state.vault,
+            Some(self.state.kinds.as_ref()),
             &p.board_rel_path,
             &hiker_core::boards::ops::BoardEdit::RemoveCard { handle: &p.card_id },
         )
@@ -358,6 +388,7 @@ impl App {
     ) -> Result<CallToolResult, ErrorData> {
         let preview = hiker_core::boards::ops::preview_edit(
             &self.state.vault,
+            Some(self.state.kinds.as_ref()),
             &p.board_rel_path,
             &hiker_core::boards::ops::BoardEdit::AddColumn { name: &p.name },
         )
@@ -378,6 +409,7 @@ impl App {
     ) -> Result<CallToolResult, ErrorData> {
         let preview = hiker_core::boards::ops::preview_edit(
             &self.state.vault,
+            Some(self.state.kinds.as_ref()),
             &p.board_rel_path,
             &hiker_core::boards::ops::BoardEdit::RenameColumn {
                 old_name: &p.old_name,
@@ -401,6 +433,7 @@ impl App {
     ) -> Result<CallToolResult, ErrorData> {
         let preview = hiker_core::boards::ops::preview_edit(
             &self.state.vault,
+            Some(self.state.kinds.as_ref()),
             &p.board_rel_path,
             &hiker_core::boards::ops::BoardEdit::ReorderColumn {
                 name: &p.name,
@@ -424,6 +457,7 @@ impl App {
     ) -> Result<CallToolResult, ErrorData> {
         let preview = hiker_core::boards::ops::preview_edit(
             &self.state.vault,
+            Some(self.state.kinds.as_ref()),
             &p.board_rel_path,
             &hiker_core::boards::ops::BoardEdit::DeleteColumn { name: &p.name },
         )

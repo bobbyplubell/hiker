@@ -29,10 +29,11 @@ use thiserror::Error;
 
 use crate::errors::HikerError;
 use crate::frontmatter::{assemble, merge_json_into_yaml, split, Error as FmError};
-use crate::oplog::OpLog;
+use crate::editing::LayeredDoc;
 use crate::store::Store;
 use crate::vault::Vault;
 
+pub mod ingest;
 pub mod ops;
 #[cfg(test)]
 mod tests;
@@ -48,7 +49,7 @@ use ops::{resolve_reference, ResolutionOutcome};
 ///
 /// Under path-as-identity (`wikilink-path-form`), references are
 /// path-only — no ULID half. The waypoint's internal storage id is
-/// op-log's `doc_id` for the waypoint-note's path, never written into
+/// the layered doc's `doc_id` for the waypoint-note's path, never written into
 /// frontmatter.
 ///
 /// status: trail-side-trail-shape
@@ -66,7 +67,7 @@ pub struct WaypointEntry {
 /// not part of this struct — round-trip is via `parse_trail_doc` /
 /// `write_trail_doc_frontmatter` which preserve unknown siblings.
 ///
-/// The trail's internal identifier is its op-log `doc_id`, read from
+/// The trail's internal identifier is its layered-doc `doc_id`, read from
 /// `doc-index.db` rather than stamped into frontmatter
 /// (`op-log-document-identity`). No `hiker.id` field here.
 ///
@@ -239,11 +240,9 @@ fn parse_path_ref(v: &YamlValue) -> Option<String> {
 }
 
 /// Recursive YAML-to-`WaypointEntry` parser. Children at any depth are
-/// parsed via the same function. Pre-tree-format YAML (entries with no
-/// `waypoints:` key) parses cleanly with an empty children vec, so old
-/// flat trail-docs round-trip as a tree of all-root entries. References
-/// are path-only per `trail-path-references` — any legacy `id:` half is
-/// silently dropped on parse.
+/// parsed via the same function. An entry with no `waypoints:` key parses
+/// cleanly with an empty children vec. References are path-only per
+/// `trail-path-references`.
 ///
 /// status: trail-side-trail-shape
 /// status: trail-path-references
@@ -280,8 +279,8 @@ pub fn write_trail_doc_frontmatter(
     let mut hiker_patch = serde_json::Map::new();
     hiker_patch.insert("kind".into(), serde_json::Value::String("trail".into()));
     // status: trail-doc-shape
-    // No `hiker.id` — the trail's storage key is op-log's `doc_id` for
-    // the trail-doc's path (read via `oplog::doc_id_for_path`), kept in
+    // No `hiker.id` — the trail's storage key is the layered doc's `doc_id` for
+    // the trail-doc's path (read via `editing::doc_id_for_path`), kept in
     // `doc-index.db` rather than stamped into the file.
     if let Some(ts) = &fm.last_activated_at {
         hiker_patch.insert(
@@ -319,10 +318,6 @@ pub fn write_trail_doc_frontmatter(
         && let Some(YamlValue::Mapping(hiker)) = top.get_mut("hiker")
     {
         hiker.remove("waypoints");
-        // status: trail-doc-shape
-        // Strip any legacy `hiker.id` so rewriting an old trail-doc whose
-        // frontmatter stamped a ULID drops the field cleanly.
-        hiker.remove("id");
         // status: trail-append-cursor
         // When fm.append_under is None, strip any pre-existing
         // `append_under` key so the rewritten frontmatter reflects
@@ -374,13 +369,6 @@ pub fn write_waypoint_frontmatter(
     // No `hiker.id` — waypoints are addressed by their vault path.
     hiker_patch.insert("references".into(), path_ref_to_json(&fm.references));
     hiker_patch.insert("in_trail".into(), path_ref_to_json(&fm.in_trail));
-    // Strip any pre-existing legacy `id` so a rewrite of an old waypoint
-    // drops the stale field.
-    if let YamlValue::Mapping(top) = &mut existing
-        && let Some(YamlValue::Mapping(hiker)) = top.get_mut("hiker")
-    {
-        hiker.remove("id");
-    }
     let patch = serde_json::json!({ "hiker": serde_json::Value::Object(hiker_patch) });
     merge_json_into_yaml(&mut existing, patch);
     Ok(assemble(&existing, split_view.body)?)
@@ -395,7 +383,7 @@ fn path_ref_to_json(rel: &str) -> serde_json::Value {
 
 /// Leaf directory name of the hidden trails tree under `.hiker/`. Used now
 /// only for the draft staging area (`.hiker/trails/drafts/`) and the
-/// op-log bootstrap / watcher carve-out — accepted trails store their
+/// layered-doc bootstrap / watcher carve-out — accepted trails store their
 /// waypoints in the trail-doc's *visible* companion folder instead.
 ///
 /// status: trail-storage-layout
@@ -417,7 +405,7 @@ pub fn dir() -> String {
 
 /// Vault-relative prefix used to match anything under the hidden trails
 /// tree: `.hiker/trails/`. Use with `str::starts_with` (the watcher
-/// carve-out for drafts, op-log bootstrap's second pass).
+/// carve-out for drafts, layered-doc bootstrap's second pass).
 ///
 /// status: trail-storage-layout
 pub fn dir_prefix() -> String {
@@ -432,7 +420,7 @@ pub fn dir_prefix() -> String {
 /// folder is always the sibling of the trail-doc, wherever it lives.
 ///
 /// The waypoint dir is derived from the trail-doc's *path*, not its
-/// `doc_id`: the identity is still the op-log `doc_id`, but the physical
+/// `doc_id`: the identity is still the layered-doc `doc_id`, but the physical
 /// home now follows the doc on disk (so a rename moves the folder via
 /// `move_note`'s companion-folder pairing).
 ///
@@ -667,7 +655,7 @@ pub struct TrailDetail {
 pub fn list(
     vault: &Vault,
     store: &Store,
-    log: &OpLog,
+    log: &LayeredDoc,
 ) -> Result<Vec<TrailListItem>, HikerError> {
     let paths = store
         .all_note_paths()
@@ -715,7 +703,7 @@ pub fn list(
 pub fn get_trail(
     vault: &Vault,
     store: &Store,
-    log: &OpLog,
+    log: &LayeredDoc,
     trail_doc_rel: &str,
 ) -> Result<TrailDetail, HikerError> {
     let src = vault.read_file(trail_doc_rel)?;
@@ -772,7 +760,7 @@ pub struct ContainingNoteHit {
 pub fn containing_note_with_paths(
     vault: &Vault,
     store: &Store,
-    log: &OpLog,
+    log: &LayeredDoc,
     source_rel: &str,
 ) -> Result<Vec<ContainingNoteHit>, HikerError> {
     let hits = store

@@ -98,10 +98,6 @@ pub fn tree(
 // set*, not on centroids-of-centroids. Sub-splits stop per branch when
 // either child member count `<=` `leaf_min_size` OR child cohesion
 // radius `<` `leaf_cohesion_threshold`. Hard 16-level safety cap.
-//
-// The legacy `min_clusters_to_recurse` knob is deserialized for
-// backwards-compat (`#[serde(default, skip_serializing)]`) and ignored
-// at runtime per the spec.
 
 /// One node in the in-memory divisive tree the recipe builds before
 /// flattening into `BuiltClusterTree`. A `branch` carries child nodes

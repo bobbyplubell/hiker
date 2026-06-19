@@ -851,7 +851,7 @@ pub(super) fn toolbar(&mut self, ui: &mut egui::Ui) {
     }
     if let Some(style) = export_style {
         // Snapshot the tree → a fresh `.canvas` and open it framed-to-fit.
-        // The export reads vault + oplog + the trees Db, so it needs full
+        // The export reads vault + layered + the trees Db, so it needs full
         // `&mut AppState`; defer past the narrow session borrow. status:
         // canvas-export-tree-verb
         let tid = tree_id.clone();

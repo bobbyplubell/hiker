@@ -2,6 +2,16 @@
 //! filesystem `Created` events for indexable files (`.md` / `.txt`).
 //! First match wins; each match can move the file and/or append a tag.
 //!
+//! Both actions are attributed through the layered doc when a handle is
+//! attached: `add_tag` stages the merged text authored `auto:inbox` and
+//! auto-flips it (inbox rules apply without review per the spec — the
+//! `suggest.rs` / sprint-close stage-then-flip precedent), and `move_to`
+//! records the logical rename under the same author when the note already
+//! has a layered doc. Inbox rules fire pre-index on a just-created file,
+//! so the note's layered doc usually does not exist yet — the tag stage
+//! seeds it from the current disk bytes (`doc_id_or_seed`), and the
+//! rename helper no-ops on an unmapped path.
+//!
 //! See `docs/inbox-rules.md` for the spec.
 //
 // status: inbox-rules
@@ -12,6 +22,12 @@ use regex::Regex;
 
 use crate::config::sections::InboxRule;
 use crate::errors::HikerError;
+use crate::editing::shapes::Author;
+use crate::editing::LayeredDoc;
+
+/// The producer half of every inbox-rule write's author wire (`auto:inbox`,
+/// the `op-log-author-classes` `auto:<class>` convention).
+const PRODUCER_INBOX: &str = "inbox";
 
 /// Body bytes scanned for the `body` match. Capped to keep the per-file
 /// work small even when the user drops a 5 MB log file into the inbox.
@@ -78,6 +94,7 @@ impl Rules {
         vault: &crate::vault::Vault,
         store: &mut crate::store::Store,
         watcher: Option<&crate::watcher::Watcher>,
+        log: Option<&LayeredDoc>,
         rel_path: &str,
     ) -> Result<Option<Applied>, HikerError> {
         if self.compiled.is_empty() {
@@ -110,13 +127,14 @@ impl Rules {
                     // indexer's own move path, so the returned member pairs
                     // are not needed here.
                     let _ = crate::vault::move_note(vault, store, watcher, &current, &new_rel)?;
+                    record_move_in_layered(log, &current, &new_rel);
                     current = new_rel.clone();
                     moved_to = Some(new_rel);
                 }
             }
             let mut tagged: Option<String> = None;
             if let Some(tag) = rule.add_tag.as_deref() {
-                append_tag(vault, watcher, &current, tag)?;
+                append_tag(vault, watcher, log, &current, tag)?;
                 tagged = Some(tag.to_string());
             }
             return Ok(Some(Applied {
@@ -127,6 +145,25 @@ impl Rules {
             }));
         }
         Ok(None)
+    }
+}
+
+/// Record an inbox `move_to`'s logical rename in the layered doc, authored
+/// `auto:inbox`, so a moved note's layered doc follows the move. A
+/// just-created file usually has no layered doc yet — `writes::rename`
+/// no-ops on an unmapped path, and the doc is seeded later at its final
+/// path (by the tag stage or the first save). Best-effort like the
+/// indexer's own `record_layered_rename`: the filesystem move already
+/// succeeded, so a failure here is logged, never propagated.
+fn record_move_in_layered(log: Option<&LayeredDoc>, from: &str, to: &str) {
+    let Some(log) = log else { return };
+    if let Err(e) = crate::editing::writes::rename(
+        log,
+        from,
+        to,
+        &Author::Auto(PRODUCER_INBOX.to_string()),
+    ) {
+        tracing::warn!(error = %e, %from, %to, "inbox: op-log rename failed");
     }
 }
 
@@ -251,17 +288,71 @@ fn read_body_sample(
 }
 
 /// Append `tag` to the file's frontmatter `tags` list, idempotently.
-/// Routes through the same `write_file` path the user save uses so the
-/// watcher suppression keeps the resulting Modified event out of the
-/// indexer's queue (we re-ingest inline once the rule pass finishes).
+/// With a layered doc attached the merged text rides the attributed staged-
+/// content path: staged authored `auto:inbox` and flipped immediately —
+/// inbox rules are user-configured pre-index placement and apply without
+/// review per `docs/inbox-rules.md` (the stage-then-auto-flip shape
+/// `suggest.rs` and the sprint close use). Staging seeds the just-created
+/// note's layered doc from its current disk bytes when none exists yet
+/// (`doc_id_or_seed`), so the staged tag lands on a real doc; the accept
+/// writes the `.md` through the layered-doc atomic-write path. Without a log
+/// (CLI / bare-test posture) it degrades to the suppressed direct write,
+/// mirroring `boards::ops::rewrite_card_path`.
 fn append_tag(
     vault: &crate::vault::Vault,
     watcher: Option<&crate::watcher::Watcher>,
+    log: Option<&LayeredDoc>,
     rel: &str,
     tag: &str,
 ) -> Result<(), HikerError> {
     let existing = vault.read_file(rel)?;
-    let split = crate::frontmatter::split(&existing);
+    let Some(merged) = merge_tag(&existing, tag)? else {
+        return Ok(());
+    };
+    match log {
+        Some(log) => {
+            // The accept flips the staged batch, writing the `.md` to disk
+            // through the layered-doc atomic-write path. Suppress the watcher
+            // around it (as `ops::agent::write_note` does for its self-write)
+            // so the indexer doesn't see our own write as an external edit and
+            // schedule a redundant re-index. Suppress before AND after so the
+            // TTL window covers the delay until notify surfaces the event.
+            if let Some(w) = watcher {
+                w.suppress(rel.to_string());
+            }
+            let outcome = crate::ops::op_writes::stage_auto_content(
+                log,
+                vault,
+                PRODUCER_INBOX,
+                PRODUCER_INBOX,
+                rel,
+                &merged,
+            )?;
+            if !outcome.op_ids.is_empty() {
+                crate::ops::op_writes::flip_batch_status(log, &outcome.batch_id, true)?;
+            }
+            if let Some(w) = watcher {
+                w.suppress(rel.to_string());
+            }
+        }
+        None => {
+            if let Some(w) = watcher {
+                w.suppress(rel.to_string());
+            }
+            vault.write_file(rel, &merged)?;
+            if let Some(w) = watcher {
+                w.suppress(rel.to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The pure half of [`append_tag`]: the file text with `tag` merged into
+/// the frontmatter `tags` list, or `None` when the tag is already present
+/// (the idempotent no-op).
+fn merge_tag(existing: &str, tag: &str) -> Result<Option<String>, HikerError> {
+    let split = crate::frontmatter::split(existing);
     let body = split.body.to_string();
     let mut fm = match split.frontmatter {
         Some(serde_yml::Value::Mapping(m)) => m,
@@ -275,7 +366,7 @@ fn append_tag(
         _ => Vec::new(),
     };
     if tags.iter().any(|t| t == tag) {
-        return Ok(());
+        return Ok(None);
     }
     tags.push(tag.to_string());
     let seq: serde_yml::Sequence = tags
@@ -286,16 +377,9 @@ fn append_tag(
         serde_yml::Value::String("tags".into()),
         serde_yml::Value::Sequence(seq),
     );
-    let merged = crate::frontmatter::assemble(&serde_yml::Value::Mapping(fm), &body)
-        .map_err(|e| HikerError::Io(format!("frontmatter: {e}")))?;
-    if let Some(w) = watcher {
-        w.suppress(rel.to_string());
-    }
-    vault.write_file(rel, &merged)?;
-    if let Some(w) = watcher {
-        w.suppress(rel.to_string());
-    }
-    Ok(())
+    crate::frontmatter::assemble(&serde_yml::Value::Mapping(fm), &body)
+        .map(Some)
+        .map_err(|e| HikerError::Io(format!("frontmatter: {e}")))
 }
 
 #[cfg(test)]
@@ -349,7 +433,7 @@ mod tests {
         write(&fx.vault, "inbox/cookies.md", "yum\n");
         let rules = Rules::compile(&[rule(Some(r"\.md$"), None, Some("recipes"), None)]).unwrap();
         let applied = rules
-            .apply_to_created(&fx.vault, &mut fx.store, None, "inbox/cookies.md")
+            .apply_to_created(&fx.vault, &mut fx.store, None, None, "inbox/cookies.md")
             .unwrap()
             .unwrap();
         assert_eq!(applied.final_rel_path, "recipes/cookies.md");
@@ -365,7 +449,7 @@ mod tests {
         write(&fx.vault, "inbox/note.md", "this is a TODO\nfollow up\n");
         let rules = Rules::compile(&[rule(None, Some("TODO"), None, Some("urgent"))]).unwrap();
         let applied = rules
-            .apply_to_created(&fx.vault, &mut fx.store, None, "inbox/note.md")
+            .apply_to_created(&fx.vault, &mut fx.store, None, None, "inbox/note.md")
             .unwrap()
             .unwrap();
         assert_eq!(applied.final_rel_path, "inbox/note.md");
@@ -374,6 +458,32 @@ mod tests {
         let after = fx.vault.read_file("inbox/note.md").unwrap();
         assert!(after.contains("tags:"));
         assert!(after.contains("urgent"));
+    }
+
+    /// Adding a tag through the layered-doc (`Some(log)`) path suppresses
+    /// the watcher around its own `.md` write, just like the direct path —
+    /// so the indexer doesn't see the self-write as an external edit and
+    /// schedule a redundant re-index.
+    #[test]
+    fn tag_append_suppresses_watcher_on_layered_write() {
+        let mut fx = fixture();
+        write(&fx.vault, "inbox/note.md", "this is a TODO\n");
+        let watcher = crate::watcher::Watcher::start(fx.vault.root()).unwrap();
+        let log = LayeredDoc::open(fx.vault.root()).unwrap();
+        crate::ops::op_writes::bootstrap(&fx.vault, &log).unwrap();
+
+        let rules = Rules::compile(&[rule(None, Some("TODO"), None, Some("urgent"))]).unwrap();
+        let applied = rules
+            .apply_to_created(&fx.vault, &mut fx.store, Some(&watcher), Some(&log), "inbox/note.md")
+            .unwrap()
+            .unwrap();
+        assert_eq!(applied.tagged.as_deref(), Some("urgent"));
+        // The self-write was suppressed so the watcher won't loop it back
+        // into the indexer.
+        assert!(
+            watcher.is_suppressed("inbox/note.md"),
+            "layered tag write must suppress the watcher",
+        );
     }
 
     #[test]
@@ -390,12 +500,12 @@ mod tests {
         .unwrap();
         // First file: basename matches, body does NOT → no fire.
         let a = rules
-            .apply_to_created(&fx.vault, &mut fx.store, None, "inbox/journal.md")
+            .apply_to_created(&fx.vault, &mut fx.store, None, None, "inbox/journal.md")
             .unwrap();
         assert!(a.is_none(), "AND requires both predicates to hold");
         // Second file: both match → fires.
         let b = rules
-            .apply_to_created(&fx.vault, &mut fx.store, None, "inbox/journal2.md")
+            .apply_to_created(&fx.vault, &mut fx.store, None, None, "inbox/journal2.md")
             .unwrap();
         assert!(b.is_some());
     }
@@ -412,7 +522,7 @@ mod tests {
         ])
         .unwrap();
         let applied = rules
-            .apply_to_created(&fx.vault, &mut fx.store, None, "inbox/foo.md")
+            .apply_to_created(&fx.vault, &mut fx.store, None, None, "inbox/foo.md")
             .unwrap()
             .unwrap();
         assert_eq!(applied.rule_index, 0);
@@ -426,7 +536,7 @@ mod tests {
         write(&fx.vault, "inbox/keep.md", "nothing special\n");
         let rules = Rules::compile(&[rule(Some(r"^never_matches$"), None, Some("nope"), None)]).unwrap();
         let applied = rules
-            .apply_to_created(&fx.vault, &mut fx.store, None, "inbox/keep.md")
+            .apply_to_created(&fx.vault, &mut fx.store, None, None, "inbox/keep.md")
             .unwrap();
         assert!(applied.is_none());
         assert!(fx.vault.root().join("inbox/keep.md").exists());
@@ -479,5 +589,62 @@ mod tests {
         let bad = rule(Some(r"\.md$"), None, Some("/etc"), None);
         let err = Rules::compile(&[bad]).unwrap_err();
         assert!(err.to_string().contains("vault-relative"));
+    }
+
+    /// With a layered doc attached, `add_tag` rides the staged-content path:
+    /// the tag write lands as an accepted edit authored `auto:inbox`
+    /// (every-write-attributed), the doc seeded from the just-created
+    /// file's bytes, and the tagged text reaches disk through the layered-doc
+    /// atomic write.
+    #[test]
+    fn add_tag_writes_an_attributed_frame() {
+        let mut fx = fixture();
+        let log = crate::editing::LayeredDoc::open(fx.vault.root()).unwrap();
+        write(&fx.vault, "inbox/note.md", "this is a TODO\nfollow up\n");
+        let rules = Rules::compile(&[rule(None, Some("TODO"), None, Some("urgent"))]).unwrap();
+        let applied = rules
+            .apply_to_created(&fx.vault, &mut fx.store, None, Some(&log), "inbox/note.md")
+            .unwrap()
+            .unwrap();
+        assert_eq!(applied.tagged.as_deref(), Some("urgent"));
+        let after = fx.vault.read_file("inbox/note.md").unwrap();
+        assert!(after.contains("urgent"), "{after}");
+        // Nothing left pending — inbox rules apply without review. (Authorship
+        // attribution rode the deleted `op_history` index; the tag reaching disk
+        // is the kept behavior.)
+        assert!(log.all_pending_ops().unwrap().is_empty());
+        assert_eq!(
+            log.materialize_accepted("inbox/note.md").unwrap().text,
+            after
+        );
+    }
+
+    /// A `move_to` of a note that already has a layered doc records the
+    /// logical rename authored `auto:inbox`, so the layered doc follows the move
+    /// instead of orphaning at the old path.
+    #[test]
+    fn move_to_records_an_attributed_rename_for_mapped_docs() {
+        let mut fx = fixture();
+        let log = crate::editing::LayeredDoc::open(fx.vault.root()).unwrap();
+        std::fs::create_dir_all(fx.vault.root().join("recipes")).unwrap();
+        write(&fx.vault, "inbox/cookies.md", "yum\n");
+        log.create_document("inbox/cookies.md", "markdown", "yum\n", &Author::User)
+            .unwrap();
+        let rules =
+            Rules::compile(&[rule(Some(r"\.md$"), None, Some("recipes"), None)]).unwrap();
+        let applied = rules
+            .apply_to_created(&fx.vault, &mut fx.store, None, Some(&log), "inbox/cookies.md")
+            .unwrap()
+            .unwrap();
+        assert_eq!(applied.final_rel_path, "recipes/cookies.md");
+        // The layered doc follows the move: the old path no longer resolves, the new
+        // one does, and the content is intact at the new path. (Rename
+        // attribution rode the deleted `op_history` index.)
+        assert!(log.doc_id_for_path("inbox/cookies.md").unwrap().is_none());
+        assert!(log.doc_id_for_path("recipes/cookies.md").unwrap().is_some());
+        assert_eq!(
+            log.materialize_accepted("recipes/cookies.md").unwrap().text,
+            "yum\n"
+        );
     }
 }

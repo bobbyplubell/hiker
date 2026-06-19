@@ -20,7 +20,8 @@ use thiserror::Error;
 
 use crate::errors::HikerError;
 use crate::frontmatter::{assemble, merge_json_into_yaml, split, Error as FmError};
-use crate::oplog::OpLog;
+use crate::kinds::Registry;
+use crate::editing::LayeredDoc;
 use crate::store::Store;
 use crate::trails::ops::{resolve_reference, ResolutionOutcome};
 use crate::vault::Vault;
@@ -99,6 +100,14 @@ pub struct Column {
 /// status: board-column-model
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Board {
+    /// The board-doc's `hiker.kind` discriminator: `"board"` for a plain
+    /// board, or a registered board-like kind (`"sprint"`) accepted by the
+    /// parse gate (`sprint-board-subtype`). Carried so the write path
+    /// round-trips the kind instead of retyping every board to `board` on
+    /// its first mutation.
+    ///
+    /// status: sprint-board-subtype
+    pub kind: String,
     pub columns: Vec<Column>,
 }
 
@@ -144,8 +153,15 @@ pub enum Error {
 /// `hiker.kind: board` is not a board per spec; `parse_board_for` is the
 /// path-aware wrapper.
 ///
+/// The accepted discriminator set is `{ "board" }` plus every kind the
+/// compiled registry declares board-like (`hiker.kind: sprint` for the
+/// built-in PM set) — acceptance is shape-driven, never sprint-special-
+/// cased, per `kinds.md`'s parse-gate paragraph. `kinds = None` (CLI /
+/// bare-test paths without a registry) accepts plain `board` only.
+///
 /// status: board-doc-shape
-pub fn parse_board(source: &str) -> Result<Board, Error> {
+/// status: sprint-board-subtype
+pub fn parse_board(source: &str, kinds: Option<&Registry>) -> Result<Board, Error> {
     let split_view = split(source);
     let fm = split_view.frontmatter.ok_or(Error::MissingFrontmatter)?;
     let YamlValue::Mapping(map) = &fm else {
@@ -160,7 +176,8 @@ pub fn parse_board(source: &str) -> Result<Board, Error> {
         .get("kind")
         .and_then(|v| v.as_str())
         .ok_or(Error::MissingField("hiker.kind"))?;
-    if kind != "board" {
+    let board_like = kinds.is_some_and(|r| r.board_like(kind).is_some());
+    if kind != "board" && !board_like {
         return Err(Error::KindMismatch {
             found: kind.to_string(),
         });
@@ -172,16 +189,25 @@ pub fn parse_board(source: &str) -> Result<Board, Error> {
         Some(_) => return Err(Error::MissingField("hiker.columns")),
     };
 
-    Ok(Board { columns })
+    Ok(Board {
+        kind: kind.to_string(),
+        columns,
+    })
 }
 
 /// Path-aware wrapper around `parse_board`: rejects non-`.md` extensions
 /// before parsing, per the spec's "discriminator alone isn't enough" rule.
-pub fn parse_board_for(rel: &str, source: &str) -> Result<Board, Error> {
+///
+/// status: sprint-board-subtype
+pub fn parse_board_for(
+    rel: &str,
+    source: &str,
+    kinds: Option<&Registry>,
+) -> Result<Board, Error> {
     if !rel.ends_with(".md") {
         return Err(Error::NotMarkdown(rel.to_string()));
     }
-    parse_board(source)
+    parse_board(source, kinds)
 }
 
 fn parse_column(v: &YamlValue) -> Option<Column> {
@@ -203,8 +229,7 @@ fn parse_column(v: &YamlValue) -> Option<Column> {
 /// `text` key with no `path` and a `card_id` → a freeform card
 /// (`{ card_id, text }`). Mints nothing — a card with neither key is
 /// dropped. Under path-as-identity (`board-card-references`) note cards
-/// no longer carry an `id` half; the parser silently accepts (and drops)
-/// a legacy `id:` sibling so existing board-docs round-trip.
+/// carry no `id` half.
 ///
 /// status: board-card-references
 /// status: board-freeform-card
@@ -217,13 +242,9 @@ fn parse_card(v: &YamlValue) -> Option<BoardCard> {
     }
     if let Some(text) = m.get("text").and_then(YamlValue::as_str) {
         // `card_id` is the freeform card's internal disambiguator.
-        // Legacy board-docs may have used `id:`; honor that for
-        // round-trip but prefer the new `card_id` when both are present.
-        let card_id = m
-            .get("card_id")
-            .or_else(|| m.get("id"))
-            .and_then(YamlValue::as_str)?
-            .to_string();
+        // Unambiguous: this branch only fires for a freeform `text` card
+        // (no `path`).
+        let card_id = m.get("card_id").and_then(YamlValue::as_str)?.to_string();
         return Some(BoardCard::Text {
             card_id,
             text: text.to_string(),
@@ -234,7 +255,7 @@ fn parse_card(v: &YamlValue) -> Option<BoardCard> {
 
 /// Serialize a board-doc frontmatter back into the source. Preserves
 /// non-`hiker.*` top-level fields and any unknown sibling fields under
-/// `hiker.*` — only `hiker.{kind,id,columns}` are rewritten, mirroring
+/// `hiker.*` — only `hiker.{kind,columns}` are rewritten, mirroring
 /// `write_trail_doc_frontmatter`'s deep-merge semantics.
 ///
 /// status: board-doc-shape
@@ -248,9 +269,14 @@ pub fn write_board_frontmatter(body_source: &str, board: &Board) -> Result<Strin
         existing = YamlValue::Mapping(Default::default());
     }
     let mut hiker_patch = serde_json::Map::new();
-    hiker_patch.insert("kind".into(), serde_json::Value::String("board".into()));
+    // status: sprint-board-subtype — write back the parsed kind, never a
+    // hardcoded `board`, so a card move on a sprint board can't retype it.
+    hiker_patch.insert(
+        "kind".into(),
+        serde_json::Value::String(board.kind.clone()),
+    );
     // status: board-doc-shape
-    // No `hiker.id` — the board's storage key is the op-log's `doc_id`
+    // No `hiker.id` — the board's storage key is the layered doc's `doc_id`
     // for the board-doc's path; kept in `doc-index.db` not the file.
     hiker_patch.insert(
         "columns".into(),
@@ -260,13 +286,11 @@ pub fn write_board_frontmatter(body_source: &str, board: &Board) -> Result<Strin
     // `merge_json_into_yaml` deep-merges maps but *replaces* arrays — so
     // the existing `columns` array is fully overwritten with the new one.
     // Strip the pre-existing `hiker.columns` first so no stale entries
-    // linger if the merge ever changes its array policy. Also strip any
-    // legacy `hiker.id` so rewriting an old board-doc drops the field.
+    // linger if the merge ever changes its array policy.
     if let YamlValue::Mapping(top) = &mut existing
         && let Some(YamlValue::Mapping(hiker)) = top.get_mut("hiker")
     {
         hiker.remove("columns");
-        hiker.remove("id");
     }
     merge_json_into_yaml(&mut existing, patch);
     Ok(assemble(&existing, split_view.body)?)
@@ -335,7 +359,36 @@ pub struct ResolvedCard {
     pub title: String,
     /// `None` for a freeform card — it resolves to itself, no note ref.
     pub resolution: Option<ResolutionOutcome>,
+    /// PM read-surface for note cards on boards of a board-like kind
+    /// (`pm-story-kind` field strip + the `derived-status-rule` conflict
+    /// pill); `None` on plain boards and freeform cards.
+    ///
+    /// status: pm-story-kind
+    /// status: derived-status-rule
+    #[serde(default)]
+    pub pm: Option<CardPmInfo>,
 }
+
+/// The per-card PM strip a sprint-kind board renders: `estimate` / `due`
+/// read straight from the metadata index (a board-doc edit is never needed
+/// to change them, and a field edit never touches the board-doc), plus the
+/// loud conflicted flag when the note is hand-edited onto more than one
+/// sprint (`derived-status-rule`'s problem-pill posture). `due` is only
+/// populated when the date is near (within [`DUE_NEAR_HORIZON_SECS`]) or
+/// overdue — pm.md's "due when near".
+///
+/// status: pm-story-kind
+/// status: derived-status-rule
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CardPmInfo {
+    pub estimate: Option<String>,
+    pub due: Option<String>,
+    pub conflicted: bool,
+}
+
+/// How far ahead a `due` date counts as "near" for the card field strip
+/// (`pm-story-kind`): one week, plus anything already overdue.
+const DUE_NEAR_HORIZON_SECS: f64 = 7.0 * 86_400.0;
 
 impl ResolvedCard {
     /// Polymorphic handle for move/reorder/remove: the note card's
@@ -369,19 +422,30 @@ pub struct ResolvedColumn {
 pub struct BoardDetail {
     pub rel_path: String,
     pub board_id: String,
+    /// The board-doc's `hiker.kind` (`"board"` or a board-like kind like
+    /// `"sprint"`), so consumers can surface kind-specific affordances
+    /// (the sprint close verb, the PM card strip).
+    ///
+    /// status: sprint-board-subtype
+    #[serde(default)]
+    pub kind: String,
     pub body: String,
     pub columns: Vec<ResolvedColumn>,
 }
 
 /// Enumerate every board-doc in the vault. Strategy mirrors `trails::list`:
 /// walk the indexer's note-path listing and try `parse_board_for` on each
-/// `.md` file; rows that parse Ok are board-docs.
+/// `.md` file; rows that parse Ok are board-docs. With a registry attached
+/// the gate accepts board-like kinds, so sprints show up here (and in every
+/// consumer of this listing — the Boards index page, the picker, the MCP
+/// `boards_list` tool) with no further change. status: sprint-board-subtype
 ///
 /// status: board-many-to-many
 pub fn list(
     vault: &Vault,
     store: &Store,
-    log: &OpLog,
+    log: &LayeredDoc,
+    kinds: Option<&Registry>,
 ) -> Result<Vec<BoardListItem>, HikerError> {
     let paths = store
         .all_note_paths()
@@ -392,7 +456,7 @@ pub fn list(
             continue;
         }
         let Ok(src) = vault.read_file(&rel) else { continue };
-        let Ok(board) = parse_board_for(&rel, &src) else { continue };
+        let Ok(board) = parse_board_for(&rel, &src, kinds) else { continue };
         let card_count: u32 = board.columns.iter().map(|c| c.cards.len() as u32).sum();
         // status: store-path-is-identity
         let board_id = match log.doc_id_for_path(&rel) {
@@ -416,20 +480,24 @@ pub fn list(
 /// Fetch a single board's body + resolved columns. The board-doc's
 /// `hiker.columns` array is the source of truth for column + card order;
 /// each card is resolved against the index for self-heal / broken-card
-/// rendering.
+/// rendering. On a board of a registered board-like kind, note cards also
+/// carry the PM strip (`estimate` / near-`due` off the metadata index +
+/// the conflicted-membership flag) — `pm-story-kind` / `derived-status-rule`.
 ///
 /// status: board-view
 /// status: board-card-references
 pub fn get_board(
     vault: &Vault,
     store: &Store,
-    log: &OpLog,
+    log: &LayeredDoc,
     board_doc_rel: &str,
+    kinds: Option<&Registry>,
 ) -> Result<BoardDetail, HikerError> {
     let src = vault.read_file(board_doc_rel)?;
-    let board = parse_board_for(board_doc_rel, &src)
+    let board = parse_board_for(board_doc_rel, &src, kinds)
         .map_err(|e| HikerError::Io(format!("parse board-doc: {e}")))?;
     let body = split(&src).body.to_string();
+    let pm_board = kinds.filter(|r| r.board_like(&board.kind).is_some());
 
     let columns = board
         .columns
@@ -437,7 +505,17 @@ pub fn get_board(
         .map(|col| ResolvedColumn {
             name: col.name.clone(),
             wip_limit: col.wip_limit,
-            cards: col.cards.iter().map(|card| resolve_card(store, vault, card)).collect(),
+            cards: col
+                .cards
+                .iter()
+                .map(|card| {
+                    let mut resolved = resolve_card(store, vault, card);
+                    if let (Some(registry), Some(path)) = (pm_board, resolved.path.as_deref()) {
+                        resolved.pm = Some(card_pm_info(store, registry, path));
+                    }
+                    resolved
+                })
+                .collect(),
         })
         .collect();
 
@@ -454,9 +532,48 @@ pub fn get_board(
     Ok(BoardDetail {
         rel_path: board_doc_rel.to_string(),
         board_id,
+        kind: board.kind,
         body,
         columns,
     })
+}
+
+/// The PM strip for one note card on a sprint-kind board: `estimate` and
+/// `due` read off the metadata index (`pm-story-kind` — the board-doc is
+/// never the storage for story fields), `due` kept only when near or
+/// overdue, plus the loud conflicted flag from the derived-status read
+/// (`derived-status-rule`'s problem pill on both sprints' cards). All
+/// reads are soft — an index miss renders as an empty strip, never an
+/// error on the board view.
+///
+/// status: pm-story-kind
+/// status: derived-status-rule
+fn card_pm_info(store: &Store, registry: &Registry, note_rel: &str) -> CardPmInfo {
+    let estimate = store.meta_value(note_rel, "estimate").ok().flatten();
+    let due = store
+        .meta_value(note_rel, "due")
+        .ok()
+        .flatten()
+        .filter(|d| due_is_near(d));
+    let conflicted = matches!(
+        crate::pm::derived_status(store, registry, note_rel),
+        Ok(crate::pm::DerivedStatus::Conflicted { .. })
+    );
+    CardPmInfo { estimate, due, conflicted }
+}
+
+/// Whether a `due` value is near enough to surface on the card strip
+/// ("due when near" per pm.md): a parseable ISO-8601 date within the next
+/// week, or already overdue. Unparseable values stay off the strip.
+fn due_is_near(due: &str) -> bool {
+    let Some(epoch) = crate::frontmatter::iso_date_epoch(due) else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    epoch <= now + DUE_NEAR_HORIZON_SECS
 }
 
 /// One row of `containing_note_with_paths`. Pairs the derived-table hit's
@@ -481,8 +598,9 @@ pub struct ContainingNoteHit {
 pub fn containing_note_with_paths(
     vault: &Vault,
     store: &Store,
-    log: &OpLog,
+    log: &LayeredDoc,
     source_rel: &str,
+    kinds: Option<&Registry>,
 ) -> Result<Vec<ContainingNoteHit>, HikerError> {
     let hits = store
         .boards_containing_note(source_rel)
@@ -490,7 +608,7 @@ pub fn containing_note_with_paths(
     if hits.is_empty() {
         return Ok(Vec::new());
     }
-    let listing = list(vault, store, log)?;
+    let listing = list(vault, store, log, kinds)?;
     let mut by_id: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     for b in &listing {
         by_id.insert(b.board_id.as_str(), b.rel_path.as_str());
@@ -515,23 +633,37 @@ pub fn containing_note_with_paths(
 /// source note's current ULID via the index (empty when unstamped — the
 /// path half still anchors the card). Returns `Ok(None)` when the note is
 /// already a card anywhere on the board (idempotent no-op), so callers can
-/// skip a redundant write/stage. Drives the review-mode MCP `board_add_card`
-/// staging path; the direct path uses [`ops::add_card`], which also lazy-
-/// stamps the source note's ULID.
+/// skip a redundant write/stage. Drives both MCP `board_add_card` paths
+/// (review staging and the direct write).
+///
+/// Enforces the at-most-one-sprint rule at this card-add path
+/// (`derived-status-rule`): adding to a sprint-kind board errors — naming
+/// the holding sprint — when the note is already a card on a *different*
+/// sprint-kind board. Plain-board membership stays unconstrained.
 ///
 /// status: board-mcp-tools
+/// status: derived-status-rule
 pub fn add_card_preview(
     vault: &Vault,
+    store: &Store,
+    kinds: Option<&Registry>,
     board_doc_rel: &str,
     column_name: &str,
     source_rel: &str,
 ) -> Result<Option<String>, HikerError> {
     let src = vault.read_file(board_doc_rel)?;
-    let mut board = parse_board_for(board_doc_rel, &src)
+    let mut board = parse_board_for(board_doc_rel, &src, kinds)
         .map_err(|e| HikerError::Io(format!("parse board-doc: {e}")))?;
     if board.contains_note(source_rel) {
         return Ok(None);
     }
+    crate::pm::ensure_single_sprint_membership(
+        store,
+        kinds,
+        board_doc_rel,
+        &board.kind,
+        source_rel,
+    )?;
     let col_idx = board
         .column_index(column_name)
         .ok_or_else(|| HikerError::NotFound(format!("column: {column_name}")))?;
@@ -557,6 +689,7 @@ fn resolve_card(store: &Store, vault: &Vault, card: &BoardCard) -> ResolvedCard 
             text: Some(text.clone()),
             title: text.clone(),
             resolution: None,
+            pm: None,
         },
         BoardCard::Note { path } => {
             let resolution = resolve_reference(store, vault, path)
@@ -569,6 +702,7 @@ fn resolve_card(store: &Store, vault: &Vault, card: &BoardCard) -> ResolvedCard 
                 text: None,
                 title: title_of(path),
                 resolution: Some(resolution),
+                pm: None,
             }
         }
     }
@@ -588,13 +722,10 @@ fn title_of(rel: &str) -> String {
 ///
 /// status: board-card-references
 pub async fn on_note_moved(
-    watcher: Option<&crate::watcher::Watcher>,
-    jobs: Option<&crate::indexer::IndexJobTx>,
-    log: Option<&OpLog>,
-    vault: &Vault,
+    env: &ops::NoteMovedEnv<'_>,
     store: &mut Store,
     old_rel: &str,
     new_rel: &str,
 ) -> Result<usize, HikerError> {
-    ops::run_note_moved(watcher, jobs, log, vault, store, old_rel, new_rel).await
+    ops::run_note_moved(env, store, old_rel, new_rel).await
 }

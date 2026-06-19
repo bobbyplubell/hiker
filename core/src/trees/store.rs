@@ -6,7 +6,7 @@
 //! structure lives in the `hiker` frontmatter (`trees-md-frontmatter`); the
 //! body is a fixed stub (the human render is produced on demand by the
 //! cluster editor, not persisted). Edits load the tree, mutate the in-memory
-//! [`TreeDoc`], and rewrite **only the frontmatter fence** through the op-log
+//! [`TreeDoc`], and rewrite **only the frontmatter fence** through the layered-doc
 //! working layer — so each edit lands as a `SetFrontmatter` op
 //! (`trees-edit-setfrontmatter`) and the body bytes never move.
 //!
@@ -27,7 +27,7 @@ use super::types::{
     Db, EditableNode, Error, NodeInsert, NodeKind, NodePolicy, TreeContainingHit, TreeInsert, TreeRow,
 };
 use crate::indexer::IndexJobTx;
-use crate::oplog::OpLog;
+use crate::editing::LayeredDoc;
 use crate::store::dto::{MetaFilter, NoteQuery};
 use crate::vault::Vault;
 use crate::watcher::Watcher;
@@ -48,7 +48,7 @@ fn cluster_tree_query() -> NoteQuery {
     NoteQuery {
         filters: vec![MetaFilter::Equals {
             key: "hiker.kind".to_string(),
-            value: KIND.to_string(),
+            values: vec![KIND.to_string()],
         }],
         ..Default::default()
     }
@@ -155,7 +155,7 @@ pub(super) struct TreeDoc {
     body: String,
     /// Non-`hiker` frontmatter keys, preserved on round-trip.
     extra_fm: serde_yml::Mapping,
-    /// node_id → recorded note op-log id, so the double-link survives a
+    /// node_id → recorded note layered-doc id, so the double-link survives a
     /// round-trip even though `EditableNode` only carries the path half.
     note_ids: HashMap<String, String>,
 }
@@ -262,15 +262,15 @@ impl TreeDoc {
 // ── construction + load / save ─────────────────────────────────────────
 
 impl Db {
-    /// Create a trees handle backed by the op-log + vault. No directory is
+    /// Create a trees handle backed by the layered doc + vault. No directory is
     /// created — the visible tree dir (`new_cluster_tree_dir`, default
     /// `cluster-trees/`) is created lazily by `vault.write_file` on the first
     /// tree. The watcher/indexer handles and the configured dir are wired
     /// later via [`Db::wire`] (they don't exist at construction time).
-    pub fn new(oplog: Arc<OpLog>, vault: Arc<Vault>) -> Result<Self, Error> {
+    pub fn new(layered: Arc<LayeredDoc>, vault: Arc<Vault>) -> Result<Self, Error> {
         let store = crate::store::Store::open(vault.root()).map_err(|e| Error::Store(e.to_string()))?;
         Ok(Self {
-            oplog,
+            layered,
             vault,
             centroids: Mutex::new(store),
             history: Mutex::new(HashMap::new()),
@@ -435,13 +435,13 @@ impl Db {
     }
 
     /// Serialize `doc` back to frontmatter (body preserved) and commit it
-    /// through the op-log as a user edit at `doc.path`. Because only the
+    /// through the layered doc as a user edit at `doc.path`. Because only the
     /// frontmatter fence changes, the op is labeled `SetFrontmatter`.
     ///
     /// The tree now lives at a visible, indexed path
     /// (`cluster-tree-visible-note`), so — like trail-docs and presets — the
     /// write suppresses the watcher and enqueues an explicit `Upsert` so the
-    /// tree is queryable at once and the op-log atomic write isn't echoed
+    /// tree is queryable at once and the layered-doc atomic write isn't echoed
     /// back as an external edit. When the handles aren't wired yet (early
     /// open, tests) the write still lands; the ambient watcher → indexer
     /// route picks it up.
@@ -486,12 +486,12 @@ impl Db {
         // Record the id → path mapping so the next `load` resolves without the
         // index (covers the insert_tree → insert_nodes create sequence).
         self.cache_path(&doc.meta.id, rel);
-        // Suppress before the op-log atomic write so notify's echo for this
+        // Suppress before the layered-doc atomic write so notify's echo for this
         // self-write is dropped (`watcher-suppress-self-writes`).
         if let Some(watcher) = self.watcher.get() {
             watcher.suppress(rel.clone());
         }
-        crate::ops::op_writes::user_save(&self.oplog, &self.vault, rel, &full)?;
+        crate::ops::op_writes::user_save(&self.layered, &self.vault, rel, &full)?;
         // Re-suppress close to when notify surfaces the write, then index
         // explicitly (the watcher events were suppressed) so the tree is
         // discoverable by the frontmatter query immediately.
@@ -559,10 +559,10 @@ impl Db {
     }
 
     /// Create a new tree `.md` already carrying its full node set, in a
-    /// SINGLE atomic op-log write. This is the create path the cluster-review
+    /// SINGLE atomic layered-doc write. This is the create path the cluster-review
     /// Confirm uses: the alternative `insert_tree` (empty `nodes: []`) →
     /// `insert_nodes` (populated block) two-step leaves a momentary
-    /// empty-nodes document on disk and lands the nodes as an op-log
+    /// empty-nodes document on disk and lands the nodes as a layered-doc
     /// *diff* of the empty→full frontmatter — a span computation that has
     /// corrupted the `nodes:` block for some node sets, surfacing as a tree
     /// that reloads with no nodes. Writing the doc whole sidesteps both: the
@@ -742,24 +742,36 @@ impl Db {
         })
     }
 
-    /// Delete a tree: tombstone its op-log document and remove the `.md`.
+    /// Delete a tree: tombstone its layered-doc document and remove the `.md`.
     /// (Trash-on-discard semantics live in the app's discard-draft path per
     /// `cluster-editor-discard-draft`; this is the low-level removal.)
     pub fn delete_tree(&self, tree_id: &str) -> Result<(), Error> {
         // Resolve the tree's current visible path via the frontmatter query.
-        // A tree whose file is already gone still tombstones any op-log doc
+        // A tree whose file is already gone still tombstones any layered-doc doc
         // and clears its centroids below. The hard `remove_file` is left
         // *un*-suppressed: the file is now visible + indexed, so the watcher's
         // Delete event drives the index-row removal (the same way an ordinary
         // note delete does); suppressing it would orphan the `notes` row.
         if let Some(rel) = self.path_for_tree(tree_id) {
-            if let Ok(Some(doc_id)) = self.oplog.doc_id_for_path(&rel) {
+            if let Ok(Some(doc_id)) = self.layered.doc_id_for_path(&rel) {
                 let _ = self
-                    .oplog
-                    .tombstone_document(&doc_id, &crate::oplog::shapes::Author::User);
+                    .layered
+                    .tombstone_document(&doc_id, &crate::editing::shapes::Author::User);
             }
             if let Ok(abs) = self.vault.abs_path(&rel) {
-                let _ = std::fs::remove_file(abs);
+                // The delete MUST make the doc's `.md` absent from its vault
+                // path. `load_accepted` reads the canonical content straight off
+                // the `.md` (and `tombstone` is purely in-memory lifecycle
+                // state), so a surviving `.md` resurrects as a LIVE note on the
+                // next `LayeredDoc::open`. Swallowing this removal error would
+                // leave a resurrectable file behind silently, so surface it — a
+                // delete that can't remove the file must fail loudly rather than
+                // claim success. A missing file is fine (already gone).
+                match std::fs::remove_file(&abs) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(Error::Io(e)),
+                }
             }
         }
         if let Ok(mut store) = self.centroids.lock() {
@@ -966,4 +978,56 @@ fn yaml_to_json_string(y: &Yaml) -> String {
         return "{}".to_string();
     }
     serde_json::to_string(y).unwrap_or_else(|_| "{}".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::editing::LayeredDoc;
+    use crate::vault::Vault;
+
+    fn tree_insert(name: &str) -> TreeInsert {
+        TreeInsert {
+            id: None,
+            name: name.to_string(),
+            source: "one-shot".to_string(),
+            state: "draft".to_string(),
+            scope_json: "{}".to_string(),
+            method_json: "{}".to_string(),
+            vault_snapshot: None,
+        }
+    }
+
+    /// Regression (finding 1 — tombstone resurrection). `delete_tree` must make
+    /// the tree's `.md` ABSENT from its vault path (and not swallow a removal
+    /// error). `load_accepted` reads content straight off the `.md`, so a
+    /// surviving file would resurrect the deleted tree as a live note on the next
+    /// `LayeredDoc::open`. After delete, the `.md` is gone AND a fresh LayeredDoc
+    /// sees the doc as deleted (not materialized live).
+    #[test]
+    fn delete_tree_removes_md_and_doc_stays_deleted_on_reopen() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let layered = Arc::new(LayeredDoc::open(dir.path()).unwrap());
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let trees = Db::new(layered, vault).unwrap();
+
+        let tree_id = trees.insert_tree(tree_insert("doomed")).unwrap();
+        let rel = trees.path_for_tree(&tree_id).expect("tree has a path");
+        let abs = dir.path().join(&rel);
+        assert!(abs.exists(), "tree .md written");
+
+        trees.delete_tree(&tree_id).unwrap();
+
+        // The `.md` is durably gone from its vault path.
+        assert!(!abs.exists(), "delete_tree must remove the tree's .md");
+
+        // A fresh LayeredDoc must NOT resurrect it — the file is absent, so it
+        // reads as an unknown (deleted) doc.
+        let reopened = LayeredDoc::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened.doc_id_for_path(&rel).unwrap(),
+            None,
+            "deleted tree must not exist after reopen (no resurrection)"
+        );
+    }
 }

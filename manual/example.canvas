@@ -1,0 +1,43 @@
+{
+	"nodes": [
+		{
+			"id": "intro-text",
+			"type": "text",
+			"x": -360,
+			"y": -120,
+			"width": 280,
+			"height": 120,
+			"text": "# Example canvas\n\nA card pointing at a real note, a couple of text cards, and an edge."
+		},
+		{
+			"id": "widgets-file",
+			"type": "file",
+			"x": 0,
+			"y": -200,
+			"width": 360,
+			"height": 360,
+			"file": "manual/widgets.md"
+		},
+		{
+			"id": "note-text",
+			"type": "text",
+			"x": 0,
+			"y": 220,
+			"width": 360,
+			"height": 100,
+			"text": "The card above is a *pointer* to the Widgets chapter — editing it here edits the real note.",
+			"color": "4"
+		}
+	],
+	"edges": [
+		{
+			"id": "intro-to-widgets",
+			"fromNode": "intro-text",
+			"fromSide": "right",
+			"toNode": "widgets-file",
+			"toSide": "left",
+			"toEnd": "arrow",
+			"label": "points at"
+		}
+	]
+}

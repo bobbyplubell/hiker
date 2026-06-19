@@ -1,7 +1,7 @@
 //! Vault-open recipe. Constructs `AppState` from a vault path.
 //!
 //! Wires the long-lived subsystems hiker needs to be useful (store,
-//! op log, trees, activity, watcher, indexer, autosave). The direct LLM
+//! layered doc, trees, activity, watcher, indexer, autosave). The direct LLM
 //! worker + MCP server layer on top.
 //!
 //! Spawned background tasks (watcher relay, indexer progress forwarder,
@@ -18,13 +18,12 @@ use anyhow::{Context, Result};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use hiker_core::activity::Activity;
 use hiker_core::audit::AgentLog;
 use hiker_core::autosave::Autosave;
 use hiker_core::config::Config;
 use hiker_core::embed::FastembedEmbedder;
 use hiker_core::indexer::{route_watcher_events, start, Handle};
-use hiker_core::oplog::OpLog;
+use hiker_core::editing::LayeredDoc;
 use hiker_core::store::Store;
 use hiker_core::tasks::queue::Queue as TaskQueue;
 use hiker_core::tasks::types::TaskRecord;
@@ -131,11 +130,6 @@ struct RelayChannels {
     mut_rx: tokio::sync::mpsc::UnboundedReceiver<MutationEvent>,
     mut_tx: tokio::sync::mpsc::UnboundedSender<MutationEvent>,
     sync_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
-    /// Receiver for on-demand fork-diff fetch results (`sync-fork-diff`):
-    /// `(path, Ok(their_text) | Err(message))`, drained each frame into the
-    /// Sync page's fork-diff cache. Held even when sync is disabled (the channel
-    /// just stays empty), like `sync_rx`.
-    fork_diff_rx: tokio::sync::mpsc::UnboundedReceiver<crate::sync_service::ForkDiffResult>,
 }
 
 /// Inputs for `Spawner::snapshot_poller`: the read-side handles to poll
@@ -143,8 +137,11 @@ struct RelayChannels {
 struct SnapshotChannels {
     tasks: Arc<TaskQueue>,
     read_store: Arc<Mutex<Store>>,
+    layered: Arc<hiker_core::editing::LayeredDoc>,
     task_snap_tx: watch::Sender<Vec<TaskRecord>>,
     skipped_snap_tx: watch::Sender<HashSet<String>>,
+    pending_snap_tx: watch::Sender<Vec<hiker_core::ops::op_writes::PendingProposal>>,
+    whole_file_snap_tx: watch::Sender<Vec<hiker_core::ops::op_writes::WholeFileProposal>>,
 }
 
 impl Spawner {
@@ -175,269 +172,74 @@ impl Spawner {
         fs_rx
     }
 
+    /// Enqueue the vault rules `date-passed` sweep job once now (the
+    /// interval's first tick is immediate — the vault-open sweep) and once
+    /// every 24h after (`docs/rules.md`'s daily tick). Exits on `cancel`
+    /// or when the indexer channel closes. status: rule-triggers
+    fn rules_date_sweep_ticker(&self, jobs: hiker_core::indexer::IndexJobTx) {
+        let cancel = self.cancel.clone();
+        tokio::spawn(async move {
+            let mut tick =
+                tokio::time::interval(std::time::Duration::from_secs(60 * 60 * 24));
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tick.tick() => {
+                        if jobs
+                            .send(hiker_core::indexer::IndexJob::RulesDateSweep)
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// Set up the watcher fan-out for a vault session: the app-state relay
-    /// (returns the `fs_rx` the UI drains) plus the op-log external-edit
-    /// reconciliation relay. Both subscribe to the same broadcast and are
-    /// torn down on `cancel`. Bundled so `open_vault` stays a single call
-    /// site and the relay-loop complexity counts toward `Spawner`.
+    /// (returns the `fs_rx` the UI drains). The layered-doc external-edit
+    /// reconciliation relay is gone (`hiker-core-rework-plan.md` WS7a) — with no
+    /// `.ops` frame to mint, an external edit no longer needs a backend fold:
+    /// the layered doc loads `accepted` lazily from the canonical `.md`, and a clean
+    /// buffer is reloaded by the frontend's own watcher handler. `Watcher::suppress`
+    /// still drops self-write echoes so the indexer doesn't loop.
     fn watcher_relays(
         &self,
         watcher: &Arc<Watcher>,
-        oplog: Arc<hiker_core::oplog::OpLog>,
+        layered: Arc<hiker_core::editing::LayeredDoc>,
         vault: Arc<hiker_core::vault::Vault>,
     ) -> tokio::sync::mpsc::UnboundedReceiver<hiker_core::watcher::FileEvent> {
-        let fs_rx = self.watcher_relay(watcher.subscribe());
-        self.oplog_external_sync_relay(watcher.subscribe(), oplog, vault);
-        fs_rx
+        let _ = (layered, vault);
+        self.watcher_relay(watcher.subscribe())
     }
 
-    /// External-edit-sync relay (`op-log-external-edit-sync`). Subscribes to
-    /// the watcher and, for every `.md` Created/Modified event hiker didn't
-    /// initiate (the watcher already drops self-writes via
-    /// `watcher-suppress-self-writes` before broadcasting), reconciles the
-    /// new disk bytes into `accepted` through `core::ops::op_writes`. The
-    /// substrate compares disk against `materialize(accepted)`: equal →
-    /// ignored as a self-write echo (the safety net); different → applied as
-    /// an `author=external` text delta. Mirrors `watcher_relay`'s shape; one
-    /// spawned task per vault session, torn down on `cancel`.
-    fn oplog_external_sync_relay(
-        &self,
-        mut sub: tokio::sync::broadcast::Receiver<hiker_core::watcher::FileEvent>,
-        oplog: Arc<hiker_core::oplog::OpLog>,
-        vault: Arc<hiker_core::vault::Vault>,
-    ) {
-        use hiker_core::watcher::FileEvent;
-        let cancel = self.cancel.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    recv = sub.recv() => match recv {
-                        Ok(FileEvent::Created { path } | FileEvent::Modified { path }) => {
-                            if !hiker_core::indexer::is_indexable_path(&path) {
-                                continue;
-                            }
-                            match hiker_core::ops::op_writes::external_edit(&oplog, &vault, &path) {
-                                Ok(true) => tracing::debug!(%path, "external-edit-sync: reconciled disk change"),
-                                Ok(false) => {}
-                                Err(e) => tracing::warn!(%path, error = %e, "external-edit-sync failed"),
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        // Lagged: events were dropped. A missed external edit
-                        // is caught by the editor's pre-write drift check; no
-                        // forced reconcile needed here.
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    },
-                }
-            }
-        });
-    }
-
-    /// Build the live sync engine and spawn its responder loop, when
-    /// `[sync].enabled`. Mirrors `oplog_external_sync_relay`'s spawn shape:
-    /// one tokio task per vault session, torn down on `cancel`. The task
-    /// `listen`s on the configured/default addr, records the bound address,
-    /// then drives the swarm event loop as a responder (answering enrolled
-    /// peers) in short windows so the shared node lock is released between
-    /// turns and a UI-spawned `force_sync`/`discover` can interleave.
+    /// The optional, user-driven git integration (`git.md`, the VSCode model):
+    /// built only when `[git] enabled` is set over a vault that is *already* a
+    /// git repo. Spawns the debounced commit-on-save task (`git-commit-on-save`,
+    /// gated by `[git] auto_commit`) and nothing else — hiker never runs
+    /// automatic push/pull rounds, and never inits a repo on the user's behalf.
+    /// Returns `None` when git is not opted in, the vault isn't a git repo, or
+    /// the repo can't be opened (all non-fatal).
     ///
-    /// Returns the constructed service (stored on `Services`), or `None` when
-    /// sync is disabled or the key store can't be opened — both non-fatal.
-    pub(crate) fn spawn_sync_service(
-        &self,
-        vault_root: &std::path::Path,
-        oplog: Arc<hiker_core::oplog::OpLog>,
-        section: &hiker_core::config::sections::SyncSection,
-        sync_tx: tokio::sync::mpsc::UnboundedSender<String>,
-        fork_diff_tx: crate::sync_service::ForkDiffSender,
-    ) -> Option<Arc<crate::sync_service::SyncService>> {
-        use hiker_core::config::vcs::SyncTransport;
-        // The transport seam (`sync-transport-seam`): only build the libp2p
-        // engine when it is the selected transport. `git` / `none` are handled
-        // by `spawn_git_engine` / nothing. The single-bidirectional rule
-        // (`sync-single-bidirectional-transport`) is enforced by this exclusive
-        // selection — at most one bidirectional transport is constructed.
-        if !section.enabled || section.transport != SyncTransport::Libp2p {
-            return None;
-        }
-        let service = match crate::sync_service::SyncService::new(
-            vault_root,
-            oplog,
-            section,
-            sync_tx,
-            fork_diff_tx,
-        ) {
-            Ok(s) => Arc::new(s),
-            Err(e) => {
-                tracing::warn!(error = %e, "sync: failed to build service (non-fatal)");
-                return None;
-            }
-        };
-
-        // Spawn the debounced poke-on-commit task (the sending side): each
-        // local commit calls `service.notify_local_change()`, which wakes this
-        // task to nudge enrolled peers to pull promptly. Respects the service
-        // cancel token. [sync-poke-on-commit]
-        service.spawn_poke_task();
-
-        let node = service.node();
-        let events_tx = service.events_tx();
-        let svc = service.clone();
-        let cancel = self.cancel.clone();
-        // Per-service kill switch (the live `[sync].enabled = false` path),
-        // in addition to the session-wide cancel (vault switch / close).
-        let svc_cancel = service.cancel_token();
-        tokio::spawn(async move {
-            // Start listening; resolve the OS-assigned port.
-            {
-                let mut node = node.lock().await;
-                match node
-                    .listen(crate::sync_service::DEFAULT_LISTEN_ADDR)
-                    .await
-                {
-                    Ok(addr) => {
-                        let _ = events_tx.send(format!("sync: listening on {addr}"));
-                        svc.set_listen_addr(addr);
-                    }
-                    Err(e) => {
-                        let _ = events_tx.send(format!("sync: listen failed — {e}"));
-                        return;
-                    }
-                }
-            }
-
-            // Auto-sync driver, folded into the responder loop so it never
-            // fights the responder for the node lock — both interleave by
-            // yielding the lock between turns. Three triggers fire a round:
-            //   * startup: one round shortly after `listen` succeeds, so a
-            //     device that just came online catches up immediately.
-            //   * periodic: the `AUTO_SYNC_INTERVAL` tick.
-            //   * on-discovery: a new enrolled peer surfaced via mDNS in the
-            //     responder window (`take_newly_discovered`).
-            // `[sync].enabled` already gated building the whole task; the
-            // cancel tokens below stop it (kill switch / vault swap). Rounds
-            // run when server-mode is usable, or LAN discovery is on; with
-            // discovery off and no server, the driver still ticks but every
-            // round is a benign no-op (no known peers → `Ok(None)`, silent).
-            // ~15s: cheap (manifest/state-vector exchange, deltas only) and
-            // quiet on empty rounds; a config knob is a future nicety.
-            const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(15);
-            // Startup delay: let the listener settle + give mDNS a beat to
-            // surface a peer before the first round.
-            const STARTUP_DELAY: Duration = Duration::from_secs(2);
-            let mut interval = tokio::time::interval(AUTO_SYNC_INTERVAL);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // The interval's first tick fires immediately; consume it so the
-            // *periodic* arm doesn't double up with the explicit startup round.
-            interval.tick().await;
-            let startup = tokio::time::sleep(STARTUP_DELAY);
-            tokio::pin!(startup);
-            let mut did_startup = false;
-
-            // Responder loop: drive the swarm in short windows, releasing the
-            // node lock between turns so UI-spawned dialer work and the
-            // auto-sync rounds below can take it.
-            loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    _ = svc_cancel.cancelled() => break,
-                    _ = &mut startup, if !did_startup => {
-                        did_startup = true;
-                        svc.auto_sync_round().await;
-                    }
-                    _ = interval.tick() => {
-                        svc.auto_sync_round().await;
-                    }
-                    _ = async {
-                        let (newly_discovered, poked) = {
-                            let mut node = node.lock().await;
-                            // Short window so the node lock is held only briefly
-                            // between turns — a UI-spawned action that needs the
-                            // lock (enroll / import / resolve) waits at most this
-                            // long, not half a second.
-                            if let Err(e) = node.run(Duration::from_millis(120)).await {
-                                tracing::warn!(error = %e, "sync: responder run window failed");
-                            }
-                            // Mirror the node-derived state the page renders
-                            // (enrolled LAN peers + blocked docs) into `Shared`
-                            // while we hold the lock (cheap sync reads), so the
-                            // egui render path never locks the node itself.
-                            svc.fold_discovered(node.discovered_peers());
-                            svc.fold_blocked(node.blocked_docs());
-                            // Mirror the unenrolled-seen LAN peers for the page,
-                            // and emit a one-time log line per newly-seen one so
-                            // the user sees a hiker instance is reachable but
-                            // needs enrolling. [sync-mdns-discovery]
-                            svc.fold_seen_unenrolled(node.seen_unenrolled());
-                            for peer in node.take_newly_seen_unenrolled() {
-                                let _ = events_tx.send(format!(
-                                    "sync: discovered un-enrolled peer {peer} on LAN — \
-                                     enroll its fingerprint to sync"
-                                ));
-                            }
-                            // Drain both prompt-round triggers under the same
-                            // lock turn: a newly-seen enrolled peer AND an
-                            // inbound poke (a peer committed a change and asked
-                            // us to pull). [sync-poke-on-commit]
-                            (node.take_newly_discovered(), node.take_poked())
-                        };
-                        // Yield so a waiting dialer can grab the lock between
-                        // the responder window and any on-discovery round.
-                        tokio::task::yield_now().await;
-                        if newly_discovered || poked {
-                            // A new enrolled peer just appeared, or a peer poked
-                            // us after committing — pull promptly rather than
-                            // waiting for the next tick. [sync-poke-on-commit]
-                            svc.auto_sync_round().await;
-                        }
-                    } => {}
-                }
-            }
-        });
-
-        Some(service)
-    }
-
-    /// The git transport engine behind the sync seam (`git.md`,
-    /// `sync-transport-seam`): built + driven only when `[sync].enabled` and
-    /// `[sync].transport = "git"`. Spawns the debounced commit-on-save task and
-    /// (integrated mode, remote set) a periodic + startup push/pull driver on
-    /// the SAME triggers the libp2p engine uses. Returns `None` when git isn't
-    /// the selected transport or the repo can't be opened (both non-fatal).
-    /// status: sync-transport-seam
-    /// status: git-integrated-mode
+    /// status: git-config-section
+    /// status: git-commit-on-save
     pub(crate) fn spawn_git_engine(
         &self,
         vault_root: &std::path::Path,
-        oplog: Arc<hiker_core::oplog::OpLog>,
-        sync_section: &hiker_core::config::sections::SyncSection,
+        layered: Arc<hiker_core::editing::LayeredDoc>,
         git_section: &hiker_core::config::vcs::GitSection,
         sync_tx: tokio::sync::mpsc::UnboundedSender<String>,
     ) -> Option<Arc<crate::git_sync::GitSyncEngine>> {
-        use hiker_core::config::vcs::{GitMode, SyncTransport};
-        if !sync_section.enabled || sync_section.transport != SyncTransport::Git {
-            return None;
-        }
-        // Enforce the single-bidirectional rule (`sync-single-bidirectional-
-        // transport`). Selection already makes libp2p and git mutually exclusive
-        // (this engine is only built when git is THE transport), so libp2p is
-        // not also running. The check is stated here as the authority and logs
-        // a clear signal if the invariant is ever violated out-of-band.
-        let git_has_remote = !git_section.remote.trim().is_empty();
-        if let Err(reason) = hiker_sync::seam::check_single_bidirectional(
-            hiker_sync::seam::TransportKind::Git,
-            git_has_remote,
-            false,
-        ) {
-            tracing::warn!(target: "hiker::sync", "{reason}");
-            let _ = sync_tx.send(format!("git: {reason}"));
+        // Opt-in + inert until the user acts: git does nothing unless the user
+        // enabled it AND the vault is already a git repo. We never auto-init.
+        if !git_section.enabled || !vault_root.join(".git").exists() {
             return None;
         }
         let engine = match crate::git_sync::GitSyncEngine::new(
             vault_root,
-            oplog,
+            layered,
             git_section,
             sync_tx,
             tokio::runtime::Handle::current(),
@@ -448,42 +250,18 @@ impl Spawner {
                 return None;
             }
         };
-        // Debounced commit-on-save (`git-commit-on-save`).
+        // CODE-IN-VAULT restore-on-open: when `[git] submodules = "submodule"`,
+        // populate any declared-but-uninitialized submodule (the empty-gitlink
+        // state a fresh clone leaves) at its pinned commit. Conservative — a
+        // populated or dirty submodule is never re-checked-out — so it's safe in
+        // BOTH modes (a checkout, not a structure mutation). Non-fatal.
+        // [git-nested-repo-submodule]
+        engine.restore_submodules_on_open();
+        // The one automatic git action that stays: debounced commit-on-save
+        // (`git-commit-on-save`), a no-op when `[git] auto_commit` is off (and
+        // never in manual mode). No push/pull driver, no interval, no
+        // poke-on-commit — push/pull is user-driven only.
         engine.spawn_commit_task();
-
-        // Push/pull driver on the sync triggers (`git-push-pull-rounds`):
-        // a startup round then a periodic interval. Integrated mode with a
-        // remote pulls+pushes; manual mode's only coupling is the HEAD-move
-        // fold, which `push_pull_round` routes to `manual_reconcile`. A no-op
-        // round (no remote, nothing diverged) is silent.
-        let drive = engine.clone();
-        let cancel = self.cancel.clone();
-        let engine_cancel = engine.cancel_token();
-        let manual = git_section.mode == GitMode::Manual;
-        tokio::spawn(async move {
-            const STARTUP_DELAY: Duration = Duration::from_secs(2);
-            const ROUND_INTERVAL: Duration = Duration::from_secs(15);
-            tokio::time::sleep(STARTUP_DELAY).await;
-            let mut interval = tokio::time::interval(ROUND_INTERVAL);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    _ = engine_cancel.cancelled() => break,
-                    _ = interval.tick() => {
-                        // Run the blocking libgit2 round off the async worker.
-                        let e = drive.clone();
-                        let res = tokio::task::spawn_blocking(move || {
-                            if manual { e.manual_reconcile() } else { e.push_pull_round() }
-                        })
-                        .await;
-                        if let Ok(Err(msg)) = res {
-                            tracing::warn!(target: "hiker::sync", "{msg}");
-                        }
-                    }
-                }
-            }
-        });
         Some(engine)
     }
 
@@ -514,17 +292,28 @@ impl Spawner {
     }
 
     /// Snapshot pollster: tasks every 200ms; the read-store-locked
-    /// skipped-paths query every ~3s. First tick fires immediately so the
-    /// very first UI frame sees a populated cache. Exits on `cancel`. (The
-    /// pending-op badge feed reads the op log directly each frame in
-    /// `main::refresh_pending_proposals` — it isn't polled here.)
+    /// skipped-paths query every ~3s; the layered-doc pending-proposal walks
+    /// (badge / pill feeds) every ~1s. First tick fires immediately so the
+    /// very first UI frame sees a populated cache. Exits on `cancel`.
+    ///
+    /// The layered-doc walks live here for the same reason the skipped-paths
+    /// query does: they take a mutex the background side also wants (the
+    /// layered doc's inner lock, which the indexer's rule pass and accept paths
+    /// hold across file I/O) — polling off-thread keeps a contended lock
+    /// from stalling a paint frame. A failed walk skips the send so the
+    /// prior snapshot stays in place (a transient I/O hiccup doesn't blink
+    /// the badge off).
     fn snapshot_poller(&self, ch: SnapshotChannels) {
         let cancel = self.cancel.clone();
         const TICK: Duration = Duration::from_millis(200);
         const SKIPPED_INTERVAL: Duration = Duration::from_secs(3);
+        const OPLOG_INTERVAL: Duration = Duration::from_secs(1);
         tokio::spawn(async move {
             let mut last_skipped = std::time::Instant::now()
                 .checked_sub(SKIPPED_INTERVAL)
+                .unwrap_or_else(std::time::Instant::now);
+            let mut last_layered = std::time::Instant::now()
+                .checked_sub(OPLOG_INTERVAL)
                 .unwrap_or_else(std::time::Instant::now);
             let mut interval = tokio::time::interval(TICK);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -547,6 +336,27 @@ impl Spawner {
                         }
                     }
                     last_skipped = std::time::Instant::now();
+                }
+
+                if last_layered.elapsed() >= OPLOG_INTERVAL {
+                    match hiker_core::ops::op_writes::list_pending_proposals(ch.layered.as_ref()) {
+                        Ok(props) => {
+                            let _ = ch.pending_snap_tx.send(props);
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "poller: list_pending_proposals failed");
+                        }
+                    }
+                    match hiker_core::ops::op_writes::list_whole_file_proposals(ch.layered.as_ref())
+                    {
+                        Ok(props) => {
+                            let _ = ch.whole_file_snap_tx.send(props);
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "poller: list_whole_file_proposals failed");
+                        }
+                    }
+                    last_layered = std::time::Instant::now();
                 }
 
                 tokio::select! {
@@ -596,16 +406,22 @@ impl Spawner {
         &self,
         tasks: &Arc<TaskQueue>,
         read_store: &Arc<Mutex<Store>>,
+        layered: &Arc<hiker_core::editing::LayeredDoc>,
         relays: RelayChannels,
     ) -> VaultEvents {
         let (task_snap_tx, task_snap_rx) = watch::channel::<Vec<TaskRecord>>(Vec::new());
         let (skipped_snap_tx, skipped_snap_rx) = watch::channel::<HashSet<String>>(HashSet::new());
+        let (pending_snap_tx, pending_snap_rx) = watch::channel(Vec::new());
+        let (whole_file_snap_tx, whole_file_snap_rx) = watch::channel(Vec::new());
 
         self.snapshot_poller(SnapshotChannels {
             tasks: tasks.clone(),
             read_store: read_store.clone(),
+            layered: layered.clone(),
             task_snap_tx,
             skipped_snap_tx,
+            pending_snap_tx,
+            whole_file_snap_tx,
         });
 
         VaultEvents {
@@ -616,92 +432,50 @@ impl Spawner {
             indexer_events: VecDeque::new(),
             sync_events_rx: Mutex::new(relays.sync_rx),
             sync_events: VecDeque::new(),
-            fork_diff_rx: Mutex::new(relays.fork_diff_rx),
             task_snapshot_rx: task_snap_rx,
             skipped_paths_rx: skipped_snap_rx,
+            pending_proposals_rx: pending_snap_rx,
+            whole_file_proposals_rx: whole_file_snap_rx,
         }
     }
 }
 
-/// Open the vault's op log and seed it from the on-disk notes on first
-/// open. The op log is the text write substrate every producer rides on
+/// Open the vault's layered doc and seed it from the on-disk notes on first
+/// open. The layered doc is the text write substrate every producer rides on
 /// (`op-log-ops-producer-helpers`); the seed (`op-log-doc-id-bootstrap`)
 /// mints a doc per existing note and is idempotent — already-mapped notes
 /// are skipped — so subsequent opens are a cheap walk. The vestigial
-/// `[op-log] compact_threshold` is still read but no longer triggers
-/// compaction (the `.ops` log is the durable representation). A bootstrap seed
-/// failure is non-fatal (logged) so a single unreadable note can't block
-/// the whole vault opening.
+/// `[editing] compact_threshold` is still read but no longer does anything (the
+/// canonical `.md` on disk is the durable representation). A bootstrap seed
+/// failure is non-fatal (logged) so a single unreadable note can't block the
+/// whole vault opening.
 ///
-/// Ordering (`op-log.md` §External-edit sync): the startup disk-reconcile
-/// runs first, then the bootstrap seed, and this whole step completes
-/// synchronously before `open_vault` spawns the sync service — i.e.
-/// reconcile → seed → first sync round.
-fn open_and_seed_oplog(
+/// The former startup full-vault disk-reconcile (and the reconcile → seed →
+/// first-sync ordering invariant) is gone (`hiker-core-rework-plan.md` WS7a):
+/// there is nothing to fold in at open. The layered doc loads each doc's
+/// `accepted` lazily from its `.md`, so an offline edit is observed the moment
+/// the buffer opens (the editor reads the `.md`) and an offline rename degrades
+/// to delete + create — accepted per the plan.
+fn open_and_seed_layered(
     root: &std::path::Path,
     vault: &Vault,
     config: &std::sync::RwLock<Config>,
-) -> Result<Arc<OpLog>> {
-    let compact_threshold = config
+) -> Result<Arc<LayeredDoc>> {
+    let retention = config
         .read()
-        .map(|c| c.op_log.compact_threshold)
-        .unwrap_or(4.0);
-    let oplog = Arc::new(
-        OpLog::open_with_threshold(root, compact_threshold).with_context(|| "open op log")?,
+        .map(|c| hiker_core::snapshot::RetentionPolicy::from(&c.history))
+        .unwrap_or_default();
+    let layered = Arc::new(
+        LayeredDoc::open(root)
+            .with_context(|| "open layered doc")?
+            .with_retention(retention),
     );
-    // Startup disk-reconcile MUST run before the bootstrap seed (see the
-    // ordering invariant on `run_disk_reconcile_on_open`).
-    run_disk_reconcile_on_open(root, vault, &oplog);
-    match hiker_core::ops::op_writes::bootstrap(vault, &oplog) {
-        Ok(n) if n > 0 => tracing::info!(seeded = n, "oplog: seeded documents on first open"),
+    match hiker_core::ops::op_writes::bootstrap(vault, &layered) {
+        Ok(n) if n > 0 => tracing::info!(seeded = n, "layered: seeded documents on first open"),
         Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "oplog: bootstrap seed failed (non-fatal)"),
+        Err(e) => tracing::warn!(error = %e, "layered: bootstrap seed failed (non-fatal)"),
     }
-    run_oplog_retention_gc_on_open(&oplog, config);
-    Ok(oplog)
-}
-
-/// Startup disk-reconcile (`op-log.md` §External-edit sync, Ordering
-/// invariant): walk every tracked doc and fold disk-vs-`accepted` drift
-/// (offline edits, deletes, renames) in as `author=external` ops. This MUST
-/// run BEFORE the bootstrap seed — bootstrap seeds an untracked path as a fresh
-/// document, so an offline rename's new path has to be claimed by reconcile
-/// while it is still untracked, or the rename degrades into a tombstone + a
-/// fresh, history-orphaned lineage. It runs synchronously here during vault
-/// open, before `open_vault` calls `spawn_sync_service` — so a stale `accepted`
-/// is never pushed and an offline edit is never clobbered by an inbound update
-/// that lands first. Failures are logged, not fatal. status: op-log-startup-disk-reconcile
-fn run_disk_reconcile_on_open(root: &std::path::Path, vault: &Vault, oplog: &Arc<OpLog>) {
-    let trash = hiker_core::trash::Trash::open(root);
-    match hiker_core::ops::op_writes::reconcile_disk(vault, oplog, &trash) {
-        Ok(n) if n > 0 => tracing::info!(reconciled = n, "oplog: reconciled disk drift on open"),
-        Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "oplog: disk reconcile failed (non-fatal)"),
-    }
-}
-
-/// On-open retention GC (`op-log-retention`): drop accepted/rejected
-/// side-table rows past their `[op-log]` retention horizons. This only
-/// covers the side-table sweep (the `.ops` history itself is retained, not
-/// compacted). Failures are logged, not fatal —
-/// a vault still opens with stale metadata rows.
-fn run_oplog_retention_gc_on_open(oplog: &Arc<OpLog>, config: &std::sync::RwLock<Config>) {
-    let (meta_days, rejected_days) = config
-        .read()
-        .map(|c| {
-            (
-                c.op_log.metadata_retention_days,
-                c.op_log.rejected_retention_days,
-            )
-        })
-        .unwrap_or((365, 14));
-    match hiker_core::ops::op_writes::run_retention_gc(oplog, meta_days, rejected_days) {
-        Ok((a, r)) if a + r > 0 => {
-            tracing::info!(accepted_dropped = a, rejected_dropped = r, "oplog: retention GC on open")
-        }
-        Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "oplog: retention GC failed (non-fatal)"),
-    }
+    Ok(layered)
 }
 
 /// Load the persisted session state for a freshly-opened vault: crash-recovery
@@ -718,6 +492,61 @@ fn load_persisted_session(
     let recovery_entries = autosave.recover().unwrap_or_default();
     let tab_state = autosave.load_tab_state().ok().flatten();
     (recovery_entries, tab_state)
+}
+
+/// Compile the config-derived engines attached to the indexer at vault
+/// open: the `[inbox]` rule list (the Created-event hook applies rules
+/// before the upsert) and the `[kinds]` registry (ingest derives each
+/// note's lenient-validation problems from it). Strict-load already
+/// validated both inside `Config::load`, so a compile failure here is
+/// drift — logged and degraded (that engine disabled) rather than failing
+/// the open. Returns the registry so the host can share it with the
+/// smart-folder lens and the MCP server's generated kind tools.
+///
+/// status: inbox-rules
+/// status: kind-registry
+/// status: rule-shape
+fn attach_config_engines(
+    config: &std::sync::RwLock<Config>,
+    indexer: &hiker_core::indexer::Handle,
+) -> (Arc<hiker_core::kinds::Registry>, Arc<hiker_core::rules::Engine>) {
+    let inbox_rules_src = config
+        .read()
+        .map(|c| c.inbox.rules.clone())
+        .unwrap_or_default();
+    match hiker_core::inbox::Rules::compile(&inbox_rules_src) {
+        Ok(rules) => indexer.attach_inbox_rules(Arc::new(rules)),
+        Err(e) => tracing::error!(error = %e, "inbox: rule compile failed; rules disabled"),
+    }
+    let kinds_src = config.read().map(|c| c.kinds.clone()).unwrap_or_default();
+    let kinds = match hiker_core::kinds::Registry::compile(&kinds_src) {
+        Ok(registry) => Arc::new(registry),
+        Err(e) => {
+            tracing::error!(error = %e, "kinds: registry compile failed; kinds disabled");
+            Arc::new(hiker_core::kinds::Registry::empty())
+        }
+    };
+    indexer.attach_kind_registry(kinds.clone());
+    // status: rule-shape
+    // The vault rules engine compiles beside the registry it references;
+    // firings stage under review mode per the [editing] config's
+    // `review_required` (`rule-attribution`). Same drift posture: a
+    // compile failure here disables rules rather than failing the open.
+    let rules_src = config.read().map(|c| c.rules.clone()).unwrap_or_default();
+    let review_required = config
+        .read()
+        .map(|c| c.editing.review_required)
+        .unwrap_or(true);
+    let rule_set = match hiker_core::rules::RuleSet::compile(&rules_src, &kinds) {
+        Ok(set) => set,
+        Err(e) => {
+            tracing::error!(error = %e, "rules: compile failed; vault rules disabled");
+            hiker_core::rules::RuleSet::default()
+        }
+    };
+    let rules = Arc::new(hiker_core::rules::Engine::new(rule_set, review_required));
+    indexer.attach_rules_engine(rules.clone());
+    (kinds, rules)
 }
 
 pub async fn open_vault(root: PathBuf) -> Result<AppState> {
@@ -740,15 +569,11 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
         Store::open(&root).with_context(|| "open read store")?,
     ));
 
-    let oplog = open_and_seed_oplog(&root, &vault, &config)?;
+    let layered = open_and_seed_layered(&root, &vault, &config)?;
 
     let trees = Arc::new(
-        Db::new(oplog.clone(), vault.clone()).with_context(|| "open trees store")?,
+        Db::new(layered.clone(), vault.clone()).with_context(|| "open trees store")?,
     );
-    // Activity feed projects over the op log: accepted ops → change rows,
-    // pending ops → pending proposal rows. The op log is the sole changelog
-    // substrate.
-    let activity = Arc::new(Activity::new(oplog.clone()));
     let autosave = Arc::new(
         Autosave::open(&root).with_context(|| "open autosave")?,
     );
@@ -774,22 +599,12 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
     );
     indexer.attach_watcher(watcher.clone());
     // Let the indexer's move / delete jobs record renames + tombstones in the
-    // op log so `doc-index.db` follows file moves and deletes reach history.
-    indexer.attach_oplog(oplog.clone());
-    // status: inbox-rules
-    // Compile the [inbox] rule list once at vault open and hand it to the
-    // indexer; the Created-event hook applies rules before the upsert.
-    // Strict-load already validated the rules in Config::load above, so
-    // compile here is expected to succeed; log + skip on the off chance it
-    // doesn't (e.g. drift between validate / compile).
-    let inbox_rules_src = config
-        .read()
-        .map(|c| c.inbox.rules.clone())
-        .unwrap_or_default();
-    match hiker_core::inbox::Rules::compile(&inbox_rules_src) {
-        Ok(rules) => indexer.attach_inbox_rules(Arc::new(rules)),
-        Err(e) => tracing::error!(error = %e, "inbox: rule compile failed; rules disabled"),
-    }
+    // layered doc so `doc-index.db` follows file moves and deletes reach history.
+    indexer.attach_layered(layered.clone());
+    // Compile + attach the config-derived engines (the [inbox] rule list
+    // and the [kinds] registry); the returned registry is shared with the
+    // smart-folder lens and the MCP server's generated kind tools.
+    let (kinds, rules) = attach_config_engines(&config, &indexer);
 
     // Wire watcher → indexer router so file events drive re-indexing.
     let _router = route_watcher_events(watcher.subscribe(), indexer.job_sender());
@@ -797,9 +612,8 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
     // status: cluster-tree-visible-note
     // Hand the trees store its watcher + indexer handles and the configured
     // tree directory now that both subsystems exist (they postdate `Db::new`).
-    // Tree saves now suppress + explicitly index the visible `.md`, the same
-    // discipline trail-docs use. The full_scan below indexes any trees the
-    // construction-time migration relocated.
+    // Tree saves suppress + explicitly index the visible `.md`, the same
+    // discipline trail-docs use.
     let new_cluster_tree_dir = config
         .read()
         .map(|c| c.clustering.new_cluster_tree_dir.clone())
@@ -823,27 +637,28 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
     // `open_vault`'s.
     let spawner = Spawner { cancel: cancel.clone() };
 
-    // Watcher fan-out: app-state relay + op-log external-edit reconciliation.
-    let fs_rx = spawner.watcher_relays(&watcher, oplog.clone(), vault.clone());
+    // Watcher fan-out: app-state relay + layered-doc external-edit reconciliation.
+    let fs_rx = spawner.watcher_relays(&watcher, layered.clone(), vault.clone());
 
     // Indexer progress forwarder.
     let indexer_arc = Arc::new(indexer);
     let ev_rx = spawner.indexer_progress_relay(indexer_arc.subscribe_progress());
 
+    // status: rule-triggers
+    // The vault rules `date-passed` sweep: once at vault open (the first
+    // immediate tick) and daily after — the lazy sweep `docs/rules.md`
+    // calls for. The per-rule watermark in the store makes redundant
+    // enqueues free; without rules the job is a no-op.
+    spawner.rules_date_sweep_ticker(indexer_arc.job_sender());
+
     // Channel for note-mutation outcomes.
     let (mut_tx, mut_rx) =
         tokio::sync::mpsc::unbounded_channel::<MutationEvent>();
 
-    // Channel for sync progress lines. Created up-front (even when sync is
-    // disabled) so `VaultEvents` always holds both ends; the tx is also handed
-    // to the sync service so its async tasks can push.
+    // Channel for git-transport progress lines. Created up-front (even when git
+    // is disabled) so `VaultEvents` always holds both ends; the tx is also
+    // handed to the git engine so its async tasks can push.
     let (sync_tx, sync_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-
-    // Channel for on-demand fork-diff fetch results (`sync-fork-diff`). Created
-    // up-front like `sync_tx`; the tx is handed to the sync service so its
-    // fetch task can deliver `(path, Ok(text) | Err(msg))` back to the UI.
-    let (fork_diff_tx, fork_diff_rx) =
-        tokio::sync::mpsc::unbounded_channel::<crate::sync_service::ForkDiffResult>();
 
     // Audit log + task queue: shared dependencies for MCP + agent loop.
     let audit = Arc::new(AgentLog::new(
@@ -886,28 +701,24 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
         tasks_config: tasks_cfg,
         boards_config: config.read().map(|c| c.boards.clone()).unwrap_or_default(),
         llm_enabled: config.read().map(|c| c.llm.enabled).unwrap_or(false),
-        oplog: Some(oplog.clone()),
+        layered: Some(layered.clone()),
         ui_context: mcp_ui_context.clone(),
+        kinds: kinds.clone(),
     }).await;
 
     // Crash recovery + persisted tab snapshot for the new Session.
     let (recovery_entries, tab_state) = load_persisted_session(&autosave);
 
-    // Live sync engine: built + responder-spawned only when `[sync].enabled`.
-    // When disabled, `None` — no keys, no swarm, no listener. The `sync_tx`
-    // end is also stashed in `VaultEvents` so the UI drains the progress ring.
-    let (sync_section, git_section) = config
+    // The optional, user-driven git integration (`git.md`, the VSCode model):
+    // built only when `[git] enabled` is set over a vault that is already a git
+    // repo. When off, `None` — no git calls. The `sync_tx` end is stashed in
+    // `VaultEvents` so the UI drains the git progress ring.
+    let git_section = config
         .read()
-        .map(|c| (c.sync.clone(), c.git.clone()))
+        .map(|c| c.git.clone())
         .unwrap_or_default();
-    let sync = spawner.spawn_sync_service(
-        &root, oplog.clone(), &sync_section, sync_tx.clone(), fork_diff_tx.clone(),
-    );
-    // The git transport (`git.md`) behind the same seam: built only when
-    // `[sync].transport = "git"`, mutually exclusive with the libp2p `sync`
-    // engine above (`sync-single-bidirectional-transport`).
     let git_sync = spawner.spawn_git_engine(
-        &root, oplog.clone(), &sync_section, &git_section, sync_tx.clone(),
+        &root, layered.clone(), &git_section, sync_tx.clone(),
     );
 
     // Wire the UI `watch` channels + snapshot pollster and fold them in
@@ -916,20 +727,18 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
     let events = spawner.build_vault_events(
         &tasks,
         &read_store,
-        RelayChannels { fs_rx, ev_rx, mut_rx, mut_tx, sync_rx, fork_diff_rx },
+        &layered,
+        RelayChannels { fs_rx, ev_rx, mut_rx, mut_tx, sync_rx },
     );
-    // `sync_tx` / `fork_diff_tx` were handed to the sync service (when enabled)
-    // above; drop our copies so each channel closes cleanly if no service holds
-    // a sender.
+    // `sync_tx` was handed to the git engine (when enabled) above; drop our
+    // copy so the channel closes cleanly if no engine holds a sender.
     drop(sync_tx);
-    drop(fork_diff_tx);
 
     // Assemble the compartments.
     let services = Services {
         read_store,
-        oplog,
+        layered,
         trees,
-        activity,
         autosave,
         watcher,
         indexer: indexer_arc,
@@ -938,8 +747,9 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
         mcp,
         mcp_tools_cfg,
         mcp_ui_context,
-        sync,
         git_sync,
+        kinds,
+        rules,
     };
     let vault_session = VaultSession {
         vault: vault.clone(),
@@ -982,29 +792,26 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
         search_state,
         vault_state: crate::vault_view::State::default(),
         trash_state: crate::trash::State,
+        source_control_state: crate::source_control::State::default(),
         canvases_activity_state: crate::canvas_activity::State,
         projects_activity_state: crate::projects_activity::State,
-        chat_state: crate::chat::state::State::default(),
+        code_sources: crate::code_sources::Registry::default(),
         // Per-vault activity registry: built-ins (Clusters in v1) plus
         // (Phase 3) plugin-derived activities. `feature-registry`.
         activities: crate::activity::ActivityRegistry::build(crate::activity::builtin_activities()),
         ui: UiState::default(),
         toasts: Vec::new(),
         pending_effects: Vec::new(),
-        sync_attention_seen: crate::state::SyncAttentionSeen::default(),
         vault_switch: VaultSwitchState::Idle,
         workbench: {
             // Inlined `new_workbench`: fresh workbench with the default
             // activity (`Files`) open in the splittable primary side
-            // region, the Chat (secondary) side bar visible, and the
-            // global bottom status strip on.
+            // region and the global bottom status strip on. The secondary
+            // (right) side bar has no activities since the chat dock was
+            // removed (AI is MCP-only), so it starts hidden.
             let mut wb = egui_workbench::workspace::Workbench::default();
             wb.open_primary_panel("files".to_string());
-            // Chat is a right-bar activity: seed the secondary stack with
-            // it so the default-shown right side bar renders chat through
-            // the same generic path as the primary. [feature-multi-region-sidebar]
-            wb.secondary_panels.switch_group("chat".to_string(), vec!["chat".to_string()]);
-            wb.secondary_side_bar.visible = true;
+            wb.secondary_side_bar.visible = false;
             wb.status_bar.visible = true;
             wb
         },
@@ -1081,6 +888,13 @@ impl AppState {
     // status: canvas-view-state-persist
     state.session.canvas_views = ts.canvas_views;
 
+    // Restore persisted graph + code-graph view state into the session maps; each
+    // panel applies its entry on first render (`graph::apply_persisted_view` /
+    // `code_graph::apply_persisted_view`), so a graph opens where the user left it
+    // across a restart. status: graph-view-state-persist
+    state.session.graph_views = ts.graph_views;
+    state.session.code_graph_views = ts.code_graph_views;
+
     let mut first_id: Option<crate::tab::TabId> = None;
     let mut active_id: Option<crate::tab::TabId> = None;
     let mut preview_id: Option<crate::tab::TabId> = None;
@@ -1089,7 +903,17 @@ impl AppState {
             ":home" => Some(TabKind::Home),
             ":queue" => Some(TabKind::Queue),
             ":settings" => Some(TabKind::Settings),
-            ":graph" => Some(TabKind::Graph),
+            ":graph" => Some(TabKind::Graph { focus: None, scope_query: None }),
+            // status: graph-tab-focus
+            // Focused graph tab: the persist key is `graph:<depth>:<path>`.
+            // The landing state itself restores via the persisted view state
+            // (`graph-view-state-persist`); this re-creates the tab kind.
+            p if p.starts_with("graphq:") => Some(TabKind::Graph {
+                focus: None,
+                scope_query: Some(p["graphq:".len()..].to_string()),
+            }),
+            p if p.starts_with("graph:") => crate::tab::GraphFocus::from_persist_key(p)
+                .map(|f| TabKind::Graph { focus: Some(f), scope_query: None }),
             // status: board-view
             // Per-doc board tab: the persist key is `board:<doc-path>`.
             p if p.starts_with("board:") => {
@@ -1116,11 +940,10 @@ impl AppState {
             ":patch_review" => Some(TabKind::PatchReview),
             // status: board-index-page
             ":boards_index" => Some(TabKind::BoardsIndex),
+            ":rules" => Some(TabKind::Rules),
             ":indexer" => Some(TabKind::IndexerDetail),
-            ":sync" => Some(TabKind::Sync),
-            // `:agent_changes` is the legacy persist key; map it forward
-            // to the unified `Changes` tab so old workspaces restore cleanly.
-            ":changes" | ":agent_changes" => Some(TabKind::Changes),
+            // status: diff-summary-panel
+            ":git_diff" => Some(TabKind::GitDiff),
             _ => None,
         };
         let kind = if let Some(k) = singleton_kind {
@@ -1131,12 +954,14 @@ impl AppState {
                     state.vault_session.vault.read_file_with_hash(&path)
                 {
                     let cfg_guard = state.vault_session.config.read().ok();
-                    let buf = crate::buffer::Buffer::with_config_and_vault(
+                    let code = crate::code_sources::completion_provider(state);
+                    let buf = crate::buffer::Buffer::with_config_vault_and_code(
                         path.clone(),
                         &contents,
                         hash,
                         cfg_guard.as_deref(),
                         Some(state.vault_session.vault.clone()),
+                        Some(code),
                     );
                     drop(cfg_guard);
                     state.session.buffers.insert(path.clone(), buf);

@@ -38,7 +38,6 @@ hiker-core.workspace = true
 # Shared LLM client (extracted from core); the chat + cluster-summary paths
 # build a GraniteLlmClient via core's config bridge. status: crawler-shared-llm
 hiker-llm.workspace = true
-hiker-sync = { path = "../hiker-sync" }
 # Git transport backend; `git2`/libgit2 is confined to `hiker-git` — the app
 # sees only its plain-Rust `GitBackend` surface. status: git-backend-trait
 hiker-git.workspace = true
@@ -71,6 +70,9 @@ canvas-view.workspace = true
 # The egui-free projection math kernel, so the canvas View menu can name
 # `ProjectionKind` for the Off/Fisheye/Poincaré selector. [proj-canvas-mode]
 hiker-projection.workspace = true
+# The view-layer lens (disk frame, disk operator, centroid framing) — lets the
+# canvas overview drop its hand-copied `centroid_scale`/`disk_point`.
+hiker-projection-view.workspace = true
 # Vector-free layout types (`LayoutParams`, `LayoutKind`, `LayoutTree`, the
 # tree builders) come from here directly; `graph-widgets` façades only the
 # egui-wrapped pieces (the project bans `pub use` re-exports).
@@ -105,10 +107,11 @@ hiker-charts-gui.workspace = true
 # SVG → RGBA rasterization (usvg parse + tiny-skia pixmap). Same version
 # `hiker-htmlview` already pulls in, so the dep set stays consistent.
 resvg = "0.47.0"
-# PNG encode/decode for the persisted diagram-cache layer
-# (panels/buffer/widgets/diagram_cache.rs). PNG-only; same version
-# tools/graph-snapshot uses. status: widget-render-disk-cache
-image = { version = "0.25", default-features = false, features = ["png"] }
+# Image decode/encode. PNG drives the persisted diagram-cache layer
+# (panels/buffer/widgets/disk_cache.rs); the other web formats decode an
+# `![alt](path)` image hosted in a table cell (panels/buffer/widgets/tables/
+# image.rs). status: widget-render-disk-cache / widget-table-render
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 eframe.workspace = true
 petgraph.workspace = true
 rfd.workspace = true
@@ -122,6 +125,8 @@ editor-view.workspace = true
 editor-egui.workspace = true
 editor-md.workspace = true
 editor-diff.workspace = true
+# Code syntax highlighting for read-only code buffers (`code-syntax-highlight`).
+editor-ts = { workspace = true, features = ["lang-rust", "lang-python"] }
 
 # Async + runtime
 tokio = { workspace = true, features = ["rt-multi-thread", "rt", "sync", "macros", "time", "fs"] }

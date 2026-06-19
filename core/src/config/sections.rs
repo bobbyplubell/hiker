@@ -4,8 +4,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::vcs::SyncTransport;
-
 pub(super) const fn yes() -> bool {
     true
 }
@@ -35,7 +33,7 @@ pub struct SuggestionsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TriageConfig {
-    /// When `true`, every triage match stays pending in the op log
+    /// When `true`, every triage match stays pending in the layered doc
     /// until the user accepts. When `false`, `auto-*` matches auto-accept
     /// at insert time. Live-applied.
     #[serde(default = "no")]
@@ -150,128 +148,48 @@ pub struct InboxAction {
     pub add_tag: Option<String>,
 }
 
-/// `[op-log]` section. Tunables for the `core::oplog` substrate (the text
-/// op log that owns every write). See `docs/op-log.md` §`[op-log]` config section.
+/// `[editing]` section. Tunables for the layered editing model
+/// (`core::editing::LayeredDoc` — the in-memory `accepted`/`working`/`pending`
+/// document with pending-edit staging and per-hunk review). See
+/// `docs/op-log.md` §`[editing]` config section. (Renamed from `[op-log]` in
+/// K4; keys unchanged.)
 ///
 /// status: op-log-config-section
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OpLogConfig {
-    /// GC age threshold (days) for accepted `op_history` index rows.
-    /// The `.ops` history content lives forever (it IS the document); only the
-    /// side-table author/timestamp data is bounded.
+pub struct EditingConfig {
+    /// Retention horizon (days) for pending-edit metadata. Currently advisory:
+    /// pending proposals are disposable and there is no metadata side-table to
+    /// sweep (local history is plain-file snapshots in `core::snapshot`); kept
+    /// as a stable config key with a sensible default.
     #[serde(default = "default_metadata_retention_days")]
     pub metadata_retention_days: u32,
-    /// Faster GC age threshold (days) for `status='rejected'` rows.
+    /// Retention horizon (days) for rejected pending proposals.
     #[serde(default = "default_rejected_retention_days")]
     pub rejected_retention_days: u32,
-    /// When a pending op's anchor no longer resolves, flip it to rejected
-    /// automatically.
+    /// When a pending edit's anchor no longer resolves (the document drifted),
+    /// flip it to rejected automatically rather than surfacing it for review.
     #[serde(default = "no")]
     pub auto_reject_on_drift: bool,
-    /// Default `status` for agent-authored ops (`true` = require review).
+    /// Default `status` for agent-authored edits (`true` = require review).
     /// Surface-specific overrides (`[mcp.tools]`, `[llm.background]`) win.
     #[serde(default = "yes")]
     pub review_required: bool,
-    /// Vestigial size multiple that once triggered compaction on vault open;
-    /// compaction is gone now that the `.ops` log is the durable representation,
-    /// but the tunable is retained so the config plumbing doesn't churn.
-    #[serde(default = "default_compact_threshold")]
-    pub compact_threshold: f32,
 }
 
-impl Default for OpLogConfig {
+impl Default for EditingConfig {
     fn default() -> Self {
         Self {
             metadata_retention_days: default_metadata_retention_days(),
             rejected_retention_days: default_rejected_retention_days(),
             auto_reject_on_drift: false,
             review_required: true,
-            compact_threshold: default_compact_threshold(),
         }
     }
 }
 
 const fn default_metadata_retention_days() -> u32 { 365 }
 const fn default_rejected_retention_days() -> u32 { 14 }
-const fn default_compact_threshold() -> f32 { 4.0 }
-
-/// `[sync]` section. Per-vault multi-device sync policy for the op log.
-/// See `docs/sync.md` §`[sync]` config section.
-///
-/// Carries **no secrets**: the per-vault content key and the per-device
-/// private key are user-scope and stored outside this config — never in
-/// the synced vault TOML — the same eligibility rule as `[llm].api_key`.
-/// See `sync-secrets-user-scope`.
-///
-/// status: sync-config-section
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SyncSection {
-    /// Master switch. Opt in per vault; default off so an un-enrolled
-    /// vault never advertises or connects.
-    #[serde(default = "no")]
-    pub enabled: bool,
-    /// Which transport carries cross-device sync (`sync-transport-seam`):
-    /// `libp2p` (default — encrypted file blobs over the authenticated P2P /
-    /// relay channel), `git` (hiker drives, or tolerates, a git repo per
-    /// `git.md`), or `none` (local-only; `.ops` history still accrues). The
-    /// single-bidirectional rule (`sync-single-bidirectional-transport`) makes
-    /// libp2p and git-as-sync mutually exclusive — only one bidirectional
-    /// cross-device transport runs at a time.
-    #[serde(default)]
-    pub transport: SyncTransport,
-    /// Topology this vault participates in (`peer` / `server` / `both`).
-    #[serde(default)]
-    pub mode: SyncMode,
-    /// Relay / hub multiaddr or URL when using the decoupled server.
-    /// Empty = no server configured (P2P / LAN only).
-    #[serde(default)]
-    pub server_url: String,
-    /// Allow the manual, time-boxed mDNS discovery window. Discovery only
-    /// supplies IP:port candidates; it never substitutes for enrollment.
-    #[serde(default = "yes")]
-    pub discovery: bool,
-    /// Enrolled device fingerprints (Syncthing-Device-ID style strings).
-    #[serde(default)]
-    pub devices: Vec<String>,
-    /// THIS device's self-set human name, carried on the sync handshake so
-    /// peers can show "synced from `laptop`" instead of a fingerprint. A device
-    /// only ever names itself. Empty = unnamed. See `sync-device-name`.
-    #[serde(default)]
-    pub device_name: String,
-    /// Learned `fingerprint -> name` map: the name each enrolled peer
-    /// self-reported in its handshake (last name a device reports for ITSELF
-    /// wins). Persisted so a peer's name survives a restart. See `sync-device-name`.
-    #[serde(default)]
-    pub device_names: std::collections::HashMap<String, String>,
-}
-
-impl Default for SyncSection {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            transport: SyncTransport::default(),
-            mode: SyncMode::default(),
-            server_url: String::new(),
-            discovery: true,
-            devices: Vec::new(),
-            device_name: String::new(),
-            device_names: std::collections::HashMap::new(),
-        }
-    }
-}
-
-/// Sync topology. `Peer` = direct P2P / LAN only (default); `Server` =
-/// route through a relay / hub; `Both` = participate in both.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SyncMode {
-    #[default]
-    Peer,
-    Server,
-    Both,
-}
 
 /// `[trails]` section. Configures trail-doc placement and other vault-wide
 /// trail policy. See `docs/trails.md`.
@@ -407,26 +325,6 @@ fn default_new_board_dir() -> String {
     "boards/".to_string()
 }
 
-/// `[acp]` section. Configures the optional Agent Client Protocol backend
-/// for the chat panel. When `command` is non-empty, the chat panel routes
-/// through an external ACP agent instead of the built-in basic agent loop.
-/// The `command` value is the full command line to launch the agent (e.g.
-/// `"auggie --acp"`, `"gemini --acp"`, `"cursor --acp"`). The first
-/// whitespace-delimited word is the binary; the rest are arguments.
-/// The agent binary must be installed and on PATH independently.
-/// See `docs/acp.md`.
-///
-/// status: llm-acp-client-optional
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AcpConfig {
-    /// Full command line to launch the ACP agent. Empty string means
-    /// ACP is disabled. Split on whitespace; first token = binary,
-    /// remainder = args.
-    #[serde(default)]
-    pub command: String,
-}
-
 /// `[tasks]` section. Configures the unified work queue (`core::tasks`).
 /// See `docs/task-queue.md`.
 ///
@@ -440,11 +338,6 @@ pub struct TasksConfig {
     pub terminal_retention_secs: u64,
     #[serde(default)]
     pub direct_worker: DirectWorkerConfig,
-    /// Whether the in-process basic chat agent gets the `task_*` MCP
-    /// tools advertised in its tool set. External rmcp clients are
-    /// unaffected — they always see `task_*` when `[mcp] enabled = true`.
-    #[serde(default = "yes")]
-    pub expose_to_chat_agent: bool,
     #[serde(default)]
     pub lease: LeaseConfig,
 }
@@ -455,7 +348,6 @@ impl Default for TasksConfig {
             worker_preference: WorkerPreferenceCfg::default(),
             terminal_retention_secs: default_terminal_retention_secs(),
             direct_worker: DirectWorkerConfig::default(),
-            expose_to_chat_agent: true,
             lease: LeaseConfig::default(),
         }
     }
@@ -535,8 +427,8 @@ const fn default_lease_max_secs() -> u64 {
     600
 }
 
-/// `[llm]` section. Configures generative LLM access for `core::llm` and
-/// the basic agent loop (`core::agent`). Mirrors the shape pinned in
+/// `[llm]` section. Configures generative LLM access for `core::llm`
+/// background / fan-out features. Mirrors the shape pinned in
 /// `docs/llm.md` §`core::llm` and the v3.5 stub in `docs/settings.md`.
 ///
 /// status: llm-providers-config
@@ -544,17 +436,14 @@ const fn default_lease_max_secs() -> u64 {
 #[serde(deny_unknown_fields)]
 pub struct LlmConfig {
     /// Master switch. When false, `core::llm` is treated as unavailable
-    /// (background / fan-out / chat panel all no-op). Reserved for
-    /// `llm-disable-mode`; left here so the loader doesn't reject the key
-    /// once that slug lands.
+    /// (background / fan-out all no-op). Reserved for `llm-disable-mode`;
+    /// left here so the loader doesn't reject the key once that slug lands.
     #[serde(default = "yes")]
     pub enabled: bool,
     #[serde(default)]
     pub provider: LlmProviderConfig,
     #[serde(default)]
     pub limits: LlmLimitsConfig,
-    #[serde(default)]
-    pub agent: LlmAgentConfig,
     #[serde(default)]
     pub audit: LlmAuditConfig,
     #[serde(default)]
@@ -567,7 +456,6 @@ impl Default for LlmConfig {
             enabled: true,
             provider: LlmProviderConfig::default(),
             limits: LlmLimitsConfig::default(),
-            agent: LlmAgentConfig::default(),
             audit: LlmAuditConfig::default(),
             background: LlmBackgroundConfig::default(),
         }
@@ -583,7 +471,7 @@ impl Default for LlmConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LlmBackgroundConfig {
-    /// When true, debounced background LLM features stage a pending op log
+    /// When true, debounced background LLM features stage a pending layered-doc
     /// op instead of mutating frontmatter directly. Default false (off).
     #[serde(default = "no")]
     pub review_required: bool,
@@ -654,29 +542,6 @@ impl Default for LlmLimitsConfig {
     }
 }
 
-/// `[llm.agent]` — basic agent loop tunables. Defaults match the
-/// circuit-breaker numbers pinned in `llm.md`.
-///
-/// status: agent-iteration-cap-prompt
-/// status: agent-tool-call-timeout
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LlmAgentConfig {
-    #[serde(default = "default_iteration_cap")]
-    pub iteration_cap: u32,
-    #[serde(default = "default_tool_timeout_secs")]
-    pub tool_timeout_secs: u64,
-}
-
-impl Default for LlmAgentConfig {
-    fn default() -> Self {
-        Self {
-            iteration_cap: default_iteration_cap(),
-            tool_timeout_secs: default_tool_timeout_secs(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LlmAuditConfig {
@@ -703,14 +568,6 @@ const fn default_llm_timeout_secs() -> u64 {
     60
 }
 
-const fn default_iteration_cap() -> u32 {
-    10
-}
-
-const fn default_tool_timeout_secs() -> u64 {
-    30
-}
-
 /// `[mcp]` section. Configures the in-process MCP server (see `docs/mcp.md`).
 /// Loader lands alongside the v3 milestone — until then the section is
 /// recognized so users can enable/disable the server and tune top_k caps.
@@ -719,7 +576,10 @@ const fn default_tool_timeout_secs() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpConfig {
-    #[serde(default = "yes")]
+    /// Default `false`: the MCP server binds a write-capable localhost listener
+    /// at every vault open, so it must be a deliberate opt-in. Flip to `true`
+    /// (user-scope) to let an external agent (e.g. Claude Code) reach the vault.
+    #[serde(default = "no")]
     pub enabled: bool,
     /// Bind host. Defaults to `127.0.0.1` (loopback-only, matching the
     /// localhost-trust auth model). Anything else exposes vault contents
@@ -746,7 +606,7 @@ pub struct McpConfig {
 impl Default for McpConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             host: default_mcp_host(),
             port: 0,
             discovery_file: default_mcp_discovery_file(),
@@ -761,9 +621,8 @@ impl Default for McpConfig {
 #[serde(deny_unknown_fields)]
 pub struct McpToolsConfig {
     /// Master gate for the write tools (`write_note`, `set_frontmatter`,
-    /// `apply_tag`, `remove_tag`). Kept for backwards compatibility with
-    /// existing TOMLs — when false, every write tool refuses with `1004
-    /// disabled` regardless of the per-tool flags below.
+    /// `apply_tag`, `remove_tag`) — when false, every write tool refuses
+    /// with `1004 disabled` regardless of the per-tool flags below.
     #[serde(default = "yes")]
     pub writes_enabled: bool,
     /// If true, agents passing `scope` can fetch redacted bodies.
@@ -772,7 +631,7 @@ pub struct McpToolsConfig {
     pub allow_redacted_lookup: bool,
     // status: agent-write-review-mode
     /// When true, MCP write tools (`write_note`, `edit_note`,
-    /// `set_frontmatter`, `apply_tag`, `remove_tag`) stage a pending op log
+    /// `set_frontmatter`, `apply_tag`, `remove_tag`) stage a pending layered-doc
     /// op so the user reviews each change before it lands on disk. Default
     /// true — the in-buffer patch-review surface expects edits as pending
     /// ops; turning this off bypasses the review UI and writes straight to
@@ -794,6 +653,10 @@ pub struct McpToolsConfig {
     /// Stateless syntax-check of a diagram source (mermaid / wavedrom /
     /// latex). Read-only — no vault access.
     #[serde(default = "yes")] pub check_diagram_enabled: bool,
+    /// status: query-mcp-tool
+    /// The generic `query` read tool: run a saved query-doc or an inline
+    /// filter over the note-metadata index (`docs/queries.md`).
+    #[serde(default = "yes")] pub query_enabled: bool,
     // Writes (also gated by `writes_enabled` master flag):
     #[serde(default = "yes")] pub write_note_enabled: bool,
     #[serde(default = "yes")] pub edit_note_enabled: bool,
@@ -814,8 +677,15 @@ pub struct McpToolsConfig {
     #[serde(default = "yes")] pub board_rename_column_enabled: bool,
     #[serde(default = "yes")] pub board_reorder_column_enabled: bool,
     #[serde(default = "yes")] pub board_delete_column_enabled: bool,
-    // Task-queue tools (also gated by `[tasks] expose_to_chat_agent`
-    // for the in-process chat agent path):
+    /// status: mcp-registry-tools
+    /// Family toggle for the registry-generated `create_<kind>` /
+    /// `update_<kind>` tools (one gate for the whole family, not per-kind
+    /// keys — this struct is a closed strict-load shape). Also gated by
+    /// `writes_enabled`.
+    #[serde(default = "yes")] pub kind_tools_enabled: bool,
+    // Task-queue tools. Advertised to external rmcp clients whenever the
+    // MCP server runs (`[mcp] enabled`); each gated by its per-tool flag
+    // below and the runtime `[llm] enabled` guard.
     #[serde(default = "yes")] pub task_checkout_enabled: bool,
     #[serde(default = "yes")] pub task_submit_enabled: bool,
     #[serde(default = "yes")] pub task_fail_enabled: bool,
@@ -856,6 +726,7 @@ impl McpToolsConfig {
             "get_open_notes" => self.get_open_notes_enabled,
             "get_selection" => self.get_selection_enabled,
             "check_diagram" => self.check_diagram_enabled,
+            "query" => self.query_enabled,
             "write_note" => self.write_note_enabled,
             "edit_note" => self.edit_note_enabled,
             "set_frontmatter" => self.set_frontmatter_enabled,
@@ -896,6 +767,7 @@ impl Default for McpToolsConfig {
             get_open_notes_enabled: true,
             get_selection_enabled: true,
             check_diagram_enabled: true,
+            query_enabled: true,
             write_note_enabled: true,
             edit_note_enabled: true,
             set_frontmatter_enabled: true,
@@ -913,6 +785,7 @@ impl Default for McpToolsConfig {
             board_rename_column_enabled: true,
             board_reorder_column_enabled: true,
             board_delete_column_enabled: true,
+            kind_tools_enabled: true,
             task_checkout_enabled: true,
             task_submit_enabled: true,
             task_fail_enabled: true,
@@ -1354,15 +1227,6 @@ pub struct VaultConfig {
     /// status: side-panel-resize
     #[serde(default = "default_discovery_width")]
     pub discovery_width: u32,
-    /// Retired: the multi-region egui-workbench sidebar (`HikerMode` +
-    /// `side_panel_persist`) is the real persistence path; this field no
-    /// longer drives runtime layout. Kept only as an ignored, deserialize-
-    /// tolerant sink so existing `.hiker/config.toml` files carrying a
-    /// `[vault] sidebar_mode = "..."` line still load under
-    /// `deny_unknown_fields`. Not exposed in settings and not in the
-    /// eligible-write set, so it is never written back.
-    #[serde(rename = "sidebar_mode", default, skip_serializing)]
-    pub sidebar_mode_legacy_ignored: Option<String>,
     /// Vault-relative path of the currently active trail-doc, or `None`
     /// if no trail is active. At most one active trail per vault. Persisted
     /// via `set_setting` so it survives restarts.
@@ -1388,7 +1252,6 @@ impl Default for VaultConfig {
             chat_height: default_chat_height(),
             sidebar_width: default_sidebar_width(),
             discovery_width: default_discovery_width(),
-            sidebar_mode_legacy_ignored: None,
             active_trail: None,
             chat_input_height: 0,
             tree: TreeConfig::default(),
@@ -1439,33 +1302,6 @@ impl TreeSortBy {
             TreeSortBy::MtimeAsc => "mtime_asc",
         }
     }
-}
-
-/// `[chat]` section. Loaded so the strict-load `Config` accepts a `[chat]`
-/// table. Owns the location of the visible chat-session note folder; the
-/// chat *runtime* lives in the app layer and reads this field to build
-/// session paths. See `docs/settings.md` §`[chat]`.
-///
-/// status: settings-section-chat
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ChatConfig {
-    /// Visible folder holding native + imported chat-session notes
-    /// (`chat-session-markdown-store`); imports land in its `imported/`
-    /// subfolder. Default `"chats/"`. Sessions are ordinary indexed notes,
-    /// not hidden under `.hiker/` (`subsystem-notes-visible`).
-    #[serde(default = "default_chats_dir")]
-    pub chats_dir: String,
-}
-
-impl Default for ChatConfig {
-    fn default() -> Self {
-        Self { chats_dir: default_chats_dir() }
-    }
-}
-
-fn default_chats_dir() -> String {
-    "chats/".to_string()
 }
 
 /// `[render]` section. Vault-wide policy for the editor's rendered-widget

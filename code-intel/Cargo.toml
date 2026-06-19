@@ -4,6 +4,8 @@ members = [
     "spec-engine",
     "hiker-code",
     "code-cli",
+    "zim-adapter",
+    "hiker-lsp",
 ]
 # `hiker-projects` used to live here but is now a top-level hiker crate (decoupled from code
 # intelligence — it only produces source descriptors). `code-cli` still uses it via a path dep

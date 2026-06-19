@@ -290,6 +290,7 @@ impl TrailsCtx<'_, '_> {
         let mut open_trail_doc = false;
         let mut do_new_trail = false;
         let mut do_delete = false;
+        let mut do_open_graph = false;
 
         ui.horizontal(|ui| {
             ui.add(crate::icons::ICONS.trail()).on_hover_text("Trails");
@@ -311,7 +312,17 @@ impl TrailsCtx<'_, '_> {
             }
 
             self.expand_all_toggle(ui, !trails.is_empty());
-            overflow_menu(ui, &mut do_new_trail, &mut do_delete);
+            // Persistent header "+" — the surface's primary creation verb
+            // (interaction.md [new-item-placement]), like the Files/boards/
+            // projects "+ New …" affordances. The ⋯ menu entry stays.
+            if ui
+                .add(egui::Button::image(crate::icons::ICONS.image(crate::icons::Icon::Plus)))
+                .on_hover_text("New trail")
+                .clicked()
+            {
+                do_new_trail = true;
+            }
+            overflow_menu(ui, &mut do_new_trail, &mut do_delete, &mut do_open_graph);
         });
 
         if open_picker {
@@ -328,6 +339,13 @@ impl TrailsCtx<'_, '_> {
         }
         if do_delete {
             self.delete_visible(visible_rel);
+        }
+        if do_open_graph {
+            // Focus the Graph tab on the trail-doc node, its waypoints'
+            // source notes one membership edge away.
+            // status: open-in-graph-containers
+            let rel = visible_rel.to_string();
+            self.ctx.defer(move |app| crate::panels::graph::open_focused(app, &rel, 1));
         }
         if open_trail_doc {
             let rel = visible_rel.to_string();
@@ -537,16 +555,29 @@ fn header_dropdown(
     });
 }
 
-/// Overflow menu — New / Delete. Rename happens by renaming the trail-doc
-/// in the file tree (the trail carries its identity in frontmatter), so it
-/// isn't a sidebar verb under the read-only invariant.
-fn overflow_menu(ui: &mut egui::Ui, do_new: &mut bool, do_delete: &mut bool) {
+/// Overflow menu — New / Open in graph / Delete. Rename happens by renaming
+/// the trail-doc in the file tree (the trail carries its identity in
+/// frontmatter), so it isn't a sidebar verb under the read-only invariant.
+/// "Open trail in graph" is the container variant of the note-item graph
+/// entry: it focuses the Graph tab on the trail-doc node, its waypoints'
+/// source notes at depth 1 (menu-only — graph-jumping isn't the sidebar's
+/// primary move, so no extra header button). status: open-in-graph-containers
+fn overflow_menu(
+    ui: &mut egui::Ui,
+    do_new: &mut bool,
+    do_delete: &mut bool,
+    do_open_graph: &mut bool,
+) {
     let overflow = ui
         .add(egui::Button::image(crate::icons::ICONS.image(crate::icons::Icon::Menu)))
         .on_hover_text("Trail actions");
     egui::Popup::menu(&overflow).show(|ui| {
         if ui.button("New trail").clicked() {
             *do_new = true;
+            ui.close();
+        }
+        if ui.button("Open trail in graph").clicked() {
+            *do_open_graph = true;
             ui.close();
         }
         if ui.button("Delete trail").clicked() {
@@ -648,6 +679,11 @@ impl ForestView<'_> {
             })
             .response;
         let resp = resp.interact(egui::Sense::click());
+        // Shared note hover-preview of the source note (interaction.md
+        // [hover-preview-universal]); an orphan card has nothing to preview.
+        if !orphan && resp.hovered() {
+            crate::widgets::preview::register_note_hover(ui, resp.rect, &wp.source_path);
+        }
         if !orphan && resp.clicked() {
             actions.open = Some(wp.source_path.clone());
         }

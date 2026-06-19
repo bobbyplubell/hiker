@@ -57,13 +57,13 @@ struct Fixture {
 fn default_rankdir() -> String {
     "TB".to_string()
 }
-fn default_ranksep() -> f32 {
+const fn default_ranksep() -> f32 {
     50.0
 }
-fn default_nodesep() -> f32 {
+const fn default_nodesep() -> f32 {
     50.0
 }
-fn default_edgesep() -> f32 {
+const fn default_edgesep() -> f32 {
     // dagre's own default `edgesep` is 20.
     20.0
 }
@@ -139,7 +139,7 @@ fn run_engine(fx: &Fixture) -> Layout {
         .iter()
         .map(|e| e.label.as_ref().map(|l| Vec2::new(l.w, l.h)))
         .collect();
-    let has_labels = edge_label_sizes.iter().any(|l| l.is_some());
+    let has_labels = edge_label_sizes.iter().any(std::option::Option::is_some);
 
     let engine = LayeredEngine {
         rankdir: rankdir_of(&fx.rankdir),
@@ -147,6 +147,8 @@ fn run_engine(fx: &Fixture) -> Layout {
         nodesep: fx.nodesep,
         edgesep: fx.edgesep,
         default_node_size: Vec2::new(50.0, 50.0),
+        // Conformance harness: must exercise the dagre-faithful path only.
+        transpose: false,
     };
 
     let input = GraphInput {

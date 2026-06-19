@@ -106,7 +106,7 @@ impl AppState {
         let watcher = state.vault_session.services.watcher.clone();
         let jobs = state.vault_session.services.indexer.job_sender();
         let vault = state.vault_session.vault.clone();
-        let oplog = state.vault_session.services.oplog.clone();
+        let layered = state.vault_session.services.layered.clone();
         let cfg = state
             .vault_session
             .config
@@ -119,7 +119,7 @@ impl AppState {
         };
         let result = handle.block_on(async {
             hiker_core::boards::ops::create_board(
-                &watcher, &jobs, &oplog, &vault, &cfg, "new-board",
+                &watcher, &jobs, &layered, &vault, &cfg, "new-board", None,
             )
             .await
         });
@@ -140,8 +140,8 @@ impl AppState {
     /// Create a new empty `.canvas` file and open it in the canvas view. Seeds
     /// `{"nodes":[],"edges":[]}` (via `Canvas::default().to_canonical_json()`)
     /// through the same indexer-driven `core::ops::file::create_at` path the `+`
-    /// new-note / new-board buttons use, so the file is written + op-log-adopted
-    /// on its first save exactly like a note. The cross-type new-item picker
+    /// new-note / new-board buttons use, so the file is written + adopted into
+    /// the layered doc on its first save exactly like a note. The cross-type new-item picker
     /// (`sidebar-new-item-button`) routes here. status: canvas-create
     pub fn new_canvas(&mut self) {
         let state = self;

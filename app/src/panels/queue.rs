@@ -189,7 +189,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for rel in &pending {
-                    ui.horizontal(|ui| {
+                    let row = ui.horizontal(|ui| {
                         if ui
                             .small_button("Open")
                             .on_hover_text("Open this file in a buffer tab")
@@ -204,6 +204,15 @@ pub fn show(ui: &mut egui::Ui, app: &mut AppState) {
                                 .small(),
                         );
                     });
+                    // A pending row names a note → the shared note-item base
+                    // menu (`interaction.md` [rightclick-menu-always]).
+                    let resp = row.response.interact(egui::Sense::click());
+                    let opts = crate::item_menu::BaseOpts { reveal: true };
+                    if let Some(action) =
+                        crate::item_menu::note_item_menu_response(&resp, rel, opts)
+                    {
+                        crate::item_menu::apply_item_action(app, action, rel);
+                    }
                 }
             });
     }
@@ -217,6 +226,50 @@ const fn state_rank(s: TaskState) -> u8 {
         TaskState::Failed => 2,
         TaskState::Completed => 3,
         TaskState::Cancelled => 4,
+    }
+}
+
+/// A verb on a task row's right-click menu (`interaction.md`
+/// [rightclick-menu-always]).
+#[derive(Clone, Copy, Debug)]
+enum TaskRowVerb {
+    /// A shared note-item base verb (note-mutation rows name a note).
+    Base(crate::item_menu::ItemAction),
+    /// Cancel the queued/leased task.
+    Cancel,
+}
+
+/// Build a task row's context menu: the shared note-item base when the task
+/// names a note (note mutations), then Cancel — greyed with the reason once
+/// the task is terminal, so the menu stays complete and teaches why.
+fn build_task_row_menu(
+    note_path: Option<&str>,
+    state: TaskState,
+) -> egui_workbench::menu::Menu<TaskRowVerb> {
+    use crate::item_menu::{note_item_base, BaseOpts};
+    use egui_workbench::menu::{Action, Enabled, Menu};
+    let mut cancel = Action::new("Cancel", TaskRowVerb::Cancel);
+    if !matches!(state, TaskState::Queued | TaskState::Leased) {
+        cancel = cancel.enabled(Enabled::No("task already finished".into()));
+    }
+    match note_path {
+        Some(path) => note_item_base(path, BaseOpts { reveal: true }, TaskRowVerb::Base)
+            .section()
+            .action_with(cancel),
+        None => Menu::new().action_with(cancel),
+    }
+}
+
+/// Request cancellation of a task on the shared queue (fire-and-forget on
+/// the frame's tokio runtime). Shared by the row's Cancel button and its
+/// context-menu Cancel verb.
+fn cancel_task(app: &AppState, id: &str) {
+    let queue = app.vault_session.services.tasks.clone();
+    let id = id.to_string();
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            queue.cancel(&id).await;
+        });
     }
 }
 
@@ -249,7 +302,7 @@ impl View<'_> {
     } else {
         color
     };
-    ui.horizontal(|ui| {
+    let row = ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new(label)
                 .small()
@@ -276,15 +329,28 @@ impl View<'_> {
         if matches!(r.state, TaskState::Queued | TaskState::Leased)
             && ui.small_button("Cancel").clicked()
         {
-            let queue = app.vault_session.services.tasks.clone();
-            let id = r.id.clone();
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    queue.cancel(&id).await;
-                });
-            }
+            cancel_task(app, &r.id);
         }
     });
+    // Right-click anywhere on the row → its context menu (`interaction.md`
+    // [rightclick-menu-always]): note base on note-mutation rows + Cancel.
+    let note_path = match &r.kind {
+        TaskKind::NoteMutation { source_path, .. } => Some(source_path.as_str()),
+        _ => None,
+    };
+    let mut chosen = None;
+    row.response.interact(egui::Sense::click()).context_menu(|ui| {
+        chosen = egui_workbench::menu::show(ui, build_task_row_menu(note_path, r.state));
+    });
+    match chosen {
+        Some(TaskRowVerb::Base(action)) => {
+            if let Some(path) = note_path {
+                crate::item_menu::apply_item_action(app, action, path);
+            }
+        }
+        Some(TaskRowVerb::Cancel) => cancel_task(app, &r.id),
+        None => {}
+    }
     }
 
     /// Worker-preference + direct-worker.enabled toggles. Spec calls these
@@ -380,4 +446,42 @@ pub fn show_detail(ui: &mut egui::Ui, _app: &mut AppState, task_id: &str) {
         )
         .color(theme::muted()),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use egui_workbench::menu::{Enabled, Entry};
+    use hiker_core::tasks::types::TaskState;
+
+    use super::{build_task_row_menu, TaskRowVerb};
+
+    fn cancel_enabled(menu: &egui_workbench::menu::Menu<TaskRowVerb>) -> bool {
+        let sections = menu.sections();
+        let Some(Entry::Action { label, enabled, .. }) =
+            sections.last().and_then(|s| s.last())
+        else {
+            panic!("expected a trailing Cancel action");
+        };
+        assert_eq!(label, "Cancel");
+        matches!(enabled, Enabled::Yes)
+    }
+
+    /// Menu composition: a note-mutation row carries the shared note-item
+    /// base + Cancel; a non-note row carries Cancel alone; Cancel greys out
+    /// (stays listed) once the task is terminal.
+    #[test]
+    fn task_row_menu_composes_base_and_gates_cancel_on_state() {
+        let note = build_task_row_menu(Some("notes/a.md"), TaskState::Queued);
+        let sections = note.sections();
+        assert_eq!(sections.len(), 2, "note base section + Cancel section");
+        assert_eq!(sections[0].len(), 5, "Open · Reveal · Open in graph · Copy path · Properties");
+        assert!(cancel_enabled(&note), "queued → cancellable");
+
+        let bare = build_task_row_menu(None, TaskState::Leased);
+        assert_eq!(bare.sections().len(), 1, "no note → Cancel only");
+        assert!(cancel_enabled(&bare), "leased → cancellable");
+
+        let done = build_task_row_menu(None, TaskState::Completed);
+        assert!(!cancel_enabled(&done), "terminal → greyed with reason");
+    }
 }

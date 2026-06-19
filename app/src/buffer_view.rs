@@ -8,7 +8,7 @@
 //! while each embedding site owns its own scroll / zoom / wrap / galley cache
 //! via an [`EmbeddedView`]. [`show_embedded_buffer`] renders the shared editor
 //! through the editor widget, drains its `transactions_out`, and runs the
-//! op-log editor binding for `path` — so edits reach the document's `working`
+//! layered-doc editor binding for `path` — so edits reach the document's `working`
 //! layer even when no buffer tab is open, making save / autosave / agent-review
 //! / dirty-tracking work regardless of which host did the editing.
 //!
@@ -77,7 +77,7 @@ impl EmbeddedView {
 pub struct EmbedOpts {
     /// When true, the view never captures edits — the editor widget no-ops
     /// doc-mutating input (`ViewState::read_only`) and the transactions sink /
-    /// op-log binding are skipped. Non-editing previews pass `true`.
+    /// layered-doc binding are skipped. Non-editing previews pass `true`.
     pub read_only: bool,
     /// When true, render with the live-preview markdown decoration providers
     /// (wikilink pills, callouts, math, rendered widgets, ...). When false, the
@@ -111,7 +111,7 @@ pub struct EmbedResponse {
 /// Render an editable view of `session.buffers[path]`'s shared `Editor` at the
 /// current `ui` rect, using `embed`'s own view + paint cache. Loads the buffer
 /// if not already present (`ensure_vault_buffer_loaded`), drains the editor's
-/// `transactions_out`, and runs the op-log editor binding (`editor_binding::run`)
+/// `transactions_out`, and runs the layered-doc editor binding (`editor_binding::run`)
 /// for `path` — so edits reach `working` even with no buffer tab open.
 ///
 /// Borrows are sequential: the widget holds `&mut buffer.editor` only inside the
@@ -278,21 +278,34 @@ fn render_widget(ui: &mut egui::Ui, ctx: RenderCtx<'_>) -> egui::Response {
         cache: decorations,
         folds: &EMPTY_FOLDS,
         loaded_text,
+        // No dirty-diff gutter in an embedded preview host. status: git-dirty-diff-gutter
+        git_head_text: None,
         theme,
         live_preview: markdown,
         render_widgets: markdown,
         is_markdown: markdown,
+        code_language: None, // embeds host vault notes, not code files
         dpr,
         font_px,
         chunk_boundaries: false,
         show_whitespace: false,
         highlight_trailing_whitespace: false,
         diff: None,
+        conflict: None,
         resolve_title: Some(resolve_title),
         diagram_cache,
         // Embedded buffer view: inline-CSV charts render; external `data:`
         // charts fall back to source (no note-bound resolver). status: widget-chart-render
         chart_resolver: None,
+        // No note-bound vault binding here, so `![alt](path)` image cells fall
+        // back to source. status: widget-table-render
+        image_resolver: None,
+        // Embedded buffer view renders tables Fit-only (no overflow toggle).
+        // status: widget-table-overflow-scroll
+        table_overflow: &EMPTY_TABLE_OVERFLOW,
+        // No in-place table cell edit in an embed — the table reveals normally.
+        // status: widget-table-cell-edit-inplace
+        editing_table: None,
     };
     let mut rebuild = |editor: &editor_core::state::Editor, view: &mut ViewState| {
         rebuild_editor_layers(editor, view, &mut deco_ctx);
@@ -311,3 +324,10 @@ fn render_widget(ui: &mut egui::Ui, ctx: RenderCtx<'_>) -> egui::Response {
 /// avoids allocating one per frame per embed.
 static EMPTY_FOLDS: std::sync::LazyLock<std::collections::HashSet<u64>> =
     std::sync::LazyLock::new(std::collections::HashSet::new);
+
+/// Embeds render tables Fit-only — the Scrollable overflow toggle is an
+/// editor-only affordance — so a shared empty per-table overflow map avoids a
+/// per-frame allocation. status: widget-table-overflow-scroll
+static EMPTY_TABLE_OVERFLOW: std::sync::LazyLock<
+    crate::panels::buffer::widgets::tables::TableViewMap,
+> = std::sync::LazyLock::new(crate::panels::buffer::widgets::tables::TableViewMap::new);

@@ -1,0 +1,12 @@
+[package]
+name = "hiker-lsp"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+spec-engine = { path = "../spec-engine" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# spec-engine is a regular dep; examples/tests use it directly too (re-exported types not enough).

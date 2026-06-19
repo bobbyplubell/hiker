@@ -1,8 +1,8 @@
 //! Canvas-pane rendering: the header (title + view toggle + create toolbar)
-//! and the spatial-editor body (the forward op-log binding).
+//! and the spatial-editor body (the forward layered-doc binding).
 //
 // status: canvas-view-toggle
-// status: canvas-oplog-binding
+// status: canvas-layered-binding
 
 use eframe::egui;
 
@@ -110,13 +110,13 @@ fn view_menu(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId) {
     });
 }
 
-/// The "Overview" section of the canvas View menu: the corner overview toggle
-/// plus its corner / size controls. The overview is a `hiker-graph-view` Poincaré
-/// disk of the canvas's cards (a SIMPLIFIED graph — coloured dots + edges), not a
-/// second camera over the board; clicking a dot moves the canvas to that card and
-/// clicking empty overview space swaps it full-pane. status: canvas-minimap
+/// The "Overview" section of the canvas View menu. The overview is a
+/// `hiker-graph-view` [`Minimap`](hiker_graph_view::graph_view::minimap::Minimap) — a
+/// Poincaré disk of the canvas's cards (coloured dots + edges), not a second
+/// camera over the board; clicking a dot moves the canvas to that card and
+/// clicking empty overview space swaps it full-pane. The placement / size /
+/// indicator controls are engine-owned (`Minimap::options_menu`). status: canvas-minimap
 fn minimap_menu(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId) {
-    use crate::panels::canvas::overview_layout::Corner;
     let Some(pane) = app.panels.canvases.get_mut(&tab_id) else {
         return;
     };
@@ -125,22 +125,7 @@ fn minimap_menu(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId) {
             .small()
             .color(hiker_theme::muted()),
     );
-    ui.checkbox(&mut pane.overview_enabled, "Show overview");
-    if !pane.overview_enabled {
-        return;
-    }
-    // Corner placement.
-    ui.horizontal(|ui| {
-        ui.selectable_value(&mut pane.overview_corner, Corner::TopLeft, "\u{2196}")
-            .on_hover_text("Top-left");
-        ui.selectable_value(&mut pane.overview_corner, Corner::TopRight, "\u{2197}")
-            .on_hover_text("Top-right");
-        ui.selectable_value(&mut pane.overview_corner, Corner::BottomLeft, "\u{2199}")
-            .on_hover_text("Bottom-left");
-        ui.selectable_value(&mut pane.overview_corner, Corner::BottomRight, "\u{2198}")
-            .on_hover_text("Bottom-right");
-    });
-    ui.add(egui::Slider::new(&mut pane.overview_size, 0.12..=0.5).text("Size"));
+    pane.overview.options_menu(ui);
 }
 
 /// The "Projection" section of the canvas View menu: an Off / Fisheye / Poincaré
@@ -403,7 +388,7 @@ fn icon_toggle(ui: &mut egui::Ui, icon: Icon, selected: bool, hover: &str) -> bo
 /// pane's picker is open, render it as a centered overlay window over notes +
 /// sources; on a pick, build a `File { file, subpath: None }` pointer node
 /// (default file-node size) and drop it at the viewport center via
-/// `insert_node_centered`, so it persists through the existing op-log binding
+/// `insert_node_centered`, so it persists through the existing layered-doc binding
 /// and renders via the content engine. status: canvas-insert-from-vault
 fn insert_from_vault(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId) {
     use crate::autocomplete::vault_source::{Scope, VaultSource};
@@ -427,6 +412,52 @@ fn insert_from_vault(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId) {
         let node = file_node(item.insert.as_str());
         pane.view_widget.insert_node_centered(node);
     }
+}
+
+/// Accept a file-tree row dropped onto the canvas: a `String` vault-relative
+/// path released over the `viewport`. The sidebar emits the dropped file's path
+/// as the `String` dnd payload (the same payload the board's lanes accept). We
+/// register a hover surface over the EXACT viewport rect — `dnd_drop_zone` would
+/// re-allocate at the layout cursor, which no longer aligns to the viewport after
+/// the widget paints, so we interact directly like the widget's own surface does
+/// — paint the drop affordance while a path hovers, and on release map the
+/// pointer to world coords and queue a File-node insert THERE via
+/// [`CanvasView::insert_node_at`] — the cursor-positioned analogue of the
+/// "Insert from vault" picker's centered insert. The node is built by the same
+/// [`file_node`] helper, so it serializes through the layered-doc binding identically;
+/// `insert_node_at` consumes it on the next frame, so we request a repaint to
+/// flush it promptly. status: canvas-file-drop
+fn handle_file_drop(ui: &mut egui::Ui, taken: &mut TakenDoc, viewport: egui::Rect) {
+    // A hover surface over the canvas, registered AFTER the widget's own surface
+    // so it wins the pointer and reads the release. A stable id keeps it distinct
+    // from the canvas surface's id.
+    let drop = ui.interact(viewport, ui.id().with("canvas-file-drop"), egui::Sense::hover());
+    // While a file path is dragged over the canvas, paint a subtle highlight
+    // outline as the drop affordance — the board surfaces a hover state too.
+    // status: canvas-file-drop
+    if drop.dnd_hover_payload::<String>().is_some() {
+        let v = ui.visuals().widgets.active;
+        ui.painter().rect_stroke(
+            viewport,
+            egui::CornerRadius::same(0),
+            v.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
+    }
+    let Some(src_rel) = drop.dnd_release_payload::<String>() else {
+        return;
+    };
+    // The release position (the pointer where the user let go). Fall back to the
+    // viewport center if egui has no interact pos this frame (shouldn't happen on
+    // a real drop). status: canvas-file-drop
+    let pos = ui
+        .input(|i| i.pointer.interact_pos())
+        .unwrap_or_else(|| viewport.center());
+    let world = taken.view_widget.camera().screen_to_world(viewport, pos);
+    let node = file_node(src_rel.as_str());
+    taken.view_widget.insert_node_at(node, world);
+    // The insert is consumed on the next `show`; repaint so it lands immediately.
+    ui.ctx().request_repaint();
 }
 
 /// Build a fresh `File` pointer node referencing `rel` (a vault-relative path),
@@ -529,9 +560,9 @@ fn link_node(url: &str) -> hiker_canvas::model::Node {
 }
 
 /// The spatial-editor body: parse-on-change, render the `CanvasView`, and
-/// persist any committed edits through the op-log user-save path. On a parse
+/// persist any committed edits through the layered-doc user-save path. On a parse
 /// error, show a clear error state with a JSON escape hatch instead of
-/// painting a stale / panicking canvas. status: canvas-oplog-binding
+/// painting a stale / panicking canvas. status: canvas-layered-binding
 pub fn canvas_body(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId, path: &str) {
     // Reverse binding: re-read the live buffer text (kept current by the editor
     // binding / fs-event reload) and re-parse when it changed.
@@ -626,6 +657,15 @@ pub fn canvas_body(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId, path: &
     let resp = taken
         .view_widget
         .show(ui, &mut taken.canvas, &mut content, &mut menus);
+
+    // A file-tree row dropped onto the canvas → add a File-node pointer at the
+    // cursor. The sidebar emits the dropped file's vault-relative path as the
+    // `String` dnd payload (the same payload the board's lanes accept); we read
+    // it off a drop zone over the canvas viewport, map the release position to
+    // world coords, and queue an insert there. The node is built by the same
+    // `file_node` helper the "Insert from vault" picker uses, so it persists
+    // through the layered-doc binding identically. status: canvas-file-drop
+    handle_file_drop(ui, &mut taken, viewport);
 
     // The Poincaré OVERVIEW (corner minimap + expand swap): a simplified graph of
     // the canvas. Rendered after the canvas paints so it sits on top; clicking a
@@ -732,127 +772,39 @@ pub fn canvas_body(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId, path: &
 /// empty-area click toggles the expand swap, and collapsing re-centers the canvas
 /// on the overview's current focus. status: canvas-minimap
 fn render_overview(ui: &mut egui::Ui, taken: &mut TakenDoc, viewport: egui::Rect) {
-    if !taken.overview_enabled && !taken.overview_expanded {
-        return;
-    }
     let model = super::overview::Model::build(&taken.canvas, &ui.visuals().clone());
     if model.node_count() == 0 {
         return;
     }
-    // The overview reads the canvas's ACTUAL layout: assign the card centers
-    // directly (never `recompute_layout`), so the disk projects the real positions.
-    taken.overview.positions = model.positions();
+    // The overview reads the canvas's ACTUAL layout: the card centers are handed
+    // straight to the minimap as positions (never force-laid-out), so the disk
+    // projects the real positions. The viewport world rect drives the engine's
+    // viewport-location indicator.
+    let positions = model.positions();
     let viewport_world = camera_viewport_world(taken, viewport);
-    let source = super::overview::CanvasGraphSource::new(&model, viewport_world, &ui.visuals().clone());
+    let source = super::overview::CanvasGraphSource::new(&model, ui.visuals());
 
-    let area = if taken.overview_expanded {
-        viewport
-    } else {
-        overview_corner_rect(taken.overview_corner, taken.overview_size, viewport)
-    };
-    if area.width() < 2.0 || area.height() < 2.0 {
-        return;
-    }
-    // The corner overview reads as a CIRCLE floating over the canvas — the
-    // graph-view pane fills transparent (so there's no opaque square) and the app
-    // paints a round inset bg, leaving the area's corners transparent. The
-    // full-pane (expanded) overview is opaque and covers the canvas directly.
-    // status: canvas-minimap
-    let expanded = taken.overview_expanded;
-    taken.overview.style.background = (!expanded).then_some(egui::Color32::TRANSPARENT);
-    // No disk-boundary ring on the corner minimap (it would frame the circle with
-    // a thin white outline); the expanded full-pane overview keeps its ring.
-    taken.overview.show_boundary = expanded;
-    if !taken.overview_expanded {
-        let r = 0.5 * area.size().min_elem();
-        ui.painter().with_clip_rect(area).circle_filled(
-            area.center(),
-            r,
-            ui.visuals().extreme_bg_color.gamma_multiply(0.9),
-        );
-    }
-    let clicked = render_overview_disk(ui, taken, &source, area);
+    let out = taken
+        .overview
+        .ui(ui, viewport, &source, &positions, Some(viewport_world));
 
-    // Click a dot → select that card AND bring it into view on the canvas. A dot
-    // click is handled by the graph view (returned here), so the empty-area swap
-    // is skipped that frame. status: canvas-minimap
-    if let Some(card_id) = clicked {
+    // A clicked dot → select that card AND bring it into view on the canvas. On a
+    // collapse the engine reports the focused card, which the canvas recenters on.
+    if let Some(card_id) = out.clicked.or(out.focused_on_collapse) {
         taken.view_widget.focus_node(viewport, &taken.canvas, &card_id);
-        return;
-    }
-
-    // Click empty overview space → toggle the expand swap. When collapsing,
-    // re-center the canvas on the overview's current focus.
-    handle_overview_swap(ui, taken, area, viewport);
-}
-
-/// Drive the graph-view over the corner/full `area` via a child `Ui`, returning a
-/// clicked card id. The graph view's locked Poincaré renders a centered disk of
-/// dots regardless of the area, so the overview stays self-framed.
-fn render_overview_disk(
-    ui: &mut egui::Ui,
-    taken: &mut TakenDoc,
-    source: &super::overview::CanvasGraphSource,
-    area: egui::Rect,
-) -> Option<String> {
-    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area).layout(*ui.layout()));
-    taken.overview.ui(&mut child, source, |_, _, _, _, _| {})
-}
-
-/// Toggle the expand swap when the user clicks the OVERVIEW area off any dot, and
-/// re-center the canvas on the focused card when collapsing. The graph-view's own
-/// `ui` already consumed dot clicks (returned above); this catches the remaining
-/// empty-area click. status: canvas-minimap
-fn handle_overview_swap(ui: &egui::Ui, taken: &mut TakenDoc, area: egui::Rect, viewport: egui::Rect) {
-    let resp = ui.interact(area, ui.id().with("canvas-overview-swap"), egui::Sense::click());
-    if resp.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    if !resp.clicked() {
-        return;
-    }
-    let collapsing = taken.overview_expanded;
-    taken.overview_expanded = !taken.overview_expanded;
-    if collapsing {
-        // Re-center the canvas on the card the overview is currently focused on
-        // (nearest the disk center under its accumulated navigation).
-        let cfg = taken.overview.projection;
-        let nav = taken.overview.nav;
-        let model = super::overview::Model::build(&taken.canvas, &ui.visuals().clone());
-        if let Some(id) = model.focused_card(cfg, nav).map(ToString::to_string) {
-            taken.view_widget.focus_node(viewport, &taken.canvas, &id);
-        }
-        // Then snap the corner minimap back to the global overview — drop the
-        // accumulated pan/zoom/fly-to from the expanded session so the inset
-        // reads as a whole-canvas map again, not a leftover zoomed-in region.
-        taken.overview.needs_fit = true;
     }
 }
 
-/// The canvas viewport as a WORLD-space rect, via the camera's screen↔world map —
-/// the region the overview highlights as "where you are". status: canvas-minimap
-fn camera_viewport_world(taken: &TakenDoc, viewport: egui::Rect) -> hiker_canvas::geometry::Rect {
+/// The canvas viewport as a WORLD-space rect (in the overview's `f32` position
+/// space), via the camera's screen↔world map — the region the minimap's indicator
+/// highlights as "where you are". status: canvas-minimap
+fn camera_viewport_world(taken: &TakenDoc, viewport: egui::Rect) -> egui::Rect {
     let cam = taken.view_widget.camera();
     let a = cam.screen_to_world(viewport, viewport.min);
     let b = cam.screen_to_world(viewport, viewport.max);
-    let (x0, x1) = (a.x.min(b.x), a.x.max(b.x));
-    let (y0, y1) = (a.y.min(b.y), a.y.max(b.y));
-    hiker_canvas::geometry::Rect::new(x0, y0, x1 - x0, y1 - y0)
-}
-
-/// The corner inset rect for the overview: a fraction of the shorter viewport
-/// dimension (clamped), inset ~8px from the chosen corner. status: canvas-minimap
-fn overview_corner_rect(corner: super::overview_layout::Corner, size: f32, viewport: egui::Rect) -> egui::Rect {
-    use super::overview_layout::Corner;
-    const MARGIN: f32 = 8.0;
-    let side = viewport.width().min(viewport.height()) * size.clamp(0.12, 0.5);
-    let (min_x, min_y) = match corner {
-        Corner::TopLeft => (viewport.left() + MARGIN, viewport.top() + MARGIN),
-        Corner::TopRight => (viewport.right() - MARGIN - side, viewport.top() + MARGIN),
-        Corner::BottomLeft => (viewport.left() + MARGIN, viewport.bottom() - MARGIN - side),
-        Corner::BottomRight => (viewport.right() - MARGIN - side, viewport.bottom() - MARGIN - side),
-    };
-    egui::Rect::from_min_size(egui::pos2(min_x, min_y), egui::Vec2::splat(side))
+    let (x0, x1) = (a.x.min(b.x) as f32, a.x.max(b.x) as f32);
+    let (y0, y1) = (a.y.min(b.y) as f32, a.y.max(b.y) as f32);
+    egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1))
 }
 
 /// Dispatch a double-click: a full-detail File / Text card enters inline-edit
@@ -954,7 +906,7 @@ fn resolve_edit_overlay(
 
 /// Draw the inline-edit overlay for `node` over `edit_rect` and apply its exits.
 /// An Escape inside the overlay clears edit mode; a Text-node change persists a
-/// `SetText` through the same op-log user-save path moves use.
+/// `SetText` through the same layered-doc user-save path moves use.
 /// status: canvas-inline-edit
 fn render_edit_overlay(
     ui: &mut egui::Ui,
@@ -994,7 +946,7 @@ fn render_edit_overlay(
 }
 
 /// Apply a Text-node `SetText` from the inline editor: mutate the pane's live
-/// canvas and persist it through the same op-log path `persist_canvas` uses, so a
+/// canvas and persist it through the same layered-doc path `persist_canvas` uses, so a
 /// text edit is versioned / mergeable like a move. status: canvas-inline-edit
 fn persist_text_edit(app: &mut AppState, tab_id: TabId, path: &str, op: &hiker_canvas::ops::EditOp) {
     let Some(mut canvas) = app
@@ -1083,15 +1035,10 @@ struct TakenDoc {
     view_widget: canvas_view::widget::CanvasView,
     last_parsed_text: String,
     fit_pending: bool,
-    /// The Poincaré overview graph-view state, carried out alongside the widget so
-    /// the panel can render the corner overview / expand-swap and sync the camera
-    /// in the same borrow window. status: canvas-minimap
-    overview: hiker_graph_view::graph_view::State,
-    /// Overview placement + swap config, carried by value for the frame.
-    overview_enabled: bool,
-    overview_corner: super::overview_layout::Corner,
-    overview_size: f32,
-    overview_expanded: bool,
+    /// The Poincaré overview minimap, carried out alongside the widget so the
+    /// panel can render the corner overview / expand-swap and sync the camera in
+    /// the same borrow window. status: canvas-minimap
+    overview: hiker_graph_view::graph_view::minimap::Minimap,
 }
 
 /// Move the parsed document + widget out of the pane for the frame.
@@ -1103,11 +1050,10 @@ fn take_pane_doc(app: &mut AppState, tab_id: TabId) -> Option<TakenDoc> {
         view_widget: std::mem::take(&mut pane.view_widget),
         last_parsed_text: std::mem::take(&mut pane.last_parsed_text),
         fit_pending: std::mem::replace(&mut pane.fit_pending, false),
-        overview: std::mem::replace(&mut pane.overview, super::new_overview_state()),
-        overview_enabled: pane.overview_enabled,
-        overview_corner: pane.overview_corner,
-        overview_size: pane.overview_size,
-        overview_expanded: pane.overview_expanded,
+        overview: std::mem::replace(
+            &mut pane.overview,
+            hiker_graph_view::graph_view::minimap::Minimap::new(),
+        ),
     })
 }
 
@@ -1119,11 +1065,10 @@ fn put_pane_doc(app: &mut AppState, tab_id: TabId, taken: TakenDoc) {
     pane.last_parsed_text = taken.last_parsed_text;
     pane.fit_pending = taken.fit_pending;
     pane.overview = taken.overview;
-    pane.overview_expanded = taken.overview_expanded;
 }
 
 /// Forward binding: re-serialize the live canvas to canonical JSON and mirror
-/// it into the op-log `working` layer — the SAME dirty/save model the text
+/// it into the layered-doc `working` layer — the SAME dirty/save model the text
 /// editor uses (`editor_binding::run`). A canvas edit becomes an uncommitted
 /// `working` edit (buffer DIRTY), not a write straight to `accepted`/disk; the
 /// fold to `accepted` + the `.canvas` rewrite + the peer poke all happen on
@@ -1131,13 +1076,13 @@ fn put_pane_doc(app: &mut AppState, tab_id: TabId, taken: TakenDoc) {
 /// when the serialization is unchanged. Also keeps the shared buffer's editable
 /// text in lockstep so a flip to the JSON view shows the just-edited canvas, and
 /// updates `last_parsed_text` so the reverse binding doesn't re-parse our own
-/// write. status: canvas-oplog-binding
+/// write. status: canvas-layered-binding
 fn persist_canvas(app: &mut AppState, path: &str, canvas: &Canvas, last_parsed_text: &mut String) {
     let json = canvas.to_canonical_json();
     if json == *last_parsed_text {
         return;
     }
-    let log = &app.vault_session.services.oplog;
+    let log = &app.vault_session.services.layered;
     let doc_id = match log.doc_id_for_path(path) {
         Ok(Some(id)) => id,
         Ok(None) => {
@@ -1177,19 +1122,19 @@ fn persist_canvas(app: &mut AppState, path: &str, canvas: &Canvas, last_parsed_t
 /// `working` span with `json` in one `apply_working_edit` (`working` is seeded
 /// from `accepted` on the first edit, so its length is the current materialized
 /// length). The canvas pure-binding step, factored out of [`persist_canvas`] so
-/// it runs against a plain `&OpLog` — testable end-to-end against a real op-log
+/// it runs against a plain `&LayeredDoc` — testable end-to-end against a real `LayeredDoc`
 /// without an egui pane (`persist_canvas` itself is wired to `AppState` + the
-/// canvas widget). status: canvas-oplog-binding
+/// canvas widget). status: canvas-layered-binding
 fn mirror_json_to_working(
-    log: &hiker_core::oplog::OpLog,
+    log: &hiker_core::editing::LayeredDoc,
     doc_id: &str,
     json: &str,
-) -> Result<(), hiker_core::oplog::error::Error> {
+) -> Result<(), hiker_core::editing::error::Error> {
     // One atomic whole-span replace (`replace_working`) — NOT a length read
     // followed by a separate `apply_working_edit`. With live dirty-buffer sync
     // on, the autosave tick's `commit_working` clears `working` on its own
     // cadence; reading the length and replacing across two locks could race it
-    // and tear the buffer. status: canvas-oplog-binding
+    // and tear the buffer. status: canvas-layered-binding
     log.replace_working(doc_id, json)
 }
 
@@ -1197,9 +1142,9 @@ fn mirror_json_to_working(
 /// doesn't double-fire with any global save) and routes by edit state:
 /// - editing a **File** node → save that note's shared buffer (`save_buffer`,
 ///   which folds `working` into `accepted` and rewrites the `.md`);
-/// - otherwise → save the **canvas document** itself by committing its op-log
+/// - otherwise → save the **canvas document** itself by committing its layered-doc
 ///   `working` layer to disk (the canvas buffer is kept clean — edits route
-///   through the op-log, not the editor — so `save_buffer` would no-op; commit
+///   through the layered doc, not the editor — so `save_buffer` would no-op; commit
 ///   the canvas doc directly instead).
 ///
 /// The global `editor.save` action no-ops on a Canvas tab anyway
@@ -1257,7 +1202,7 @@ fn editing_file_path(app: &AppState, tab_id: TabId) -> Option<String> {
     }
 }
 
-/// Commit the canvas document's op-log `working` layer to disk — the canvas
+/// Commit the canvas document's layered-doc `working` layer to disk — the canvas
 /// Ctrl+S, mirroring `editor_pane::save_buffer`'s commit path. The forward
 /// binding (`persist_canvas`) mirrors every spatial edit into `working`, so by
 /// the time the user saves, `commit_working` has real content to fold into
@@ -1267,7 +1212,7 @@ fn editing_file_path(app: &AppState, tab_id: TabId) -> Option<String> {
 /// enrolled peers so the edit syncs — exactly like a note save.
 /// status: canvas-inline-edit
 fn save_canvas_document(app: &mut AppState, path: &str) {
-    let log = &app.vault_session.services.oplog;
+    let log = &app.vault_session.services.layered;
     let doc_id = match log.doc_id_for_path(path) {
         Ok(Some(id)) => id,
         Ok(None) => {
@@ -1299,11 +1244,11 @@ fn save_canvas_document(app: &mut AppState, path: &str) {
     };
     match log.commit_working(&doc_id) {
         Ok(true) => {
-            // A real commit advanced `accepted`. Clear dirty, poke enrolled peers
-            // to pull promptly (poke-on-commit), and confirm. status: sync-poke-on-commit
+            // A real commit advanced `accepted`. Clear dirty, nudge the git
+            // transport to commit-on-save, and confirm. status: git-commit-on-save
             advance_baseline(app);
-            if let Some(sync) = &app.vault_session.services.sync {
-                sync.notify_local_change();
+            if let Some(git) = &app.vault_session.services.git_sync {
+                git.notify_local_change();
             }
             tracing::info!(target: "hiker::canvas_save", path, "canvas committed + poked");
             app.push_toast(format!("Saved {path}"), ToastLevel::Info);
@@ -1316,7 +1261,7 @@ fn save_canvas_document(app: &mut AppState, path: &str) {
             // was the "saved but didn't sync" symptom).
             //
             // …UNLESS the `.canvas` has since vanished from disk (deleted/moved
-            // out-of-band after an autosave): the op-log content is unchanged so
+            // out-of-band after an autosave): the layered-doc content is unchanged so
             // there is nothing to commit, but the user pressing Ctrl+S plainly
             // expects the file back. Re-materialize `accepted` to disk and report
             // it as a real save. Capture the result before `advance_baseline`
@@ -1353,8 +1298,8 @@ fn render_parse_error(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId, err:
 
 #[cfg(test)]
 mod canvas_working_binding {
-    //! The canvas forward binding routed through the op-log `working` layer
-    //! (`canvas-oplog-binding`), driven against a *real* `OpLog` + `Vault` +
+    //! The canvas forward binding routed through the layered-doc `working` layer
+    //! (`canvas-layered-binding`), driven against a *real* `LayeredDoc` + `Vault` +
     //! `Buffer` — no egui pane. `persist_canvas` itself is wired to `AppState`
     //! and the canvas widget, so the model→json→`working` step is exercised via
     //! the extracted [`super::mirror_json_to_working`] helper plus the real
@@ -1366,19 +1311,19 @@ mod canvas_working_binding {
     use std::sync::Arc;
 
     use hiker_canvas::model::Canvas;
-    use hiker_core::oplog::OpLog;
+    use hiker_core::editing::LayeredDoc;
     use hiker_core::vault::Vault;
     use tempfile::TempDir;
 
     use super::mirror_json_to_working;
     use crate::buffer::Buffer;
 
-    /// A real op-log-backed vault holding `board.canvas`, seeded from `initial`
+    /// A real layered-doc-backed vault holding `board.canvas`, seeded from `initial`
     /// on disk exactly as `bootstrap` does at vault open, plus the editable
     /// `Buffer` the app opens over it.
     struct Fixture {
         td: TempDir,
-        log: Arc<OpLog>,
+        log: Arc<LayeredDoc>,
         buffer: Buffer,
         doc_id: String,
     }
@@ -1389,8 +1334,8 @@ mod canvas_working_binding {
         let td = TempDir::new().unwrap();
         std::fs::write(td.path().join(PATH), initial).unwrap();
         let vault = Vault::open(td.path()).unwrap();
-        let log = Arc::new(OpLog::open(td.path()).unwrap());
-        // The op-log bootstrap walk skips `.canvas` (it's not markdown-chunked,
+        let log = Arc::new(LayeredDoc::open(td.path()).unwrap());
+        // The layered-doc bootstrap walk skips `.canvas` (it's not markdown-chunked,
         // so `is_indexable_path` excludes it); the app seeds the canvas doc
         // lazily on open via `ensure_doc` (in `ensure_vault_buffer_loaded`). Do
         // the same so the doc exists with `meta.kind = "canvas"` before edits.

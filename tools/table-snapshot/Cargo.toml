@@ -17,7 +17,10 @@ default = []
 # `hiker-app`'s `egui-winit` under a `--workspace` build. Gating it keeps this
 # tool out of the default workspace build. Build with `--features screenshot` to
 # emit the PNG (compiles only the editor crates, never hiker-app).
-screenshot = ["dep:egui", "dep:egui_kittest", "dep:editor-view", "dep:editor-egui", "dep:image"]
+screenshot = [
+    "dep:egui", "dep:egui_kittest", "dep:editor-view", "dep:editor-egui", "dep:image",
+    "dep:hiker-math", "dep:hiker-mermaid", "dep:hiker-wavedrom", "dep:resvg",
+]
 
 [dependencies]
 editor-core = { path = "../../editor/editor-core" }
@@ -29,3 +32,12 @@ egui_kittest = { version = "0.32", default-features = false, features = ["wgpu"]
 editor-view = { path = "../../editor/editor-view", optional = true }
 editor-egui = { path = "../../editor/editor-egui", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+# Phase B: a math / mermaid / wavedrom cell renders through the SAME
+# hiker-render + resvg pipeline the app's `render.rs` uses, so the composite
+# carries a real rasterized diagram; an image cell decodes a PNG via the `image`
+# crate. None of these pull accesskit, so the screenshot feature stays
+# hiker-app-free.
+hiker-math = { path = "../../hiker-render/math", optional = true }
+hiker-mermaid = { path = "../../hiker-render/mermaid", optional = true }
+hiker-wavedrom = { path = "../../hiker-render/wavedrom", optional = true }
+resvg = { version = "0.47.0", optional = true }

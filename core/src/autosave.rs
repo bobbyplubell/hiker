@@ -64,11 +64,23 @@ pub struct TabState {
     pub open_tab_kinds: HashMap<String, String>,
     /// Per-canvas view state (camera pan/zoom + per-card scroll/zoom),
     /// keyed by the canvas's vault-relative path. View state only — it
-    /// rides this tab-state store rather than the op-log / `.canvas` file
-    /// (the camera is view state and never enters the op-log). Restored on
+    /// rides this tab-state store rather than the layered doc / `.canvas` file
+    /// (the camera is view state and never enters the layered doc). Restored on
     /// reopen and across restart. status: canvas-view-state-persist
     #[serde(default)]
     pub canvas_views: HashMap<String, CanvasViewState>,
+    /// Per-graph-view persisted state (the vault link-graph engine's view:
+    /// node positions, projection, focus mode, toggles, LOD, pan/zoom),
+    /// keyed by the graph tab's persist key (`:graph` for the singleton vault
+    /// graph). View-only — rides this tab-state store like `canvas_views`.
+    /// status: graph-view-state-persist
+    #[serde(default)]
+    pub graph_views: HashMap<String, GraphViewState>,
+    /// Per-code-graph-view persisted state (level / edge filters / focus +
+    /// the underlying graph engine's view), keyed by the code source's
+    /// `CodeSource::key()`. status: graph-view-state-persist
+    #[serde(default)]
+    pub code_graph_views: HashMap<String, CodeGraphViewState>,
 }
 
 /// One card's view state on a canvas: the per-card content zoom (font
@@ -85,7 +97,7 @@ pub struct CardViewState {
 
 /// A canvas's persisted view state: the camera pan (canvas-space point pinned
 /// to the viewport top-left) + zoom scale, plus each touched card's view state
-/// keyed by node id. Rides the tab-state store, NOT the op-log / `.canvas` file
+/// keyed by node id. Rides the tab-state store, NOT the layered doc / `.canvas` file
 /// — consistent with the camera being view state. status: canvas-view-state-persist
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct CanvasViewState {
@@ -97,6 +109,119 @@ pub struct CanvasViewState {
     pub scale: f32,
     #[serde(default)]
     pub cards: HashMap<String, CardViewState>,
+}
+
+/// A graph-view engine's persisted view state. Plain primitives only so the
+/// app can convert to/from the `hiker_graph_view` engine `State` without that
+/// crate (or `hiker_projection`) needing serde — the conversion happens at the
+/// app boundary, mirroring how `CanvasViewState` decouples from `canvas_view`.
+///
+/// Excludes every non-serializable / recomputed engine field (the layout
+/// worker, edge routes, hover-preview cache, fly-to animation, the `Mobius`
+/// nav, GPU handles): only the plain view bits below are snapshotted.
+/// status: graph-view-state-persist
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct GraphViewState {
+    /// Force-layout node positions keyed by `Source::node_key` (the stable
+    /// per-node identity, e.g. a note's rel-path). Seeded back on restore so
+    /// the layout morphs to the saved shape. `(x, y)` world coords.
+    #[serde(default)]
+    pub positions: HashMap<String, (f32, f32)>,
+    /// Affine pan/zoom view (`View::pan` + `View::zoom`).
+    #[serde(default)]
+    pub pan_x: f32,
+    #[serde(default)]
+    pub pan_y: f32,
+    #[serde(default)]
+    pub zoom: f32,
+    /// Projection: kind discriminant (`"affine"` / `"fisheye"` / `"poincare"`),
+    /// strength, size falloff. `ProjectionConfig`/`ProjectionKind` aren't serde,
+    /// so store primitives and convert at the boundary.
+    #[serde(default)]
+    pub projection_kind: String,
+    #[serde(default)]
+    pub projection_strength: f32,
+    #[serde(default)]
+    pub projection_size_falloff: f32,
+    /// Lens focus mode discriminant (`"center"` / `"cursor"` / `"selection"`).
+    #[serde(default)]
+    pub focus_mode: String,
+    /// Common toggles.
+    #[serde(default)]
+    pub show_labels: bool,
+    #[serde(default)]
+    pub show_edges: bool,
+    #[serde(default)]
+    pub show_preview: bool,
+    /// LOD magnification thresholds.
+    #[serde(default)]
+    pub lod_full_mag: f32,
+    #[serde(default)]
+    pub lod_marker_mag: f32,
+    /// Vault-graph display filters, stored as the HIDDEN entries so a kind
+    /// first appearing after a rebuild defaults to visible (mirrors
+    /// `CodeGraphViewState::hidden_kinds`). Empty/unused when this struct
+    /// rides inside `CodeGraphViewState` as the engine half.
+    /// status: vault-graph-edge-toggles
+    #[serde(default)]
+    pub hidden_edge_kinds: Vec<String>,
+    /// status: vault-graph-kind-filters
+    #[serde(default)]
+    pub hidden_node_kinds: Vec<String>,
+    /// The vault graph's coarse detail dial, as a string discriminant
+    /// (`"containers"` / `"everything"`; empty = everything).
+    /// status: vault-graph-lod-containers
+    #[serde(default)]
+    pub detail: String,
+    /// The vault graph's focus-navigation state: display scope as a string
+    /// discriminant (`"overview"` / `"hops:1..3"`; empty = overview) plus
+    /// the focus anchor's note rel-path — the vault twins of
+    /// `CodeGraphViewState::scope`/`selected`. Empty/`None` when this struct
+    /// rides inside `CodeGraphViewState` as the engine half.
+    /// status: graph-nav-extract
+    #[serde(default)]
+    pub scope: String,
+    #[serde(default)]
+    pub focus: Option<String>,
+    /// The vault graph's query scope: the scoping query-doc's rel-path, or
+    /// `None` for the full vault. Only the doc path persists — the member
+    /// set re-executes per rebuild, never from a snapshot.
+    /// status: graph-scoped-query
+    #[serde(default)]
+    pub scope_query: Option<String>,
+    /// Whether the vault graph's spec drift badges are on (the rollup data
+    /// itself always reloads from the link-store baseline).
+    /// status: vault-graph-spec-drift-badge
+    #[serde(default)]
+    pub drift_badges: bool,
+}
+
+/// A code-graph view's persisted state: its display controls (scope / selection /
+/// kind filter / edge filters / orphans / size-by-loc) plus the underlying graph
+/// engine's [`GraphViewState`] (positions + view). `scope` is stored as a String
+/// discriminant (`"overview"` / `"hops:1..3"`) because the `Scope` enum lives in
+/// the app crate, not here. The kind filter persists as the HIDDEN kinds, so a
+/// kind that first appears after a reindex defaults to visible.
+/// status: graph-view-state-persist
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CodeGraphViewState {
+    #[serde(default)]
+    pub scope: String,
+    #[serde(default)]
+    pub selected: Option<String>,
+    #[serde(default)]
+    pub hidden_kinds: Vec<String>,
+    #[serde(default)]
+    pub show_calls: bool,
+    #[serde(default)]
+    pub show_impls: bool,
+    #[serde(default)]
+    pub show_orphans: bool,
+    #[serde(default)]
+    pub size_by_loc: bool,
+    /// The code graph's own engine view (positions + pan/zoom + projection …).
+    #[serde(default)]
+    pub engine: GraphViewState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -257,8 +382,11 @@ impl Autosave {
         let mut idx = self.read_index()?;
         if let Some(entry) = idx.entries.remove(path) {
             let file_path = self.dir.join(autosave_filename(&entry.autosave_id, path));
-            if file_path.exists() {
-                let _ = fs::remove_file(&file_path);
+            if file_path.exists()
+                && let Err(e) = fs::remove_file(&file_path)
+            {
+                tracing::warn!(error = %e, %path,
+                    "autosave sidecar not removed on clear; orphaned file lingers");
             }
             self.write_index_atomic(&idx)?;
         }
@@ -302,8 +430,11 @@ impl Autosave {
             if on_disk_matches {
                 // Stale; drop the sidecar + index entry.
                 drop_paths.push(path.clone());
-                if file_path.exists() {
-                    let _ = fs::remove_file(&file_path);
+                if file_path.exists()
+                    && let Err(e) = fs::remove_file(&file_path)
+                {
+                    tracing::warn!(error = %e, %path,
+                        "stale autosave sidecar not removed; orphaned file lingers");
                 }
                 continue;
             }
@@ -358,8 +489,11 @@ impl Autosave {
         for entry in fs::read_dir(&self.dir)? {
             let entry = entry?;
             let p = entry.path();
-            if p.is_file() {
-                let _ = fs::remove_file(&p);
+            if p.is_file()
+                && let Err(e) = fs::remove_file(&p)
+            {
+                tracing::warn!(error = %e, path = %p.display(),
+                    "autosave reset left a file behind");
             }
         }
         Ok(())
@@ -509,6 +643,8 @@ mod tests {
             open_tab_kinds: HashMap::new(),
             saved_at_ms: 0,
             canvas_views,
+            graph_views: HashMap::new(),
+            code_graph_views: HashMap::new(),
         };
         a.save_tab_state(s.clone()).unwrap();
         let loaded = a.load_tab_state().unwrap().unwrap();
@@ -521,6 +657,81 @@ mod tests {
         assert!((cv.pan_x - (-120.5)).abs() < 1e-9);
         assert_eq!(cv.cards["n1"].scroll_y, 42.0);
         assert!(loaded.saved_at_ms > 0);
+    }
+
+    #[test]
+    fn tab_state_round_trips_graph_and_code_graph_views() {
+        let dir = tempdir().unwrap();
+        let a = Autosave::open(dir.path()).unwrap();
+        let mut positions = HashMap::new();
+        positions.insert("notes/a.md".to_string(), (12.0_f32, -34.0_f32));
+        positions.insert("notes/b.md".to_string(), (5.5_f32, 6.5_f32));
+        let gv = GraphViewState {
+            positions: positions.clone(),
+            pan_x: -1.0,
+            pan_y: 2.0,
+            zoom: 0.75,
+            projection_kind: "poincare".into(),
+            projection_strength: 1.5,
+            projection_size_falloff: 0.3,
+            focus_mode: "cursor".into(),
+            show_labels: true,
+            show_edges: false,
+            show_preview: true,
+            lod_full_mag: 0.5,
+            lod_marker_mag: 0.15,
+            // Vault display filters (hidden kinds + detail dial) and the
+            // focus-nav location ride the same record.
+            // status: vault-graph-edge-toggles, graph-nav-extract
+            hidden_edge_kinds: vec!["board".into()],
+            hidden_node_kinds: vec!["query".into()],
+            detail: "containers".into(),
+            scope: "hops:2".into(),
+            focus: Some("boards/b.md".into()),
+            // The query scope's doc path + the drift toggle ride it too.
+            // status: graph-scoped-query, vault-graph-spec-drift-badge
+            scope_query: Some("queries/rust.md".into()),
+            drift_badges: true,
+        };
+        let mut graph_views = HashMap::new();
+        graph_views.insert(":graph".to_string(), gv.clone());
+
+        let cgv = CodeGraphViewState {
+            scope: "hops:3".into(),
+            selected: Some("scip:foo#bar".into()),
+            hidden_kinds: vec!["code:field".into()],
+            show_calls: true,
+            show_impls: false,
+            show_orphans: true,
+            size_by_loc: true,
+            engine: gv.clone(),
+        };
+        let mut code_graph_views = HashMap::new();
+        code_graph_views.insert("project:proj.md".to_string(), cgv.clone());
+
+        let s = TabState {
+            open_paths: vec!["a.md".into()],
+            graph_views,
+            code_graph_views,
+            ..Default::default()
+        };
+        a.save_tab_state(s.clone()).unwrap();
+        let loaded = a.load_tab_state().unwrap().unwrap();
+        assert_eq!(loaded.graph_views, s.graph_views);
+        assert_eq!(loaded.code_graph_views, s.code_graph_views);
+        let lgv = &loaded.graph_views[":graph"];
+        assert_eq!(lgv.positions["notes/a.md"], (12.0, -34.0));
+        assert_eq!(lgv.projection_kind, "poincare");
+        assert_eq!(lgv.hidden_edge_kinds, vec!["board".to_string()]);
+        assert_eq!(lgv.hidden_node_kinds, vec!["query".to_string()]);
+        assert_eq!(lgv.detail, "containers");
+        assert_eq!(lgv.scope_query.as_deref(), Some("queries/rust.md"));
+        assert!(lgv.drift_badges);
+        let lcgv = &loaded.code_graph_views["project:proj.md"];
+        assert_eq!(lcgv.scope, "hops:3");
+        assert_eq!(lcgv.selected.as_deref(), Some("scip:foo#bar"));
+        assert_eq!(lcgv.hidden_kinds, vec!["code:field".to_string()]);
+        assert_eq!(lcgv.engine.positions, positions);
     }
 
     #[test]

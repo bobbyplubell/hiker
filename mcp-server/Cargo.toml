@@ -25,6 +25,9 @@ tokio-util.workspace = true
 tracing.workspace = true
 time.workspace = true
 rmcp.workspace = true
+# `FutureExt::boxed` for the dynamically-registered kind-tool routes
+# (`ToolRoute::new_dyn` wants a boxed future). status: mcp-registry-tools
+futures.workspace = true
 schemars.workspace = true
 axum.workspace = true
 async-trait.workspace = true

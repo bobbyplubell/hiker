@@ -92,7 +92,7 @@ pub(crate) fn export_tree_to_canvas(
     let result = hiker_core::canvas::export::write_tree_canvas(
         &app.vault_session.services.trees,
         &app.vault_session.vault,
-        &app.vault_session.services.oplog,
+        &app.vault_session.services.layered,
         tree_id,
         style,
     );

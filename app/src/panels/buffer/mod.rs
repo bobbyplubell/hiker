@@ -5,11 +5,17 @@
 
 pub mod breadcrumb;
 pub mod clipboard_menu;
+// Pure conflict-marker parse + per-region resolution for the in-editor VS
+// Code–style git-conflict resolver. status: git-conflict-inline-markers
+pub mod gitmerge;
+pub mod conflict_overlay;
 pub mod decorations;
 // Interactive mermaid diagram links: click dispatch + hover tooltips.
 // status: widget-mermaid-links
 pub mod diagram_nav;
 pub mod diff_overlay;
+// status: git-dirty-diff-gutter
+pub mod dirty_diff;
 pub mod find;
 pub(crate) mod editor_binding;
 mod format;
@@ -23,6 +29,11 @@ pub mod patch_review;
 pub mod patch_review_pill;
 pub mod scrollbar;
 pub mod show_changes;
+// In-place editing of a single rendered-table cell (a diagram/text cell edited
+// in a popover without the whole table collapsing to pipe source).
+// status: widget-table-cell-edit-inplace
+pub mod table_cell_edit;
+pub mod table_overflow_menu;
 mod toolbar;
 pub mod toolbar_menus;
 pub mod wikilink_nav;
@@ -161,6 +172,13 @@ impl<'a> BufCtx<'a> {
         // the dirty-buffer diff toggle / history viewer / staging-
         // proposal review.
         let overlay = self.app.diff_overlay_for(self.path);
+
+        // Dirty-diff gutter (`git-dirty-diff-gutter`, G4): refresh this buffer's
+        // git-HEAD snapshot off the paint path (no-op on idle frames; re-fetches
+        // only on a load / save). The rebuild hook below reads the snapshot from
+        // the buffer and emits the per-line `GutterMarker::Diff*` decorations.
+        self.app.refresh_dirty_diff_head(self.path);
+
         if let Some(ov) = &overlay
             && matches!(ov.owner, editor_diff::DiffOwner::Agent)
         {
@@ -172,7 +190,7 @@ impl<'a> BufCtx<'a> {
                 .get(self.path)
                 .and_then(|b| b.active_session.clone());
             // Drift + multi-session metadata for the active document, read
-            // off the op log. The drifted count rides the pill's `(M
+            // off the layered doc. The drifted count rides the pill's `(M
             // drifted)` suffix; the session list backs per-session rows.
             let pill_meta =
                 Self::pill_meta(self.app, self.path, active_session.as_deref());
@@ -191,11 +209,20 @@ impl<'a> BufCtx<'a> {
 
         self.ui.add_space(4.0);
 
+        // Inline git-conflict resolver overlay (`git-conflict-inline-markers`):
+        // when this buffer carries `git merge` conflict markers, build the
+        // per-region Accept Current/Incoming/Both action rows + side tints. The
+        // buffer already renders as source while markered (live-preview is
+        // suppressed in `decorations::rebuild_editor_layers`), so the markers
+        // stay visible + editable underneath these decorations.
+        let conflict = self.app.conflict_overlay_for(self.path);
+
         // Hoist captures so the egui closure sees disjoint `&mut`s on
         // `ui` vs `app`.
         let Self { ui, app, path } = self;
         let path: &str = *path;
         let overlay_ref = overlay.as_ref();
+        let conflict_ref = conflict.as_ref();
         egui::Frame::default().show(*ui, |ui| {
             let body_height = ui.available_height().max(80.0);
             let (rect, _resp) = ui.allocate_exact_size(
@@ -204,7 +231,7 @@ impl<'a> BufCtx<'a> {
             );
             app.session.nav.swipe_skip_rects.push(rect);
             let mut body_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
-            BufCtx { ui: &mut body_ui, app, path }.show_editor(overlay_ref);
+            BufCtx { ui: &mut body_ui, app, path }.show_editor(overlay_ref, conflict_ref);
         });
     }
 
@@ -219,7 +246,11 @@ impl<'a> BufCtx<'a> {
             .unwrap_or(0)
     }
 
-    fn show_editor(&mut self, diff: Option<&diff_overlay::DiffOverlay>) {
+    fn show_editor(
+        &mut self,
+        diff: Option<&diff_overlay::DiffOverlay>,
+        conflict: Option<&conflict_overlay::ConflictOverlay>,
+    ) {
         let ui = &mut *self.ui;
         let app = &mut *self.app;
         let path: &str = self.path;
@@ -342,8 +373,6 @@ impl<'a> BufCtx<'a> {
     let resolve_title =
         wikilink_nav::title_resolver(app.vault_session.services.read_store.clone());
 
-    let click_buffer = &mut buffer.click_buffer;
-    let paint_cache = &mut buffer.paint_cache;
     let body = ui.available_rect_before_wrap();
     let minimap_w: f32 = mini_opts.as_ref().map(|o| o.width).unwrap_or(0.0);
     let split_x = (body.right() - minimap_w).max(body.left());
@@ -355,63 +384,32 @@ impl<'a> BufCtx<'a> {
     // Seed the sink with any undo/redo change set resolved above so the
     // editor binding mirrors it into `working` alongside this frame's typing.
     let mut txns: Vec<editor_core::transaction::Transaction> = undo_txns;
-    // Set by the editor's right-click "Open in chart editor" menu item; executed
-    // after the editor block so `open_block` can take `&mut app`. status: chart-open-in-builder
-    let mut chart_open: Option<widgets::chart::EditTarget> = None;
-    {
-        crate::profile_scope!("Widget::show");
-        let mut editor_ui = ui.new_child(egui::UiBuilder::new().max_rect(editor_rect));
-        // Disjoint field borrows for the decoration-rebuild hook. Bound as
-        // locals BEFORE the widget so the borrow checker sees them as separate
-        // from `&mut buffer.editor` / `&mut buffer.view`, which the widget
-        // (and the hook) take instead. Scoped inside this `{ }` block so the
-        // closure and its captures drop before the minimap reborrows below.
-        let mut deco_ctx = DecoRebuildCtx {
-            cache: &mut buffer.decoration_cache,
-            folds: &buffer.folds,
-            loaded_text: &buffer.loaded_text,
-            theme,
-            live_preview: buffer.live_preview,
-            render_widgets: buffer.render_widgets,
-            is_markdown,
-            dpr,
-            font_px: buffer.view.font_size,
-            chunk_boundaries: buffer.chunk_boundaries,
-            show_whitespace: buffer.show_whitespace,
-            highlight_trailing_whitespace: buffer.highlight_trailing_whitespace,
-            diff,
-            resolve_title: Some(&resolve_title),
+    // This frame's in-place cell-edit targets (id + table start + editable range),
+    // reused by both the trigger resolution above and the overlay below.
+    let cell_targets = if is_markdown && buffer.render_widgets {
+        widgets::tables::cell_edit::table_cell_targets(&buffer.editor, theme, None, buffer.view.font_size)
+    } else {
+        Vec::new()
+    };
+    // The widget pass renders the editor (decoration hook + show) and resolves
+    // this frame's pointer interactions on its rendered widgets; the returned
+    // actions run after the pass's borrows drop (each needs `&mut app`).
+    let EditorPassActions { chart_open, table_choice, cell_edit_enter } = editor_widget_pass(
+        ui,
+        buffer,
+        EditorPassCtx {
+            path, theme, dpr, is_markdown, editor_rect, diff, conflict,
+            resolve_title: &resolve_title,
             diagram_cache,
-            // Bind the chart data resolver to this note's directory so an inline
-            // ```chart block's `data: x.csv` resolves note-relative under the
-            // vault sandbox (the same machinery wikilinks use). status: widget-chart-render
-            chart_resolver: Some(crate::charts::VaultDataResolver::new(
-                app.vault_session.vault.as_ref().clone(),
-                path,
-            )),
-        };
-        let mut rebuild =
-            |editor: &editor_core::state::Editor,
-             view: &mut editor_view::viewport::ViewState| {
-                decorations::rebuild_editor_layers(editor, view, &mut deco_ctx);
-            };
-        let editor_resp = EditorWidget::new(&mut buffer.editor, &mut buffer.view)
-            .with_click_sink(click_buffer)
-            .with_paint_cache(paint_cache)
-            .with_transactions_sink(&mut txns)
-            .with_decoration_rebuild(&mut rebuild)
-            .show(&mut editor_ui);
-        // Right-click → "Open in chart editor" (a LEFT click reveals the chart's
-        // source like other block widgets, via `edit_targets`). status: chart-open-in-builder
-        let chart_targets = widgets::chart::edit_targets(&buffer.editor, theme, None, dpr);
-        let chart_menu_target = chart_under_right_click(
-            editor_ui.ctx(),
-            editor_rect,
-            &buffer.view.click_zones,
-            &chart_targets,
-            egui::Id::new(("chart-ctx-menu", path)),
-        );
-        clipboard_menu::attach(&editor_resp, chart_menu_target.as_ref(), &mut chart_open);
+            vault: app.vault_session.vault.as_ref().clone(),
+            cell_targets: &cell_targets,
+            txns: &mut txns,
+        },
+    );
+    // Apply the chosen table overflow mode after the editor borrow ends.
+    // status: widget-table-overflow-scroll
+    if let Some((byte_start, mode)) = table_choice {
+        table_overflow_menu::apply_mode(&mut buffer.table_overflow, byte_start, mode);
     }
     if let Some(opts) = mini_opts {
         crate::profile_scope!("Widget::show");
@@ -496,13 +494,49 @@ impl<'a> BufCtx<'a> {
         buffer.view.hide_gutter = prev_hide_gutter;
     }
 
-    // Run the editor binding for op-log-backed vault buffers: forward this
+    // In-place table cell edit (`widget-table-cell-edit-inplace`): enter a freshly
+    // triggered edit (double-click on a block cell / "Edit diagram" / "Edit
+    // cell"), then drive the active overlay. The `buffer` borrow has ended, so the
+    // overlay takes `&mut app`; its per-keystroke splice is appended to `txns` so
+    // the layered-doc binding below mirrors the cell edit like any other typing.
+    if let Some(target) = cell_edit_enter {
+        table_cell_edit::enter(app, path, &target);
+        ui.ctx().request_repaint();
+    }
+    if app.session.buffers.get(path).is_some_and(|b| b.editing_cell.is_some()) {
+        // Clone the per-frame click zones (the overlay hit-tests the active cell's
+        // on-screen rect against them) before the `&mut app` borrow.
+        let zones = app
+            .session
+            .buffers
+            .get(path)
+            .map(|b| b.view.click_zones.clone())
+            .unwrap_or_default();
+        table_cell_edit::show(ui, app, path, table_cell_edit::ShowCtx {
+            editor_rect,
+            zones: &zones,
+            targets: &cell_targets,
+            theme,
+            txns: &mut txns,
+        });
+    }
+
+    // Run the editor binding for layered-doc-backed vault buffers: forward this
     // frame's captured change sets into the `working` layer, pull
     // `materialize_working` back into the editable buffer, and refresh the
     // agent suggestion overlay (`agent_proposal`). The `buffer` borrow above
     // has ended (last use was `drain_fold_clicks`), so the binding can take
-    // `&mut app` freely. Plain disk-only buffers (no op-log doc) fall through.
+    // `&mut app` freely. Plain disk-only buffers (no layered doc) fall through.
     editor_binding::run(app, path, &txns);
+
+    // Block-anchor auto-injection: when an edit this frame authored a
+    // `[[Page#^id]]` / `[text](Page#^id)` link to a not-yet-anchored block,
+    // inject ` ^id` onto that block in the target note so the link resolves.
+    // Gated on an actual edit so the vault read only runs when text changed.
+    // status: wikilink-block-anchor-autoinject
+    if !txns.is_empty() {
+        wikilink_nav::reconcile_block_anchors(app, path);
+    }
 
     // Wikilink click dispatch: resolve each clicked pill's target and open it.
     wikilink_nav::handle_clicks(app, ui.ctx(), path, &wikilink_clicks, mod_click);
@@ -545,8 +579,8 @@ impl<'a> BufCtx<'a> {
     if let Some(ov) = diff
         && !widget_clicks.is_empty()
     {
-        for id in widget_clicks {
-            let Some(action) = ov.click_map.get(&id) else { continue };
+        for id in &widget_clicks {
+            let Some(action) = ov.click_map.get(id) else { continue };
             match action.clone() {
                 diff_overlay::HunkAction::Accept(ids) => app.apply_hunk_accept(path, &ids),
                 diff_overlay::HunkAction::Reject(ids) => app.apply_hunk_reject(path, &ids),
@@ -562,11 +596,210 @@ impl<'a> BufCtx<'a> {
                 }
             }
         }
-        // A flip mutated the op log; repaint so the next frame's editor
+        // A flip mutated the layered doc; repaint so the next frame's editor
         // binding re-materializes the buffer / overlay immediately.
         ui.ctx().request_repaint();
     }
+
+    // Inline git-conflict resolver click dispatch (`git-conflict-inline-markers`).
+    conflict_overlay::dispatch_conflict_clicks(app, ui.ctx(), path, conflict, &widget_clicks);
     }
+}
+
+/// Per-frame inputs to [`editor_widget_pass`] beyond the buffer itself.
+/// Bundled (like [`DecoRebuildCtx`]) to keep the pass under the
+/// `too_many_arguments` cap; every field is read exactly where the old inline
+/// block read the matching local.
+struct EditorPassCtx<'a> {
+    path: &'a str,
+    theme: Option<&'a editor_core::theme::Theme>,
+    /// Device pixel ratio (`widget-render-cache`).
+    dpr: f32,
+    is_markdown: bool,
+    /// The editor body rect (the pane minus any minimap strip).
+    editor_rect: egui::Rect,
+    diff: Option<&'a diff_overlay::DiffOverlay>,
+    /// Inline git-conflict resolver overlay (`git-conflict-inline-markers`),
+    /// present only when the buffer carries `git merge` conflict markers.
+    conflict: Option<&'a conflict_overlay::ConflictOverlay>,
+    /// Wikilink live-title resolver (`wikilink-render-live-title`).
+    resolve_title: &'a editor_md::links::TitleResolver<'a>,
+    /// Persisted diagram-cache context (`widget-render-disk-cache`).
+    diagram_cache: Option<widgets::disk_cache::DiagramCacheCtx>,
+    /// An owned vault clone for the note-relative chart / image resolvers, so
+    /// the decoration-rebuild closure never borrows `app`.
+    vault: hiker_core::vault::Vault,
+    /// This frame's in-place cell-edit targets (`widget-table-cell-edit-inplace`).
+    cell_targets: &'a [widgets::tables::cell_edit::TableCellTarget],
+    /// The frame's transaction sink (seeded with any undo/redo change set).
+    txns: &'a mut Vec<editor_core::transaction::Transaction>,
+}
+
+/// The deferred actions [`editor_widget_pass`] resolved from this frame's
+/// pointer input on rendered widgets. Each one mutates state the pass itself
+/// holds borrowed (`&mut app` / `buffer.table_overflow`), so the caller
+/// applies them after the pass returns.
+#[derive(Default)]
+struct EditorPassActions {
+    /// The editor's right-click "Open in chart editor" choice; executed by the
+    /// caller via `open_block(&mut app, ..)`. status: chart-open-in-builder
+    chart_open: Option<widgets::chart::EditTarget>,
+    /// The `(byte_start, mode)` the table's right-click overflow menu picked;
+    /// applied to `buffer.table_overflow` by the caller (the menu can only
+    /// read the map during the borrow). status: widget-table-overflow-scroll
+    table_choice: Option<(usize, widgets::tables::TableOverflow)>,
+    /// A double-click on a block cell or the cell's right-click "Edit
+    /// diagram" / "Edit cell" menu item; entered by the caller (it takes
+    /// `&mut app`). status: widget-table-cell-edit-inplace
+    cell_edit_enter: Option<widgets::tables::cell_edit::TableCellTarget>,
+}
+
+/// One frame of the editor widget: wire the decoration-rebuild hook (whose
+/// disjoint `buffer` field borrows drop when this returns, freeing the caller's
+/// minimap reborrow), show the widget, then resolve this frame's pointer
+/// interactions with its rendered widgets — the chart / table-overflow /
+/// cell-edit right-click menus, the table-cell double-click fast path, and the
+/// Scrollable-table wheel pan. Follow-ups that outlive the pass's borrows come
+/// back as [`EditorPassActions`].
+fn editor_widget_pass(
+    ui: &mut egui::Ui,
+    buffer: &mut crate::buffer::Buffer,
+    ctx: EditorPassCtx<'_>,
+) -> EditorPassActions {
+    crate::profile_scope!("Widget::show");
+    let EditorPassCtx {
+        path, theme, dpr, is_markdown, editor_rect, diff, conflict,
+        resolve_title, diagram_cache, vault, cell_targets, txns,
+    } = ctx;
+    let mut actions = EditorPassActions::default();
+    let mut editor_ui = ui.new_child(egui::UiBuilder::new().max_rect(editor_rect));
+    // Disjoint field borrows for the decoration-rebuild hook. Bound as
+    // locals BEFORE the widget so the borrow checker sees them as separate
+    // from `&mut buffer.editor` / `&mut buffer.view`, which the widget
+    // (and the hook) take instead.
+    let click_buffer = &mut buffer.click_buffer;
+    let paint_cache = &mut buffer.paint_cache;
+    let chart_resolver = crate::charts::VaultDataResolver::new(vault.clone(), path);
+    let image_resolver = widgets::tables::image_loader::CellImageResolver::new(vault, path);
+    let mut deco_ctx = DecoRebuildCtx {
+        cache: &mut buffer.decoration_cache,
+        folds: &buffer.folds,
+        loaded_text: &buffer.loaded_text,
+        // Dirty-diff gutter HEAD snapshot (`git-dirty-diff-gutter`, G4),
+        // refreshed off-frame in `show`; `None` (git off / non-vault) disables
+        // the layer. Borrowed disjoint from `&mut buffer.editor` / `view`.
+        git_head_text: buffer.git_head_text.as_deref(),
+        theme,
+        live_preview: buffer.live_preview,
+        render_widgets: buffer.render_widgets,
+        is_markdown,
+        code_language: decorations::code_language_for(path),
+        dpr,
+        font_px: buffer.view.font_size,
+        chunk_boundaries: buffer.chunk_boundaries,
+        show_whitespace: buffer.show_whitespace,
+        highlight_trailing_whitespace: buffer.highlight_trailing_whitespace,
+        diff,
+        conflict,
+        resolve_title: Some(resolve_title),
+        diagram_cache,
+        // Vault-bound resolvers for this note's external references (chart
+        // `data:` CSV + `![alt](path)` table-cell image), both note-relative
+        // under the sandbox. status: widget-chart-render / widget-table-render
+        chart_resolver: Some(chart_resolver),
+        image_resolver: Some(image_resolver),
+        // Ephemeral per-table overflow map (`widget-table-overflow-scroll`),
+        // borrowed disjoint from `&mut buffer.editor` / `&mut buffer.view`.
+        table_overflow: &buffer.table_overflow,
+        // The table (if any) whose cell is in active in-place edit: it
+        // suppresses its reveal so it stays rendered while the cell edits in a
+        // popover. status: widget-table-cell-edit-inplace
+        editing_table: buffer.editing_cell.as_ref().map(|e| e.table_start),
+    };
+    let mut rebuild =
+        |editor: &editor_core::state::Editor,
+         view: &mut editor_view::viewport::ViewState| {
+            decorations::rebuild_editor_layers(editor, view, &mut deco_ctx);
+        };
+    let editor_resp = EditorWidget::new(&mut buffer.editor, &mut buffer.view)
+        .with_click_sink(click_buffer)
+        .with_paint_cache(paint_cache)
+        .with_transactions_sink(txns)
+        .with_decoration_rebuild(&mut rebuild)
+        .show(&mut editor_ui);
+    // Right-click → "Open in chart editor" (a LEFT click reveals the chart's
+    // source like other block widgets, via `edit_targets`). status: chart-open-in-builder
+    let chart_targets = widgets::chart::edit_targets(&buffer.editor, theme, None, dpr);
+    let chart_menu_target = chart_under_right_click(
+        editor_ui.ctx(),
+        editor_rect,
+        &buffer.view.click_zones,
+        &chart_targets,
+        egui::Id::new(("chart-ctx-menu", path)),
+    );
+    // Table overflow (`widget-table-overflow-scroll`): resolve the table under
+    // a right-click for the Fit ⇄ Scrollable toggle, and pan the Scrollable
+    // table under a hovering wheel. Both hit-test the table whole-widget click
+    // zones; the wheel mutates `buffer.table_overflow` in place (offset clamp),
+    // the menu's chosen mode is applied after the editor borrow ends.
+    let table_targets =
+        widgets::tables::table_overflow_targets(&buffer.editor, theme, None, buffer.view.font_size);
+    let table_menu_target = table_overflow_menu::table_under_right_click(
+        editor_ui.ctx(),
+        editor_rect,
+        &buffer.view.click_zones,
+        &table_targets,
+        egui::Id::new(("table-overflow-menu", path)),
+    );
+    if table_overflow_menu::scroll_hovered(
+        editor_ui.ctx(),
+        editor_rect,
+        editor_rect.width(),
+        &buffer.view.click_zones,
+        &table_targets,
+        &mut buffer.table_overflow,
+    ) {
+        editor_ui.ctx().request_repaint();
+    }
+    // In-place cell edit (`widget-table-cell-edit-inplace`): a double-click on
+    // a rendered BLOCK cell enters edit directly (fast path); the cell under a
+    // right-click drives the "Edit diagram" / "Edit cell" menu item. Both
+    // hit-test the per-cell click zones (the same seam the overflow menu uses);
+    // the chosen target is entered after the editor borrow ends.
+    let cell_doc = buffer.editor.doc.to_string();
+    if !cell_targets.is_empty() {
+        actions.cell_edit_enter = table_cell_edit::double_click_target(
+            editor_ui.ctx(),
+            editor_rect,
+            &buffer.view.click_zones,
+            cell_targets,
+            &cell_doc,
+            egui::Id::new(("table-cell-edit-dclick", path)),
+        );
+    }
+    let cell_menu_target = (actions.cell_edit_enter.is_none() && !cell_targets.is_empty())
+        .then(|| {
+            table_cell_edit::cell_under_right_click(
+                editor_ui.ctx(),
+                editor_rect,
+                &buffer.view.click_zones,
+                cell_targets,
+                egui::Id::new(("table-cell-edit-menu", path)),
+            )
+        })
+        .flatten();
+    clipboard_menu::attach(clipboard_menu::AttachCtx {
+        editor_resp: &editor_resp,
+        chart_target: chart_menu_target.as_ref(),
+        chart_open: &mut actions.chart_open,
+        table_target: table_menu_target,
+        table_views: &buffer.table_overflow,
+        table_choice: &mut actions.table_choice,
+        cell_target: cell_menu_target,
+        cell_doc: &cell_doc,
+        cell_edit: &mut actions.cell_edit_enter,
+    });
+    actions
 }
 
 /// Rebuild this frame's diagram-region interaction data for `buffer`: the
@@ -795,7 +1028,7 @@ fn place_caret_for_block_click(
 impl AppState {
     /// Per-hunk Restore: write the snapshot buffer's text for
     /// `[byte_start, byte_end)` back to disk at `target_path`, splicing
-    /// it into the current on-disk content. Routes through the op log so
+    /// it into the current on-disk content. Routes through the layered doc so
     /// the restore is itself an accepted op the history surfaces show.
     pub(super) fn apply_hunk_restore(
         &mut self,
@@ -831,7 +1064,7 @@ impl AppState {
         new_text.push_str(&snippet);
         new_text.push_str(&disk_text[safe_end..]);
         match hiker_core::ops::op_writes::user_save(
-            self.vault_session.services.oplog.as_ref(),
+            self.vault_session.services.layered.as_ref(),
             &self.vault_session.vault,
             target_path,
             &new_text,
@@ -847,20 +1080,22 @@ impl AppState {
     }
 }
 
+
 /// Snapshot / staging-proposal verbs, surfaced from the read-only
 /// source-toolbar. Methods on `AppState` so they're exempt from
 /// `clippy::single_call_fn`.
 impl AppState {
     pub(super) fn restore_snapshot_to_disk(&mut self, path: &str, op_id: &str) {
-        let log = self.vault_session.services.oplog.clone();
+        let log = self.vault_session.services.layered.clone();
         let snapshot_text =
-            match hiker_core::ops::op_writes::content_at_op(log.as_ref(), path, op_id) {
+            match hiker_core::ops::op_writes::content_at_snapshot(log.as_ref(), path, op_id) {
                 Ok(Some(t)) => t,
                 _ => return,
             };
-        // Restore writes the version content back through the op log: a fresh
-        // `user` op against `accepted` that atomically rewrites the `.md`, so
-        // the restore is itself an accepted op the history surfaces show.
+        // Restore writes the snapshot content back through the layered doc: a fresh
+        // `user` save against `accepted` that atomically rewrites the `.md` (and
+        // itself snapshots), so the restore is forward-correct — a new version,
+        // not a rewind of history.
         match hiker_core::ops::op_writes::user_save(
             log.as_ref(),
             &self.vault_session.vault,
@@ -874,48 +1109,6 @@ impl AppState {
         }
     }
 
-    /// Accept a pending whole-file proposal: flip the op to `accepted` via the
-    /// op log (`op_writes::flip_op_status` → `OpLog::accept_pending`), which
-    /// applies its text edit to `accepted` and atomically rewrites the `.md`.
-    /// `proposal_id` is the pending op id; `target_path` the note it targets.
-    /// On success, navigate to the target as a preview tab per
-    /// `staging-accept-navigates-to-preview`.
-    ///
-    /// status: write-note-review-surface
-    pub(super) fn accept_staging_proposal(&mut self, proposal_id: &str, target_path: &str) {
-        let log = self.vault_session.services.oplog.clone();
-        match hiker_core::ops::op_writes::flip_op_status(
-            log.as_ref(),
-            target_path,
-            std::slice::from_ref(&proposal_id.to_string()),
-            /* accept */ true,
-        ) {
-            Ok(_) => {
-                self.push_toast(format!("Accepted proposal for {}", target_path), ToastLevel::Info);
-                editor_pane::open_file(self, target_path, /* sticky */ true);
-            }
-            Err(err) => self.push_toast(format!("Accept failed: {}", err), ToastLevel::Error),
-        }
-    }
-
-    /// Reject a pending whole-file proposal: flip the op to `rejected` via the
-    /// op log (`op_writes::flip_op_status` → `OpLog::reject_pending`), writing
-    /// a rejected audit row and dropping the op from the queue. Disk content is
-    /// untouched.
-    ///
-    /// status: write-note-review-surface
-    pub(super) fn reject_staging_proposal(&mut self, proposal_id: &str, target_path: &str) {
-        let log = self.vault_session.services.oplog.clone();
-        match hiker_core::ops::op_writes::flip_op_status(
-            log.as_ref(),
-            target_path,
-            std::slice::from_ref(&proposal_id.to_string()),
-            /* accept */ false,
-        ) {
-            Ok(()) => self.push_toast("Proposal rejected".to_string(), ToastLevel::Info),
-            Err(err) => self.push_toast(format!("Reject failed: {}", err), ToastLevel::Error),
-        }
-    }
 }
 
 impl<'a> BufCtx<'a> {
@@ -971,7 +1164,7 @@ fn active_trail_rel(app: &AppState) -> Option<String> {
     let exists = hiker_core::trails::list(
         &app.vault_session.vault,
         &store,
-        &app.vault_session.services.oplog,
+        &app.vault_session.services.layered,
     )
     .unwrap_or_default()
     .into_iter()
@@ -994,7 +1187,7 @@ fn trail_contains_path(app: &AppState, trail_rel: &str, note_rel: &str) -> bool 
     hiker_core::trails::containing_note_with_paths(
         &app.vault_session.vault,
         &store,
-        &app.vault_session.services.oplog,
+        &app.vault_session.services.layered,
         note_rel,
     )
     .unwrap_or_default()
@@ -1011,7 +1204,7 @@ fn append_waypoint_to_active(
 ) -> Result<(), hiker_core::errors::HikerError> {
     let watcher = app.vault_session.services.watcher.clone();
     let jobs = app.vault_session.services.indexer.job_sender();
-    let log = app.vault_session.services.oplog.clone();
+    let log = app.vault_session.services.layered.clone();
     let vault = app.vault_session.vault.clone();
     let (trail_rel, note_rel) = (trail_rel.to_string(), note_rel.to_string());
     match tokio::runtime::Handle::try_current() {

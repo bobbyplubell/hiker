@@ -81,7 +81,7 @@ pub fn load(store: &Store, vault: &Vault) -> Vec<Entry> {
     let query = NoteQuery {
         filters: vec![MetaFilter::Equals {
             key: "hiker.kind".to_string(),
-            value: KIND.to_string(),
+            values: vec![KIND.to_string()],
         }],
         ..Default::default()
     };

@@ -1,0 +1,12 @@
+[package]
+name = "zim-adapter"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+spec-engine = { path = "../spec-engine" }
+zxr = { path = "../../zxr" }            # read-only ZIM archive reader (mmap, Send+Sync)
+
+[dev-dependencies]
+tempfile = "3"                         # synthetic in-memory ZIM is written to a temp file for mmap

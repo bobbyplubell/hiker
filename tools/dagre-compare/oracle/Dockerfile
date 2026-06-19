@@ -10,7 +10,9 @@ WORKDIR /oracle
 COPY package.json ./
 RUN npm install --omit=dev --no-audit --no-fund
 
-COPY run.js ./
+# debug-ranks.js is a manual helper: per-pass rank dumps for pinning a port
+# divergence to a specific pass (see its header for usage).
+COPY run.js debug-ranks.js ./
 
 # Fixtures are bind-mounted at /fixtures by run.sh; the fixture path is passed
 # as the argument.

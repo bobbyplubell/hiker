@@ -1,0 +1,12 @@
+{
+  "links": [
+    {
+      "spec": "spec-areas",
+      "relation": "implements",
+      "source": "pyproj",
+      "target": "scip-python python pyproj 0.0.0 `pyproj.calc`/total_area().",
+      "fingerprint": "9ed7d340f6708618",
+      "resolution": "code"
+    }
+  ]
+}

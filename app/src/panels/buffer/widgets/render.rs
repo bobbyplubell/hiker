@@ -357,6 +357,64 @@ pub fn render_chart(
     Ok(rendered)
 }
 
+/// Decode raw image `bytes` (PNG / JPEG / GIF / WebP / BMP) to a straight RGBA8
+/// [`RenderedWidget`] at the image's intrinsic pixel size. Unlike the SVG-backed
+/// renders this is dpr-independent (a raster image has fixed pixels); `dpr` only
+/// folds into the cache key + the over-large guard. `key` is the caller's stable
+/// identity for the image (e.g. the vault path + mtime), so two cells citing the
+/// same file share a render. A decode failure or a degenerate / over-large size
+/// yields `None`, so the cell falls back to tinted source
+/// (`widget-render-error-fallback`). status: widget-table-render
+pub fn render_image(
+    bytes: &[u8],
+    key: &str,
+    dpr: f32,
+    cache: Option<&DiagramCacheCtx>,
+) -> Option<RenderedWidget> {
+    let content_hash = hash_image(key, dpr);
+    if let Some(hit) = mem_cache().lock().unwrap().get_widget(Domain::Image, content_hash) {
+        return Some(hit);
+    }
+    if let Some(hit) = cache.and_then(|c| c.load(Domain::Image, content_hash)) {
+        mem_cache().lock().unwrap().put_widget(Domain::Image, &hit);
+        return Some(hit);
+    }
+
+    let img = image::load_from_memory(bytes).ok()?.into_rgba8();
+    let (width, height) = (img.width(), img.height());
+    if width == 0 || height == 0 || width as f32 > MAX_DIM_PX || height as f32 > MAX_DIM_PX {
+        return None;
+    }
+    let rendered = RenderedWidget {
+        rgba: img.into_raw(),
+        width,
+        height,
+        baseline: None,
+        content_hash,
+    };
+    if let Some(c) = cache {
+        c.store(Domain::Image, &rendered);
+    }
+    mem_cache().lock().unwrap().put_widget(Domain::Image, &rendered);
+    Some(rendered)
+}
+
+/// The `content_hash` [`render_image`] would compute for these inputs, without
+/// reading or decoding the file — used by the raster-free edit-target path so
+/// the cell's id is stable without loading the image. status: widget-table-render
+#[must_use]
+pub fn image_content_hash(key: &str, dpr: f32) -> u64 {
+    hash_image(key, dpr)
+}
+
+fn hash_image(key: &str, dpr: f32) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    "image".hash(&mut h);
+    key.hash(&mut h);
+    dpr.to_bits().hash(&mut h);
+    h.finish()
+}
+
 /// The data-free id the editor's texture cache and the click-to-edit map key on:
 /// a hash of (config body + theme + size + dpr), **excluding** the resolved
 /// external data. Computable raster-free (no file read), so the per-frame
@@ -947,6 +1005,46 @@ mod tests {
             wavedrom_content_hash(src, 16.0, 1.0, wavedrom_colors()),
             "raster-free hash matches the rendered hash"
         );
+    }
+
+    /// A tiny in-memory PNG (`w`×`h`, opaque red) for the image-render tests.
+    fn tiny_png(w: u32, h: u32) -> Vec<u8> {
+        let buf = image::RgbaImage::from_pixel(w, h, image::Rgba([200, 30, 30, 255]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(buf)
+            .write_to(&mut out, image::ImageFormat::Png)
+            .expect("png encode");
+        out.into_inner()
+    }
+
+    #[test]
+    fn image_decodes_to_intrinsic_size() {
+        // status: widget-table-render — a PNG decodes to a straight-RGBA widget
+        // at its intrinsic pixel size (dpr-independent), no baseline.
+        // Key must be unique to this test: the global mem-cache is keyed on
+        // (key, dpr) only, so sharing `img/a.png` with the 4x4 png in
+        // `image_hash_stable_and_raster_free_matches` made whichever test ran
+        // second read the other's cached pixels (order-dependent failure).
+        let png = tiny_png(12, 7);
+        let w = render_image(&png, "img/intrinsic-12x7.png", 1.0, None).expect("png decodes");
+        assert_eq!((w.width, w.height), (12, 7), "intrinsic pixel size");
+        assert!(w.baseline.is_none(), "image is a block widget");
+        assert_well_formed(&w);
+    }
+
+    #[test]
+    fn broken_image_returns_none() {
+        let w = render_image(b"not an image at all", "x", 1.0, None);
+        assert!(w.is_none(), "undecodable bytes fall back (None)");
+    }
+
+    #[test]
+    fn image_hash_stable_and_raster_free_matches() {
+        let png = tiny_png(4, 4);
+        let w = render_image(&png, "img/a.png", 1.0, None).unwrap();
+        assert_eq!(w.content_hash, image_content_hash("img/a.png", 1.0), "raster-free hash matches");
+        // A different key (e.g. a changed mtime suffix) hashes apart.
+        assert_ne!(image_content_hash("img/a.png", 1.0), image_content_hash("img/b.png", 1.0));
     }
 
     #[test]

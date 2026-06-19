@@ -28,7 +28,6 @@ pub enum ActionCategory {
     File,
     Editor,
     Tab,
-    Chat,
     Palette,
     Panel,
 }
@@ -42,7 +41,6 @@ impl ActionCategory {
             ActionCategory::File => "File",
             ActionCategory::Editor => "Editor",
             ActionCategory::Tab => "Tab",
-            ActionCategory::Chat => "Chat",
             ActionCategory::Palette => "Palette",
             ActionCategory::Panel => "Panel",
         }
@@ -233,7 +231,7 @@ static A_VAULT_GRAPH: Action = Action {
     label: "Graph",
     badge: None,
     enabled: None,
-    run: |s| open_singleton(s, TabKind::Graph),
+    run: |s| open_singleton(s, TabKind::Graph { focus: None, scope_query: None }),
     category: ActionCategory::Vault,
 };
 
@@ -250,48 +248,16 @@ static A_VAULT_PATCH_REVIEW: Action = Action {
     category: ActionCategory::Vault,
 };
 
-static A_VAULT_CHANGES: Action = Action {
-    id: "vault.open_changes",
-    icon: icons::Icon::Clock,
-    label: "Changes",
+static A_VAULT_GIT_DIFF: Action = Action {
+    id: "vault.open_git_diff",
+    icon: icons::Icon::Diff,
+    label: "Git diff",
     badge: None,
+    // Listed even when the git transport is off — the page renders the
+    // how-to-enable hint in that case (same posture as the Sync page).
     enabled: None,
-    run: |s| open_singleton(s, TabKind::Changes),
+    run: |s| open_singleton(s, TabKind::GitDiff),
     category: ActionCategory::Vault,
-};
-
-static A_CHAT_NEW: Action = Action {
-    id: "chat.new_session",
-    icon: icons::Icon::Plus,
-    label: "New chat session",
-    badge: None,
-    enabled: None,
-    run: |state| {
-        let vault_root = state.vault_session.vault_root.clone();
-        let (model, provider) = state
-            .vault_session
-            .config
-            .read()
-            .map(|c| (c.llm.provider.model.clone(), c.llm.provider.backend.clone()))
-            .unwrap_or_else(|_| ("stub-model".into(), "stub".into()));
-        let chats_dir = crate::chat::session::chats_dir(&state.vault_session.config);
-        if let Err(err) = crate::chat::session::create_new(
-            &mut state.chat_state.registry,
-            &vault_root,
-            &chats_dir,
-            &model,
-            &provider,
-        ) {
-            state.push_toast(format!("New chat failed: {err}"), ToastLevel::Error);
-        } else {
-            // Chat lives in the workbench's right-bar `secondary_panels`,
-            // not the tile dock. `ensure_panel_visible` seeds the chat
-            // section and re-shows the secondary side bar so the freshly
-            // created session is visible.
-            ensure_panel_visible(state, crate::tab::PANEL_CHAT);
-        }
-    },
-    category: ActionCategory::Chat,
 };
 
 static A_VIEW_TOGGLE_HELP: Action = Action {
@@ -344,7 +310,6 @@ static A_VIEW_TOGGLE_RIGHT_SIDEBAR: Action = Action {
     badge: None,
     enabled: None,
     run: |s| {
-        ensure_chat_seeded(s);
         s.workbench.secondary_side_bar.toggle();
     },
     category: ActionCategory::View,
@@ -545,29 +510,10 @@ jump_action!(A_TAB_JUMP_9, "tab.jump_9", "Jump to the last tab", 8, true);
 /// that maps to an activity-bar mode (Files/Clusters/Trails/Search/
 /// Context/Vault/Trash) this collapses the primary side bar
 /// when that mode is already showing, and otherwise selects the mode +
-/// shows the bar. `PANEL_CHAT` lives in the secondary side bar, so its
-/// toggle flips that bar's visibility.
-/// Ensure the right-bar `secondary_panels` stack has chat seeded as a
-/// section, so the secondary side bar (which renders empty stacks as
-/// hidden) actually shows it. Idempotent. [feature-multi-region-sidebar]
-fn ensure_chat_seeded(state: &mut AppState) {
-    if !state.workbench.secondary_panels.contains(&crate::tab::PANEL_CHAT.to_string()) {
-        state
-            .workbench
-            .secondary_panels
-            .switch_group(crate::tab::PANEL_CHAT.to_string(), vec![crate::tab::PANEL_CHAT.to_string()]);
-    }
-}
-
+/// shows the bar.
 fn toggle_panel(state: &mut AppState, panel_id: &'static str) {
-    if panel_id == crate::tab::PANEL_CHAT {
-        ensure_chat_seeded(state);
-        state.workbench.secondary_side_bar.toggle();
-        return;
-    }
     // The panel id IS the activity id / activity-bar mode. Skip if it
-    // doesn't resolve to an activity-bar activity (e.g. chat handled
-    // above, or an unknown id).
+    // doesn't resolve to an activity-bar activity (an unknown id).
     if state
         .activities
         .by_id(panel_id)
@@ -587,16 +533,10 @@ fn toggle_panel(state: &mut AppState, panel_id: &'static str) {
 }
 
 /// Reveal a registered side-bar panel via the workbench: select its
-/// activity-bar mode and show the primary side bar (or show the
-/// secondary side bar for `PANEL_CHAT`). Used by callers that want a
-/// specific panel visible after an action (e.g. reveal-in-files,
-/// activate-trail, new-chat).
+/// activity-bar mode and show the primary side bar. Used by callers that
+/// want a specific panel visible after an action (e.g. reveal-in-files,
+/// activate-trail).
 pub fn ensure_panel_visible(state: &mut AppState, panel_id: &'static str) {
-    if panel_id == crate::tab::PANEL_CHAT {
-        ensure_chat_seeded(state);
-        state.workbench.secondary_side_bar.visible = true;
-        return;
-    }
     if state
         .activities
         .by_id(panel_id)
@@ -665,16 +605,6 @@ static A_PANEL_TOGGLE_BACKLINKS: Action = Action {
     run: |s| toggle_panel(s, crate::tab::PANEL_CONTEXT),
     category: ActionCategory::Panel,
 };
-static A_PANEL_TOGGLE_CHAT: Action = Action {
-    id: "panel.toggle.chat",
-    icon: icons::Icon::Chat,
-    label: "Toggle Chat panel",
-    badge: None,
-    enabled: None,
-    run: |s| toggle_panel(s, crate::tab::PANEL_CHAT),
-    category: ActionCategory::Panel,
-};
-
 static ALL: &[&Action] = &[
     &A_NAV_BACK,
     &A_NAV_FORWARD,
@@ -685,15 +615,13 @@ static ALL: &[&Action] = &[
     &A_VAULT_INDEXER,
     &A_VAULT_GRAPH,
     &A_VAULT_PATCH_REVIEW,
-    &A_VAULT_CHANGES,
-    &A_CHAT_NEW,
+    &A_VAULT_GIT_DIFF,
     &A_PANEL_TOGGLE_FILES,
     &A_PANEL_TOGGLE_CLUSTERS,
     &A_PANEL_TOGGLE_TRAILS,
     &A_PANEL_TOGGLE_SEARCH,
     &A_PANEL_TOGGLE_RELATED,
     &A_PANEL_TOGGLE_BACKLINKS,
-    &A_PANEL_TOGGLE_CHAT,
     &A_VIEW_TOGGLE_HELP,
     &A_VIEW_TOGGLE_PROFILER,
     &A_VIEW_TOGGLE_LEFT_SIDEBAR,

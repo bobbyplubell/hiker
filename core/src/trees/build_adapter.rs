@@ -41,7 +41,7 @@ pub fn persist(
         .map_err(|e| BuildError::Summarizer(format!("method serialize: {e}")))?;
     let inserts = node_inserts(&result.tree);
     // Single atomic write: tree + nodes together. The old insert_tree (empty)
-    // → insert_nodes two-step landed nodes as an op-log diff of the empty→full
+    // → insert_nodes two-step landed nodes as a layered-doc diff of the empty→full
     // frontmatter, which could corrupt the `nodes:` block. status:
     // cluster-review-tab-confirm-single-path
     let tree_id = trees
@@ -103,7 +103,7 @@ pub fn rebuild_and_persist(
         .map_err(|e| BuildError::Summarizer(format!("method serialize: {e}")))?;
     // Tree row is created together with its nodes in one atomic write at the
     // end (after merge-preservation rewrites the inserts) so there is never an
-    // empty-nodes intermediate, and the nodes never land as an op-log diff of
+    // empty-nodes intermediate, and the nodes never land as a layered-doc diff of
     // the empty→full frontmatter. status: cluster-review-tab-confirm-single-path
     let new_tree = TreeInsert {
         id: None,
@@ -443,7 +443,7 @@ mod tests {
     fn build_and_persist_writes_rows() {
         let dir = tempfile::TempDir::new().unwrap();
         let trees = Db::new(
-            Arc::new(crate::oplog::OpLog::open(dir.path()).unwrap()),
+            Arc::new(crate::editing::LayeredDoc::open(dir.path()).unwrap()),
             Arc::new(crate::vault::Vault::open(dir.path()).unwrap()),
         )
         .unwrap();

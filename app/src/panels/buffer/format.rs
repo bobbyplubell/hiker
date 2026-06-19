@@ -6,7 +6,7 @@
 //! [`Rewrite`] (a single byte-range replacement plus where the selection should
 //! land), so they're unit-tested without an editor. [`apply`] turns a `Rewrite`
 //! into an editor [`Transaction`], applies it to the buffer, and mirrors it into
-//! the op-log `working` layer via [`super::editor_binding::run`] — the same path
+//! the layered-doc `working` layer via [`super::editor_binding::run`] — the same path
 //! a keystroke takes — so a formatting click is just another user edit.
 //!
 //! Highlight uses `==text==` and text color uses an HTML
@@ -158,7 +158,7 @@ fn sel_range(app: &AppState, path: &str) -> Option<(String, Range<usize>)> {
 }
 
 /// Apply a [`Rewrite`] to the buffer as a user edit: build the transaction,
-/// apply it to `editor`, then run the op-log binding with that transaction so
+/// apply it to `editor`, then run the layered-doc binding with that transaction so
 /// the edit lands on the `working` layer exactly like a keystroke would.
 fn apply(app: &mut AppState, path: &str, rw: Rewrite) {
     let txn = {

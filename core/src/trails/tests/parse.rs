@@ -76,18 +76,6 @@ fn parse_trail_doc_round_trips_empty_tree() {
     assert_eq!(parsed, reparsed);
 }
 
-// status: trail-path-references
-#[test]
-fn parse_trail_doc_drops_legacy_id_halves_on_parse() {
-    // Legacy yaml with `id:` siblings on entries (pre-path-as-identity);
-    // the parser drops the id half but keeps the path.
-    let src = "---\nhiker:\n  kind: trail\n  id: 01HLEGACY\n  waypoints:\n    - id: A\n      path: a.md\n    - id: B\n      path: b.md\n---\n";
-    let parsed = parse_trail_doc(src).unwrap();
-    assert_eq!(parsed.waypoints.len(), 2);
-    assert_eq!(parsed.waypoints[0].path, "a.md");
-    assert_eq!(parsed.waypoints[1].path, "b.md");
-}
-
 // status: trail-side-trail-shape / trail-path-references
 #[test]
 fn walk_waypoints_yields_depth_first_with_tree_paths() {
@@ -157,17 +145,6 @@ fn write_trail_doc_preserves_unknown_hiker_siblings() {
     let written = write_trail_doc_frontmatter(src, &parsed).unwrap();
     assert!(written.contains("author: user-authored"));
     assert!(written.contains("provenance: user"));
-}
-
-// status: trail-doc-shape — rewriting a legacy trail-doc that carried
-// `hiker.id` drops the stale field.
-#[test]
-fn write_trail_doc_strips_legacy_hiker_id() {
-    let src = "---\nhiker:\n  kind: trail\n  id: 01HLEGACY\n  waypoints: []\n---\nbody\n";
-    let parsed = parse_trail_doc(src).unwrap();
-    let written = write_trail_doc_frontmatter(src, &parsed).unwrap();
-    assert!(!written.contains("01HLEGACY"));
-    assert!(!written.contains("\n  id:"));
 }
 
 // status: trail-empty-waypoint-body

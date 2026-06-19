@@ -1,14 +1,14 @@
 //! Canvas rename-rewrite: when a referenced note moves, rewrite the
 //! `file` path of every JSON Canvas File node that pointed at it.
 //!
-//! A `.canvas` file is a first-class op-log document (`canvas-doc-kind`) but,
+//! A `.canvas` file is a first-class layered-doc document (`canvas-doc-kind`) but,
 //! unlike boards, it has no derived index table (`board-cards-derived-table`)
 //! to enumerate referrers from — that projection is deferred
 //! (`canvas-search-index`). So this sweep walks the vault for `.canvas` files,
 //! parses each with [`hiker_canvas::model::Canvas::from_json`], runs the pure
 //! [`Canvas::rewrite_file_refs`] helper, and persists any change through the
-//! SAME op-log user-save path the boards rename branch uses — so the rewrite
-//! is a versioned, mergeable, syncable op in the same transaction.
+//! SAME layered-doc user-save path the boards rename branch uses — so the rewrite
+//! is a versioned, mergeable edit in the same transaction.
 //!
 //! Best-effort, mirroring the boards / trails posture: a `.canvas` that fails
 //! to parse is skipped, a single write failure is logged and the rest of the
@@ -22,7 +22,7 @@ pub mod export;
 
 use crate::errors::HikerError;
 use crate::indexer::{IndexJob, IndexJobTx};
-use crate::oplog::OpLog;
+use crate::editing::LayeredDoc;
 use crate::vault::Vault;
 use crate::watcher::Watcher;
 
@@ -36,7 +36,7 @@ use crate::watcher::Watcher;
 pub async fn on_note_moved(
     watcher: Option<&Watcher>,
     jobs: Option<&IndexJobTx>,
-    log: Option<&OpLog>,
+    log: Option<&LayeredDoc>,
     vault: &Vault,
     from: &str,
     to: &str,
@@ -133,7 +133,7 @@ fn walk_canvas_files(vault: &Vault) -> Result<Vec<String>, HikerError> {
 /// `RewriteCtx`. Bundling the optional handles keeps `rewrite_file_ref` a
 /// method under the argument-count budget.
 struct RewriteCtx<'a> {
-    log: Option<&'a OpLog>,
+    log: Option<&'a LayeredDoc>,
     jobs: Option<&'a IndexJobTx>,
     watcher: Option<&'a Watcher>,
     vault: &'a Vault,
@@ -144,7 +144,7 @@ impl RewriteCtx<'_> {
     /// from` to `to`, and persist. Returns `true` when a rewrite landed.
     /// A `.canvas` that fails to parse is skipped (returns `Ok(false)`) so a
     /// single malformed canvas never aborts the sweep. Persistence goes
-    /// through the op-log user-save path when a log is attached, matching the
+    /// through the layered-doc user-save path when a log is attached, matching the
     /// boards branch; without a log it falls back to a suppressed
     /// `write_file` for CLI / test paths.
     async fn rewrite_file_ref(

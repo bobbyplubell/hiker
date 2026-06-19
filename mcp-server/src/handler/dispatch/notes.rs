@@ -86,22 +86,22 @@ impl App {
         ))
     }
 
-    /// The note content the agent should see on a read: its own op-log
+    /// The note content the agent should see on a read: its own layered-doc
     /// replica — `materialize_pending_view(session = agent)`, i.e. accepted
     /// plus the agent's own queued pending ops — so a follow-up `get_note`
     /// reflects edits the agent just staged, even before the user accepts
-    /// them (`op-log-agent-replica`). Returns `Ok(None)` when there is no op
-    /// log or the path has no doc yet, so callers fall back to on-disk bytes.
+    /// them (`op-log-agent-replica`). Returns `Ok(None)` when there is no layered
+    /// doc or the path has no doc yet, so callers fall back to on-disk bytes.
     pub(super) fn agent_view_content(&self, rel: &str) -> Result<Option<(String, String)>, ErrorData> {
-        let Some(op_log) = self.state.oplog.as_ref() else {
+        let Some(layered) = self.state.layered.as_ref() else {
             return Ok(None);
         };
         // `review_materializations` resolves the path → doc_id and returns
         // `(accepted, pending_view(session))`; the pending view scoped to the
         // agent's own session is the agent replica. `None` when the path has
-        // no op-log doc yet.
+        // no layered-doc doc yet.
         let Some((_accepted, pending_view)) =
-            op_writes::review_materializations(op_log, rel, Some(CLIENT_ID))
+            op_writes::review_materializations(layered, rel, Some(CLIENT_ID))
                 .map_err(translate_hiker_err)?
         else {
             return Ok(None);
@@ -235,19 +235,19 @@ impl App {
     }
 
     /// Stage a whole-body rewrite (`write_note` / `set_frontmatter` /
-    /// `apply_tag` / `remove_tag` review shapes) as one anchorless op-log
+    /// `apply_tag` / `remove_tag` review shapes) as one anchorless layered-doc
     /// pending op authored `agent:<client_id>`, returning the minted op id
-    /// for the tool's `proposal_id` field. The op-log diffs the new text
+    /// for the tool's `proposal_id` field. The layered doc diffs the new text
     /// against current accepted, so an unchanged whole-body produces no op
     /// (returns `None`).
     pub(super) fn stage_whole_body(
         &self,
-        op_log: &hiker_core::oplog::OpLog,
+        layered: &hiker_core::editing::LayeredDoc,
         rel_path: &str,
         new_content: &str,
     ) -> Result<Option<String>, ErrorData> {
         let outcome = op_writes::stage_agent_edits(
-            op_log,
+            layered,
             &self.state.vault,
             CLIENT_ID,
             "mcp-tool-call",
@@ -274,16 +274,16 @@ impl App {
 
         if review_required {
             // Review mode: stage the whole-body rewrite as one anchorless
-            // op-log pending op (`write_note` → whole-body `Replace`), the
-            // same op-log review path `edit_note` uses. Nothing reaches disk
+            // layered-doc pending op (`write_note` → whole-body `Replace`), the
+            // same layered-doc review path `edit_note` uses. Nothing reaches disk
             // until the user accepts; the returned op id is the review handle.
-            let op_log = self.state.oplog.as_ref().ok_or_else(|| {
+            let layered = self.state.layered.as_ref().ok_or_else(|| {
                 ErrorData::internal_error(
                     "review mode requires an open op log".to_string(),
                     None,
                 )
             })?;
-            let proposal_id = self.stage_whole_body(op_log, &p.rel_path, &p.content)?;
+            let proposal_id = self.stage_whole_body(layered, &p.rel_path, &p.content)?;
             Ok(structured(
                 serde_json::to_value(WriteOutcome {
                     rel_path: p.rel_path.clone(),
@@ -298,7 +298,7 @@ impl App {
                 watcher: &self.state.watcher,
                 jobs: &self.state.jobs,
                 vault: &self.state.vault,
-                op_log: self.state.oplog.as_ref(),
+                layered: self.state.layered.as_ref(),
                 client_id: CLIENT_ID,
             };
             let new_hash = ops::agent::write_note(
@@ -346,11 +346,11 @@ impl App {
         }
 
         // Read the pre-application content once; every anchor resolves against
-        // it (rule 4). This is the agent's own op-log replica — accepted plus
+        // it (rule 4). This is the agent's own layered-doc replica — accepted plus
         // the agent's queued pending ops — the same view `get_note` returns, so
         // a follow-up edit can anchor on text the agent staged in a prior,
         // not-yet-accepted edit (`op-log-agent-replica`). Falls back to disk
-        // when the path has no op-log doc.
+        // when the path has no layered-doc doc.
         let (pre_content, pre_hash) = match self.agent_view_content(&p.rel_path)? {
             Some(cv) => cv,
             None => self
@@ -421,11 +421,11 @@ impl App {
             .unwrap_or(false);
 
         if review_required {
-            // Review mode: stage the edits as op-log pending ops sharing a
+            // Review mode: stage the edits as layered-doc pending ops sharing a
             // batch_id (per `op-log.md`'s `edit_note([e1,e2,…])` → one
             // `Replace` per edit). Each edit becomes one anchored
             // `AgentEdit { old_str, new_str }`; accept/reject each
-            // independently flow through the op-log review surfaces re-homed
+            // independently flow through the layered-doc review surfaces re-homed
             // in Phases 3b–3d. A `replace_all` edit with more than one match
             // can't be expressed as a single anchored op (the anchor must
             // resolve uniquely), so the whole call collapses to one anchorless
@@ -434,7 +434,7 @@ impl App {
             //
             // status: mcp-tool-edit-note
             // status: op-log-ops-producer-helpers
-            let op_log = self.state.oplog.as_ref().ok_or_else(|| {
+            let layered = self.state.layered.as_ref().ok_or_else(|| {
                 ErrorData::internal_error(
                     "review mode requires an open op log".to_string(),
                     None,
@@ -466,7 +466,7 @@ impl App {
                     .collect()
             };
             let outcome = op_writes::stage_agent_edits(
-                op_log,
+                layered,
                 &self.state.vault,
                 CLIENT_ID,
                 "mcp-tool-call",
@@ -506,7 +506,7 @@ impl App {
             watcher: &self.state.watcher,
             jobs: &self.state.jobs,
             vault: &self.state.vault,
-            op_log: self.state.oplog.as_ref(),
+            layered: self.state.layered.as_ref(),
             client_id: CLIENT_ID,
         };
         let new_hash = ops::agent::write_note(
@@ -546,10 +546,10 @@ impl App {
 
         if review_required {
             // Review mode: merge the frontmatter patch into the current
-            // content and stage the whole-body result as one op-log pending
-            // op. The op-log labels it `SetFrontmatter` automatically when the
+            // content and stage the whole-body result as one layered-doc pending
+            // op. The layered doc labels it `SetFrontmatter` automatically when the
             // change lands inside the frontmatter fence.
-            let op_log = self.state.oplog.as_ref().ok_or_else(|| {
+            let layered = self.state.layered.as_ref().ok_or_else(|| {
                 ErrorData::internal_error(
                     "review mode requires an open op log".to_string(),
                     None,
@@ -565,7 +565,7 @@ impl App {
                 serde_json::Value::Object(p.fields.clone()),
             )
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-            let proposal_id = self.stage_whole_body(op_log, &p.rel_path, &merged)?;
+            let proposal_id = self.stage_whole_body(layered, &p.rel_path, &merged)?;
             Ok(structured(
                 serde_json::to_value(WriteOutcome {
                     rel_path: p.rel_path.clone(),
@@ -580,7 +580,7 @@ impl App {
                 watcher: &self.state.watcher,
                 jobs: &self.state.jobs,
                 vault: &self.state.vault,
-                op_log: self.state.oplog.as_ref(),
+                layered: self.state.layered.as_ref(),
                 client_id: CLIENT_ID,
             };
             let new_hash = ops::agent::set_frontmatter(
@@ -620,11 +620,11 @@ impl App {
 
         if review_required {
             // Review mode: resolve the new tag list, merge into frontmatter,
-            // and stage the whole-body result as one op-log pending op (same
+            // and stage the whole-body result as one layered-doc pending op (same
             // merge-into-write shape as the direct path, but staged for
-            // review). The op-log labels it `SetFrontmatter` when the change
+            // review). The layered doc labels it `SetFrontmatter` when the change
             // lands inside the frontmatter fence.
-            let op_log = self.state.oplog.as_ref().ok_or_else(|| {
+            let layered = self.state.layered.as_ref().ok_or_else(|| {
                 ErrorData::internal_error(
                     "review mode requires an open op log".to_string(),
                     None,
@@ -659,7 +659,7 @@ impl App {
                 serde_json::json!({"tags": tags}),
             )
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-            let proposal_id = self.stage_whole_body(op_log, &p.rel_path, &merged)?;
+            let proposal_id = self.stage_whole_body(layered, &p.rel_path, &merged)?;
             Ok(structured(
                 serde_json::to_value(WriteOutcome {
                     rel_path: p.rel_path.clone(),
@@ -674,7 +674,7 @@ impl App {
                 watcher: &self.state.watcher,
                 jobs: &self.state.jobs,
                 vault: &self.state.vault,
-                op_log: self.state.oplog.as_ref(),
+                layered: self.state.layered.as_ref(),
                 client_id: CLIENT_ID,
             };
             let result = if add {

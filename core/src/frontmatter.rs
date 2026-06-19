@@ -256,10 +256,14 @@ fn flatten_into(key: &str, value: &YamlValue, out: &mut Vec<FlatField>) {
 }
 
 /// A single scalar YAML value as a `FlatField`, or `None` for null / nested
-/// / over-long values.
+/// / over-long values. ISO-date-shaped strings mirror their epoch seconds
+/// into `num` (the value string stays verbatim) so date range filters and
+/// ordering ride the same numeric mirror as YAML numbers — see
+/// `docs/queries.md` §"Filter grammar". Rows indexed before this extension
+/// pick the mirror up on their next re-ingest or a forced reindex.
 fn scalar_field(key: &str, value: &YamlValue) -> Option<FlatField> {
     let (value, num) = match value {
-        YamlValue::String(s) => (s.clone(), None),
+        YamlValue::String(s) => (s.clone(), iso_date_epoch(s)),
         YamlValue::Bool(b) => ((*b).to_string(), Some(if *b { 1.0 } else { 0.0 })),
         YamlValue::Number(n) => (n.to_string(), n.as_f64()),
         // Null, and nested map/seq that slipped through, are not indexed.
@@ -273,6 +277,102 @@ fn scalar_field(key: &str, value: &YamlValue) -> Option<FlatField> {
         value,
         num,
     })
+}
+
+/// Epoch seconds for an ISO-8601 date or datetime string, or `None` when
+/// `s` isn't date-shaped. Accepted forms: `YYYY-MM-DD` (midnight UTC),
+/// optionally followed by `THH:MM` or `THH:MM:SS` and an optional `Z` /
+/// `+HH:MM` / `-HH:MM` offset (absent = UTC). Whole-string match only, so
+/// date-prefixed identifiers (`2026-07-01-draft`) are never mirrored.
+/// Hand-rolled (days-from-civil) rather than pulling a parsing feature
+/// into the `time` dependency for one fixed format.
+pub fn iso_date_epoch(s: &str) -> Option<f64> {
+    let (y, m, d) = parse_ymd(s.get(..10)?)?;
+    let mut secs = days_from_civil(y, m, d).checked_mul(86_400)?;
+    let rest = &s[10..];
+    if !rest.is_empty() {
+        let rest = rest.strip_prefix(['T', 't'])?;
+        let (hms, offset) = split_time_offset(rest)?;
+        secs = secs.checked_add(parse_hms(hms)?)?.checked_sub(offset)?;
+    }
+    // f64 represents every epoch value in the civil-date range exactly.
+    Some(secs as f64)
+}
+
+/// Parse a strict `YYYY-MM-DD` (range-checked, real calendar day).
+fn parse_ymd(s: &str) -> Option<(i64, u32, u32)> {
+    let b = s.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let y = digits(&s[..4])?;
+    let m = u32::try_from(digits(&s[5..7])?).ok()?;
+    let d = u32::try_from(digits(&s[8..10])?).ok()?;
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let max_d = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    (d >= 1 && d <= max_d).then_some((y, m, d))
+}
+
+/// All-digit string to i64, `None` on any non-digit.
+fn digits(s: &str) -> Option<i64> {
+    if s.is_empty() || !s.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+/// Split `HH:MM[:SS]<offset>` into the clock part and the offset's signed
+/// seconds (`Z`/empty = 0). The whole tail must be consumed.
+fn split_time_offset(rest: &str) -> Option<(&str, i64)> {
+    if let Some(hms) = rest.strip_suffix(['Z', 'z']) {
+        return Some((hms, 0));
+    }
+    if let Some(idx) = rest.rfind(['+', '-']) {
+        let off = &rest[idx + 1..];
+        let b = off.as_bytes();
+        if b.len() != 5 || b[2] != b':' {
+            return None;
+        }
+        let oh = digits(&off[..2])?;
+        let om = digits(&off[3..])?;
+        if oh > 23 || om > 59 {
+            return None;
+        }
+        let sign = if rest.as_bytes()[idx] == b'-' { -1 } else { 1 };
+        return Some((&rest[..idx], sign * (oh * 3600 + om * 60)));
+    }
+    Some((rest, 0))
+}
+
+/// Seconds since midnight for `HH:MM` or `HH:MM:SS`.
+fn parse_hms(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    let (h, m, sec) = match b.len() {
+        5 if b[2] == b':' => (digits(&s[..2])?, digits(&s[3..5])?, 0),
+        8 if b[2] == b':' && b[5] == b':' => {
+            (digits(&s[..2])?, digits(&s[3..5])?, digits(&s[6..8])?)
+        }
+        _ => return None,
+    };
+    (h <= 23 && m <= 59 && sec <= 59).then_some(h * 3600 + m * 60 + sec)
+}
+
+/// Days since the 1970-01-01 epoch for a civil date (Howard Hinnant's
+/// `days_from_civil` algorithm; exact over the whole proleptic Gregorian
+/// calendar).
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = i64::from((153 * ((m + 9) % 12) + 2) / 5 + d - 1);
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -365,6 +465,51 @@ mod tests {
         let tags: Vec<String> = get("tags").into_iter().map(|f| f.value).collect();
         assert_eq!(tags, vec!["project".to_string(), "rust".to_string()]);
         assert_eq!(get("hiker.author")[0].value, "user-authored");
+    }
+
+    #[test]
+    fn iso_date_epoch_accepts_dates_and_datetimes() {
+        // Date-only = midnight UTC (reference values from python datetime).
+        assert_eq!(iso_date_epoch("2026-07-01"), Some(1_782_864_000.0));
+        assert_eq!(iso_date_epoch("1970-01-01"), Some(0.0));
+        assert_eq!(iso_date_epoch("2000-02-29"), Some(951_782_400.0)); // leap day
+        assert_eq!(iso_date_epoch("1969-12-31"), Some(-86_400.0)); // pre-epoch
+        // Datetimes, with and without seconds / offsets.
+        assert_eq!(iso_date_epoch("2026-07-01T12:30:00Z"), Some(1_782_909_000.0));
+        assert_eq!(iso_date_epoch("2026-07-01T12:30+02:00"), Some(1_782_901_800.0));
+        assert_eq!(iso_date_epoch("2026-07-01T12:30:00"), Some(1_782_909_000.0));
+    }
+
+    #[test]
+    fn iso_date_epoch_rejects_non_dates() {
+        for s in [
+            "not-a-date",
+            "2026-13-01",       // month out of range
+            "2026-02-30",       // day out of range
+            "2001-02-29",       // not a leap year
+            "2026-1-1",         // not zero-padded
+            "2026-07-01-draft", // date-prefixed identifier
+            "2026-07-01T25:00", // hour out of range
+            "2026-07-01 12:30", // space separator not accepted
+            "20260701",
+            "",
+        ] {
+            assert_eq!(iso_date_epoch(s), None, "{s:?} must not parse");
+        }
+    }
+
+    #[test]
+    fn flatten_mirrors_iso_dates_into_num() {
+        let src = "---\ndue: \"2026-07-01\"\nstatus: active\n---\nbody\n";
+        let fm = split(src).frontmatter.unwrap();
+        let fields = flatten(&fm);
+        let due = fields.iter().find(|f| f.key == "due").unwrap();
+        // Value stays the verbatim string; num carries the epoch mirror.
+        assert_eq!(due.value, "2026-07-01");
+        assert_eq!(due.num, Some(1_782_864_000.0));
+        // Non-date strings keep a NULL mirror.
+        let status = fields.iter().find(|f| f.key == "status").unwrap();
+        assert_eq!(status.num, None);
     }
 
     #[test]

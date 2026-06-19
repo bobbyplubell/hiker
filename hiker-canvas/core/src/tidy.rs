@@ -100,6 +100,8 @@ pub fn auto_arrange(canvas: &Canvas, opts: ArrangeOpts) -> Vec<EditOp> {
         nodesep: opts.nodesep,
         edgesep: 20.0,
         default_node_size: Vec2::new(50.0, 50.0),
+        // Beyond-dagre crossing cleanup (legibility; see order::transpose).
+        transpose: true,
     };
     let out = engine.layout(&GraphInput {
         node_count: plan.node_count(),

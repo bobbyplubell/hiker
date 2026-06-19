@@ -467,6 +467,7 @@ pub fn node_card_cached(
         view,
         signature,
         dark: ui.visuals().dark_mode,
+        dpr: ui.ctx().pixels_per_point(),
         interacting,
     };
     // The cache emits onto the central layer's painter (where the body shapes

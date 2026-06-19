@@ -14,10 +14,9 @@ use crate::chunker::markdown::Markdown;
 use crate::chunker::txt::Txt;
 use crate::embed::{Embedder, Error as EmbedError, FastembedEmbedder};
 use crate::hash_string;
-use crate::oplog::OpLog;
+use crate::editing::LayeredDoc;
 use crate::store::dto::{MetaEntry, NoteUpsert};
 use crate::store::Store;
-use crate::watcher::is_ignored;
 
 // Only the most heavily-used parent items are imported; the rest are reached
 // via explicit `super::` paths at their use sites so this file doesn't lean on
@@ -39,9 +38,13 @@ pub(super) struct JobCtx<'a> {
     pub pending: &'a Arc<Mutex<HashSet<String>>>,
     pub self_tx: &'a super::IndexJobTx,
     pub watcher_cell: &'a Arc<OnceCell<Arc<crate::watcher::Watcher>>>,
-    pub oplog_cell: &'a Arc<OnceCell<Arc<crate::oplog::OpLog>>>,
+    pub layered_cell: &'a Arc<OnceCell<Arc<crate::editing::LayeredDoc>>>,
     /// status: inbox-rules
     pub inbox_cell: &'a Arc<OnceCell<Arc<crate::inbox::Rules>>>,
+    /// status: kind-lenient-validation
+    pub kinds_cell: &'a Arc<OnceCell<Arc<crate::kinds::Registry>>>,
+    /// status: rule-triggers
+    pub rules_cell: &'a Arc<OnceCell<Arc<crate::rules::Engine>>>,
 }
 
 /// Subset of `JobCtx` used by handlers that don't need the trails /
@@ -51,12 +54,15 @@ pub(super) struct UpsertCtx<'a> {
     pub embedder: &'a Arc<dyn Embedder>,
     pub progress: &'a broadcast::Sender<ProgressEvent>,
     pub status: &'a watch::Sender<super::IndexStatus>,
-    /// Cell holding the vault's `OpLog` once `attach_oplog` runs. Per
+    /// Cell holding the vault's `LayeredDoc` once `attach_layered` runs. Per
     /// `op-log-bootstraps-first`, this is populated before the indexer
     /// processes any jobs in the steady state, so handlers read it via
-    /// `oplog_cell.get()` to translate vault paths to `doc_id` for
+    /// `layered_cell.get()` to translate vault paths to `doc_id` for
     /// `notes.id`. status: store-path-is-identity
-    pub oplog_cell: &'a Arc<OnceCell<Arc<OpLog>>>,
+    pub layered_cell: &'a Arc<OnceCell<Arc<LayeredDoc>>>,
+    /// Compiled kind registry for lenient per-note validation, when the
+    /// host attached one. status: kind-lenient-validation
+    pub kinds_cell: &'a Arc<OnceCell<Arc<crate::kinds::Registry>>>,
 }
 
 impl<'a> JobCtx<'a> {
@@ -69,34 +75,48 @@ impl<'a> JobCtx<'a> {
             embedder: self.embedder,
             progress: self.progress,
             status: self.status,
-            oplog_cell: self.oplog_cell,
+            layered_cell: self.layered_cell,
+            kinds_cell: self.kinds_cell,
         }
     }
 
-    async fn handle_upsert(&self, store: &mut Store, rel_path: String, force: bool) {
+    async fn handle_upsert(
+        &self,
+        store: &mut Store,
+        rel_path: String,
+        force: bool,
+        created: bool,
+    ) {
         let progress = self.progress;
         let status = self.status;
         let pending = self.pending;
         // Make sure the path is in the pending set even if it didn't go
-        // through a tracking sender (e.g. enqueued by some legacy path);
+        // through a tracking sender;
         // remove on every terminal outcome below.
         pending.lock().unwrap().insert(rel_path.clone());
         let _ = progress.send(ProgressEvent::Started { path: rel_path.clone() });
-        let oplog = self.oplog_cell.get().cloned();
+        let layered = self.layered_cell.get().cloned();
+        let kinds = self.kinds_cell.get().cloned();
         let outcome = process_upsert(
             self.vault_root,
             store,
             self.embedder.clone(),
-            oplog.as_deref(),
+            layered.as_deref(),
+            kinds.as_deref(),
             &rel_path,
             force,
         )
         .await;
         pending.lock().unwrap().remove(&rel_path);
         match outcome {
-            Ok(UpsertOutcome::Indexed) => {
+            Ok(UpsertOutcome::Indexed(events)) => {
                 tracing::debug!(path = %rel_path, "indexer: file indexed");
-                let _ = progress.send(ProgressEvent::Finished { path: rel_path });
+                let _ = progress.send(ProgressEvent::Finished { path: rel_path.clone() });
+                // status: rule-triggers
+                // The rule pass hooks in post-index, right after the derived
+                // tables the triggers watch have been re-derived — on the
+                // indexer task, the single-writer discipline.
+                self.run_rule_pass(store, &rel_path, created, events);
             }
             Ok(UpsertOutcome::Unchanged) => {
                 let _ = progress.send(ProgressEvent::Skipped {
@@ -136,9 +156,9 @@ impl<'a> JobCtx<'a> {
         // status: store-path-is-identity
         // Rename targets the `notes.path UNIQUE` row directly. False means
         // the source path was never indexed; treat the destination as a
-        // fresh upsert. The op-log's `doc-index.db` rename happens through
-        // `record_oplog_rename` on the Move/MoveFolder paths; watcher-
-        // driven external renames here don't touch the op-log directly —
+        // fresh upsert. The layered doc's `doc-index.db` rename happens through
+        // `record_layered_rename` on the Move/MoveFolder paths; watcher-
+        // driven external renames here don't touch the layered doc directly —
         // a subsequent ingest re-reads `doc_id` from the (already updated
         // or freshly minted) `doc-index.db` row.
         let process_result: Result<bool, Error> =
@@ -152,10 +172,14 @@ impl<'a> JobCtx<'a> {
                 // status: wikilink-rename-rewrite
                 // Watcher-driven external rename: run the shared
                 // referrer-rewrite pass (trails + boards + wikilinks).
-                crate::links_rename::on_note_moved(
-                    watcher_cell, self.oplog_cell, self_tx, vault, store, &from, &to,
-                )
-                .await;
+                let sweep = crate::links_rename::RenameSweepCtx {
+                    watcher_cell,
+                    layered_cell: self.layered_cell,
+                    kinds_cell: self.kinds_cell,
+                    jobs: self_tx,
+                    vault,
+                };
+                crate::links_rename::on_note_moved(&sweep, store, &from, &to).await;
             }
             Ok(false) => {
                 let upsert_ctx = self.as_upsert_ctx();
@@ -178,6 +202,89 @@ impl<'a> JobCtx<'a> {
             }
         }
     }
+
+    /// Run the vault-rules pass for one ingested path (`docs/rules.md`):
+    /// fold in the `note-created` event when this ingest came from the
+    /// watcher's create path, then hand the detected events to the engine.
+    /// A no-op without an attached engine (CLI / tests).
+    ///
+    /// status: rule-triggers
+    fn run_rule_pass(
+        &self,
+        store: &Store,
+        rel_path: &str,
+        created: bool,
+        mut events: Vec<crate::rules::RuleEvent>,
+    ) {
+        if created {
+            events.push(crate::rules::RuleEvent::NoteCreated {
+                path: rel_path.to_string(),
+            });
+        }
+        if events.is_empty() {
+            return;
+        }
+        self.with_rules_engine(store, |engine, fire| engine.on_events(fire, &events));
+    }
+
+    /// Assemble a `FireCtx` from the job context and run `op` with it,
+    /// enqueueing a re-index for every path whose staged firing was
+    /// applied (non-blocking — a full queue defers to the ambient watcher
+    /// route). No-op when no engine / layered doc is attached or no rules are
+    /// registered.
+    ///
+    /// Each successfully enqueued path is also registered for watcher
+    /// self-write suppression (`watcher-suppress-self-writes`, the
+    /// `ops::file` suppress-then-Upsert discipline): the firing's layered-doc
+    /// accept already rewrote the `.md`, and the explicit job here is the
+    /// ingest path, so the watcher echo would only queue a duplicate
+    /// upsert and a redundant external-edit reconcile. A path whose
+    /// enqueue FAILED is deliberately left unsuppressed — the ambient
+    /// watcher route is then the only ingest path, and suppressing it
+    /// would leave the index stale until the next scan.
+    ///
+    /// status: rule-triggers
+    fn with_rules_engine(
+        &self,
+        store: &Store,
+        op: impl FnOnce(&crate::rules::Engine, &crate::rules::FireCtx<'_>) -> Vec<String>,
+    ) {
+        let Some(engine) = self.rules_cell.get() else { return };
+        if engine.is_empty() {
+            return;
+        }
+        let Some(log) = self.layered_cell.get() else { return };
+        let fallback;
+        let kinds: &crate::kinds::Registry = match self.kinds_cell.get() {
+            Some(registry) => registry,
+            None => {
+                fallback = crate::kinds::Registry::empty();
+                &fallback
+            }
+        };
+        let fire = crate::rules::FireCtx {
+            vault: self.vault,
+            store,
+            log,
+            kinds,
+        };
+        for rel in op(engine, &fire) {
+            match self.self_tx.try_upsert(rel.clone(), false) {
+                Ok(()) => {
+                    if let Some(watcher) = self.watcher_cell.get() {
+                        watcher.suppress(rel);
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        path = %rel,
+                        "rules: re-index enqueue deferred to the watcher route",
+                    );
+                }
+            }
+        }
+    }
 }
 
 impl<'a> UpsertCtx<'a> {
@@ -192,21 +299,21 @@ impl<'a> UpsertCtx<'a> {
         let trash = crate::trash::Trash::open(vault.root());
         match crate::vault::restore_note(vault, None, &trash, id) {
             Ok(entry) => {
-                // History-preserving restore: when the trashed entry references
-                // an op-log `doc_id` (a tracked note whose `.ops` history was
+                // Identity-preserving restore: when the trashed entry references
+                // a layered-doc `doc_id` (a tracked note whose doc was
                 // retained, not purged, on delete), rebind `path → doc_id` to
                 // that retained doc and clear its tombstone so the document
-                // comes back with its full change history rather than as a
+                // comes back under its original identity rather than as a
                 // brand-new import. An entry with no `doc_id` (hand-dropped
                 // file, never-seeded note, or folder — whose members rebind by
                 // path on re-ingest) takes the existing fresh-import path.
                 // status: vault-trash-restore
-                record_oplog_restore(self.oplog_cell, &entry);
+                record_layered_restore(self.layered_cell, &entry);
                 // Re-ingest the restored .md files inline so the index
                 // picks them up without waiting on watcher events
                 // (which the caller suppressed). For folders, walk
                 // the manifest's recorded members; for files, just the
-                // single original_path. Because `notes.id` == the op-log
+                // single original_path. Because `notes.id` == the layered-doc
                 // `doc_id` (`store-path-is-identity`), re-ingest reattaches
                 // fresh chunks/embeddings under the rebound identity.
                 let to_index: Vec<String> = match &entry.members {
@@ -429,10 +536,17 @@ pub(super) async fn handle_simple_job(
         // status: inbox-rules
         IndexJob::Created { rel_path } => {
             let final_path = run_inbox_rules(ctx, store, &rel_path).await;
-            ctx.handle_upsert(store, final_path, false).await;
+            // status: rule-triggers
+            // The watcher's create event IS the `note-created` seam: the
+            // upsert below is the note's first ingest, post-inbox-rules, so
+            // the vault-rules pass sees the note where the inbox rule left
+            // it (`rule-inbox-relation`). FullScan upserts never carry the
+            // created flag — a fresh index over an existing vault is not a
+            // wave of note creations.
+            ctx.handle_upsert(store, final_path, false, true).await;
         }
         IndexJob::Upsert { rel_path, force } => {
-            ctx.handle_upsert(store, rel_path, force).await;
+            ctx.handle_upsert(store, rel_path, force, false).await;
         }
         IndexJob::Delete { rel_path } => match process_delete(store, &rel_path) {
             Ok(true) => {
@@ -469,7 +583,14 @@ pub(super) async fn handle_simple_job(
             // partial referrer update can't fail the move's reply.
             let reply_result = match move_result {
                 Ok(companion_members) => {
-                    record_oplog_rename(ctx.oplog_cell, &from, &to);
+                    record_layered_rename(ctx.layered_cell, &from, &to);
+                    let sweep = crate::links_rename::RenameSweepCtx {
+                        watcher_cell,
+                        layered_cell: ctx.layered_cell,
+                        kinds_cell: ctx.kinds_cell,
+                        jobs: self_tx,
+                        vault,
+                    };
                     // status: note-companion-folder
                     // Run the companion-folder members FIRST: each member's
                     // pass updates the derived `trail_waypoints.waypoint_path`
@@ -478,16 +599,10 @@ pub(super) async fn handle_simple_job(
                     // below then reads the *fresh* waypoint paths when
                     // rewriting each waypoint's `hiker.in_trail`.
                     for (old, new) in &companion_members {
-                        record_oplog_rename(ctx.oplog_cell, old, new);
-                        crate::links_rename::on_note_moved(
-                            watcher_cell, ctx.oplog_cell, self_tx, vault, store, old, new,
-                        )
-                        .await;
+                        record_layered_rename(ctx.layered_cell, old, new);
+                        crate::links_rename::on_note_moved(&sweep, store, old, new).await;
                     }
-                    crate::links_rename::on_note_moved(
-                        watcher_cell, ctx.oplog_cell, self_tx, vault, store, &from, &to,
-                    )
-                    .await;
+                    crate::links_rename::on_note_moved(&sweep, store, &from, &to).await;
                     Ok(())
                 }
                 Err(e) => Err(e),
@@ -512,12 +627,16 @@ pub(super) async fn handle_simple_job(
             let result = crate::vault::move_folder(vault, store, None, &from, &to);
             // status: wikilink-rename-rewrite
             if result.is_ok() {
+                let sweep = crate::links_rename::RenameSweepCtx {
+                    watcher_cell,
+                    layered_cell: ctx.layered_cell,
+                    kinds_cell: ctx.kinds_cell,
+                    jobs: self_tx,
+                    vault,
+                };
                 for (old, new) in &pairs {
-                    record_oplog_rename(ctx.oplog_cell, old, new);
-                    crate::links_rename::on_note_moved(
-                        watcher_cell, ctx.oplog_cell, self_tx, vault, store, old, new,
-                    )
-                    .await;
+                    record_layered_rename(ctx.layered_cell, old, new);
+                    crate::links_rename::on_note_moved(&sweep, store, old, new).await;
                 }
             }
             let _ = reply.send(result);
@@ -532,7 +651,7 @@ pub(super) async fn handle_simple_job(
             // entry can carry it for a history-preserving restore.
             // status: vault-trash-restore
             let doc_id = ctx
-                .oplog_cell
+                .layered_cell
                 .get()
                 .and_then(|log| log.doc_id_for_path(&rel).ok().flatten());
             let result = crate::vault::delete_note(vault, store, None, &trash, &rel, doc_id);
@@ -546,13 +665,17 @@ pub(super) async fn handle_simple_job(
                     // so the trashed board drops off the Boards index.
                     // status: board-delete
                     clear_board_cards_for_delete(store, &rel, entry);
+                    // status: pm-epic-derived-table
+                    // `list_refs` rides the same lifecycle: a trashed
+                    // list-like note (epic / plan) drops its member rows.
+                    clear_list_refs_for_delete(store, &rel, entry);
                     // `trail_waypoints` likewise has no FK cascade off
                     // `notes`, so a trashed trail-doc / waypoint-note must
                     // drop its derived rows explicitly — mirrors the
                     // `process_delete` cleanup the `IndexJob::Delete` / watcher
                     // path runs.
                     clear_trail_waypoints_for_delete(store, &rel, entry);
-                    record_oplog_tombstone(ctx.oplog_cell, entry);
+                    record_layered_tombstone(ctx.layered_cell, entry);
                     let _ = progress.send(ProgressEvent::Deleted {
                         path: entry.original_path.clone(),
                     });
@@ -591,6 +714,14 @@ pub(super) async fn handle_simple_job(
                 );
             }
         }
+        // status: rule-triggers
+        // The `date-passed` sweep — enqueued by the host at vault open and
+        // on its daily tick; the per-rule watermark in the store's
+        // `meta(key, value)` sidecar makes redundant enqueues free.
+        IndexJob::RulesDateSweep => {
+            let now_epoch = super::now_secs() as f64;
+            ctx.with_rules_engine(store, |engine, fire| engine.date_sweep(fire, now_epoch));
+        }
     }
 }
 
@@ -612,7 +743,10 @@ async fn run_inbox_rules(
         return rel_path.to_string();
     }
     let watcher = ctx.watcher_cell.get().map(std::sync::Arc::as_ref);
-    match rules.apply_to_created(ctx.vault, store, watcher, rel_path) {
+    // The layered-doc handle attributes the rule's writes (`auto:inbox`): the
+    // tag merge stages + auto-flips, the move records a logical rename.
+    let log = ctx.layered_cell.get().map(std::sync::Arc::as_ref);
+    match rules.apply_to_created(ctx.vault, store, watcher, log, rel_path) {
         Ok(Some(applied)) => {
             let _ = ctx.progress.send(ProgressEvent::InboxApplied {
                 rule_index: applied.rule_index as u32,
@@ -642,65 +776,65 @@ async fn run_inbox_rules(
     }
 }
 
-/// Record a rename in the op log so the `doc-index.db` path mapping follows
-/// the move (otherwise the moved note's history orphans and its next save
-/// seeds a fresh doc) and the history feed sees the rename. Best-effort: no
-/// op-log handle (CLI / tests) or an unmapped path is a silent no-op; a
+/// Record a rename in the layered doc so the `doc-index.db` path mapping follows
+/// the move (otherwise the moved note's identity orphans and its next save
+/// seeds a fresh doc). Best-effort: no
+/// layered-doc handle (CLI / tests) or an unmapped path is a silent no-op; a
 /// failure is logged, not propagated — the filesystem move already succeeded.
-fn record_oplog_rename(
-    oplog_cell: &Arc<OnceCell<Arc<crate::oplog::OpLog>>>,
+fn record_layered_rename(
+    layered_cell: &Arc<OnceCell<Arc<crate::editing::LayeredDoc>>>,
     from: &str,
     to: &str,
 ) {
-    let Some(log) = oplog_cell.get() else { return };
+    let Some(log) = layered_cell.get() else { return };
     if let Err(e) =
-        crate::oplog::writes::rename(log, from, to, &crate::oplog::shapes::Author::User)
+        crate::editing::writes::rename(log, from, to, &crate::editing::shapes::Author::User)
     {
         tracing::warn!(error = %e, %from, %to, "indexer: op-log rename failed");
     }
 }
 
-/// Record a tombstone in the op log for a soft-deleted entry — the note, plus
+/// Record a tombstone in the layered doc for a soft-deleted entry — the note, plus
 /// every member when a folder was deleted. Same best-effort posture as
-/// [`record_oplog_rename`].
-fn record_oplog_tombstone(
-    oplog_cell: &Arc<OnceCell<Arc<crate::oplog::OpLog>>>,
+/// [`record_layered_rename`].
+fn record_layered_tombstone(
+    layered_cell: &Arc<OnceCell<Arc<crate::editing::LayeredDoc>>>,
     entry: &crate::trash::Entry,
 ) {
-    let Some(log) = oplog_cell.get() else { return };
+    let Some(log) = layered_cell.get() else { return };
     let paths = match &entry.members {
         Some(members) => members.clone(),
         None => vec![entry.original_path.clone()],
     };
     for path in &paths {
         if let Err(e) =
-            crate::oplog::writes::tombstone(log, path, &crate::oplog::shapes::Author::User)
+            crate::editing::writes::tombstone(log, path, &crate::editing::shapes::Author::User)
         {
             tracing::warn!(error = %e, %path, "indexer: op-log tombstone failed");
         }
     }
 }
 
-/// Rebind the op-log `doc_id` of a restored trash entry so the document comes
-/// back with its retained history. A no-op when the entry has no recorded
+/// Rebind the layered-doc `doc_id` of a restored trash entry so the document comes
+/// back under its retained identity. A no-op when the entry has no recorded
 /// `doc_id` (hand-dropped file, never-seeded note, or a folder whose members
-/// re-bind by path on re-ingest) or when no op-log handle is attached
-/// (CLI / tests). Best-effort, like [`record_oplog_tombstone`]: a failure is
+/// re-bind by path on re-ingest) or when no layered-doc handle is attached
+/// (CLI / tests). Best-effort, like [`record_layered_tombstone`]: a failure is
 /// logged, not propagated — the filesystem restore already succeeded and the
 /// note is recoverable; only its history rebind is at risk.
 ///
 /// status: vault-trash-restore
-fn record_oplog_restore(
-    oplog_cell: &Arc<OnceCell<Arc<crate::oplog::OpLog>>>,
+fn record_layered_restore(
+    layered_cell: &Arc<OnceCell<Arc<crate::editing::LayeredDoc>>>,
     entry: &crate::trash::Entry,
 ) {
     let Some(doc_id) = &entry.doc_id else { return };
-    let Some(log) = oplog_cell.get() else { return };
-    if let Err(e) = crate::oplog::writes::restore(
+    let Some(log) = layered_cell.get() else { return };
+    if let Err(e) = crate::editing::writes::restore(
         log,
         doc_id,
         &entry.original_path,
-        &crate::oplog::shapes::Author::User,
+        &crate::editing::shapes::Author::User,
     ) {
         tracing::warn!(
             error = %e,
@@ -721,18 +855,22 @@ async fn handle_inline_upsert(
     let progress = ctx.progress;
     let status = ctx.status;
     let _ = progress.send(ProgressEvent::Started { path: rel_path.to_string() });
-    let oplog = ctx.oplog_cell.get().cloned();
+    let layered = ctx.layered_cell.get().cloned();
+    let kinds = ctx.kinds_cell.get().cloned();
     match process_upsert(
         ctx.vault_root,
         store,
         ctx.embedder.clone(),
-        oplog.as_deref(),
+        layered.as_deref(),
+        kinds.as_deref(),
         rel_path,
         false,
     )
     .await?
     {
-        UpsertOutcome::Indexed => {
+        // The inline-upsert callers (rename fallback, trash restore) are
+        // not rule trigger seams — detected events are dropped here.
+        UpsertOutcome::Indexed(_) => {
             let _ = progress.send(ProgressEvent::Finished { path: rel_path.to_string() });
         }
         UpsertOutcome::Unchanged => {
@@ -753,7 +891,9 @@ async fn handle_inline_upsert(
 }
 
 enum UpsertOutcome {
-    Indexed,
+    /// Ingest landed; carries the rule-pass trigger events the derived-
+    /// table diffs detected (`rule-triggers`).
+    Indexed(Vec<crate::rules::RuleEvent>),
     Unchanged,
     Skipped(String),
 }
@@ -778,7 +918,8 @@ async fn process_upsert(
     vault_root: &Path,
     store: &mut Store,
     embedder: Arc<dyn Embedder>,
-    oplog: Option<&OpLog>,
+    layered: Option<&LayeredDoc>,
+    kinds: Option<&crate::kinds::Registry>,
     rel_path: &str,
     force: bool,
 ) -> Result<UpsertOutcome, Error> {
@@ -789,7 +930,7 @@ async fn process_upsert(
         Some(ext) if ext.eq_ignore_ascii_case("txt") => &Txt,
         _ => return Ok(UpsertOutcome::Skipped("unsupported extension".into())),
     };
-    if is_ignored(rel_path) {
+    if crate::ignore::is_ignored_in(vault_root, rel_path, false) {
         return Ok(UpsertOutcome::Skipped("ignored path".into()));
     }
     let abs = vault_root.join(rel_path);
@@ -832,15 +973,37 @@ async fn process_upsert(
     };
     let content_hash = hash_string(&contents);
 
+    // status: spec-anchor-index
+    // Re-derive the spec-anchor index BEFORE the unchanged short-circuit: a pure text
+    // scan (no embedding), cheap enough to run unconditionally — which is also how
+    // pre-existing dbs (the table ships without a schema-version bump) backfill on
+    // their next full scan instead of waiting for content edits.
+    store.replace_spec_anchors(rel_path, &crate::wikilink::scan_spec_anchors(&contents))?;
+
+    let existing = store.get_note_by_path(rel_path)?;
     // Short-circuit: same content + same embedder version → no-op. Skipped
     // when `force` is set so an explicit user reindex actually re-embeds.
     if !force
-        && let Some(existing) = store.get_note_by_path(rel_path)?
+        && let Some(existing) = &existing
         && existing.content_hash == content_hash
         && existing.embedder_version == embedder.version()
     {
         return Ok(UpsertOutcome::Unchanged);
     }
+
+    // status: rule-triggers
+    // Pre-ingest state the rule pass diffs against: whether the note row
+    // already existed (a first ingest is creation, never a frontmatter
+    // change — so a fresh index over an existing vault fires nothing) and
+    // the prior `note_meta` rows (the `frontmatter-changed` before-rows).
+    let pre_existing = existing.is_some();
+    let prior_meta = match store.note_metadata(rel_path) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, path = %rel_path, "indexer: prior note_meta read failed");
+            Vec::new()
+        }
+    };
 
     // Chunk + embed. Embed is CPU-heavy: spawn_blocking.
     let chunks = chunker.chunk(&contents);
@@ -862,15 +1025,25 @@ async fn process_upsert(
         // Re-derive the metadata index even for empty-body notes: their
         // frontmatter (tags, lifecycle, author) is the whole point of a
         // metadata-only note. The note's path is its `note_meta` key.
-        store.replace_note_metadata(rel_path, &note_metadata_entries(&contents))?;
+        let meta_entries = note_metadata_entries(&contents);
+        store.replace_note_metadata(rel_path, &meta_entries)?;
+        update_note_problems(store, kinds, rel_path, &meta_entries);
         // status: trail-waypoints-derived-table
         // Also re-derive on the empty-body branch — waypoint-notes
         // intentionally have empty bodies (`trail-empty-waypoint-body`),
         // so the FM-only path is the common case for them.
-        update_trail_waypoints_if_relevant(store, oplog, rel_path, &contents);
+        crate::trails::ingest::update_trail_waypoints_if_relevant(store, layered, rel_path, &contents);
         // status: board-cards-derived-table
-        update_board_cards_if_relevant(store, oplog, rel_path, &contents);
-        return Ok(UpsertOutcome::Indexed);
+        let card_events = update_board_cards_if_relevant(store, layered, kinds, rel_path, &contents);
+        // status: pm-epic-derived-table
+        update_list_refs_if_relevant(store, kinds, rel_path, &contents);
+        return Ok(UpsertOutcome::Indexed(rule_events(
+            rel_path,
+            pre_existing,
+            &prior_meta,
+            &meta_entries,
+            card_events,
+        )));
     }
 
     // status: store-path-is-identity
@@ -883,11 +1056,15 @@ async fn process_upsert(
     // `MAX_FILE_BYTES` (5 MiB). Holding it alongside the chunks +
     // embeddings dominates per-file memory; dropping it here halves
     // the peak.
-    update_trail_waypoints_if_relevant(store, oplog, rel_path, &contents);
+    crate::trails::ingest::update_trail_waypoints_if_relevant(store, layered, rel_path, &contents);
     // status: board-cards-derived-table
     // Re-derive `board_cards` rows for board-docs before the body drops —
     // same ordering rationale as the trail re-derive above.
-    update_board_cards_if_relevant(store, oplog, rel_path, &contents);
+    let card_events = update_board_cards_if_relevant(store, layered, kinds, rel_path, &contents);
+    // status: pm-epic-derived-table
+    // Re-derive `list_refs` rows for list-like notes (epic / plan) before
+    // the body drops — same ordering rationale.
+    update_list_refs_if_relevant(store, kinds, rel_path, &contents);
     // status: store-note-metadata-index
     // Flatten frontmatter now, before the body is dropped — the upsert
     // below runs after `drop(contents)` to bound peak memory, but the
@@ -932,188 +1109,83 @@ async fn process_upsert(
         chunks: zipped,
     })?;
     store.replace_note_metadata(rel_path, &meta_entries)?;
+    update_note_problems(store, kinds, rel_path, &meta_entries);
 
-    Ok(UpsertOutcome::Indexed)
+    Ok(UpsertOutcome::Indexed(rule_events(
+        rel_path,
+        pre_existing,
+        &prior_meta,
+        &meta_entries,
+        card_events,
+    )))
 }
 
-/// Soft-error helper that re-derives `trail_waypoints` rows for a file
-/// that may be a trail-doc or a waypoint-note.
+/// Assemble one ingest's rule-pass trigger events (`docs/rules.md`): the
+/// `card-moved` diffs the board re-derive detected, plus a
+/// `frontmatter-changed` event when a pre-existing note's indexed metadata
+/// changed across `replace_note_metadata`. A first ingest (no prior note
+/// row) never reads as a frontmatter change — `note-created` is the
+/// watcher-create path's event, folded in by the caller.
 ///
-/// Two ingest paths share this function:
-///
-///   - **Trail-doc ingest** is the authoritative re-derive: it walks
-///     the recursive `hiker.waypoints` tree, clears every existing row
-///     for `trail_id`, and re-inserts one row per waypoint with
-///     correct `parent_waypoint_id` + `tree_path` filled in. This is
-///     the canonical population path; tree-shape edits to the
-///     trail-doc reach the table here.
-///   - **Waypoint-note ingest** writes a single row keyed on the
-///     waypoint's own frontmatter (`hiker.in_trail`, `hiker.references`,
-///     `hiker.id`). It cannot know its own `parent_waypoint_id` /
-///     `tree_path` from the waypoint-note alone — that information
-///     lives in the parent trail-doc. So those columns are written as
-///     `(NULL, "")` here; the next trail-doc ingest fills the
-///     canonical values via the depth-first re-derive above. The
-///     append-waypoint op enqueues both upserts (waypoint-note then
-///     trail-doc), so the canonical fill follows immediately.
-fn update_trail_waypoints_if_relevant(
-    store: &mut Store,
-    oplog: Option<&OpLog>,
+/// status: rule-triggers
+fn rule_events(
     rel_path: &str,
-    contents: &str,
-) {
-    // Cheap kind discriminator: only attempt the parse on `.md` files.
-    if !rel_path.ends_with(".md") {
-        return;
-    }
-    let ingest = WaypointIngest { store, oplog, rel_path, contents };
-    // status: note-companion-folder
-    // Waypoints now live in the trail-doc's visible companion folder, so a
-    // path prefix no longer distinguishes them from trail-docs. Dispatch on
-    // `hiker.kind` instead: a note that parses as a waypoint
-    // (`hiker.kind: waypoint`) writes a waypoint row; anything else routes
-    // to the trail-doc rebuild path (which itself no-ops on a note that
-    // isn't a trail-doc).
-    if crate::trails::parse_waypoint(contents).is_ok() {
-        ingest.upsert_waypoint_row();
-    } else {
-        ingest.rebuild_trail_doc_rows();
-    }
-}
-
-/// Bundled refs for the two derived-table update paths. Methods stay exempt
-/// from `clippy::single_call_fn` and split the work so the dispatcher above
-/// stays under the cognitive-complexity cap.
-struct WaypointIngest<'a> {
-    store: &'a mut Store,
-    oplog: Option<&'a OpLog>,
-    rel_path: &'a str,
-    contents: &'a str,
-}
-
-impl<'a> WaypointIngest<'a> {
-    fn upsert_waypoint_row(self) {
-        use crate::store::dto::WaypointRow;
-        use crate::trails::parse_waypoint;
-        let fm = match parse_waypoint(self.contents) {
-            Ok(fm) => fm,
-            Err(e) => {
-                tracing::debug!(
-                    error = %e,
-                    path = %self.rel_path,
-                    "indexer: waypoint parse failed (file may be mid-edit)",
-                );
-                return;
-            }
-        };
-        // status: store-path-is-identity
-        // Trail id is the op-log's `doc_id` for `fm.in_trail` (the
-        // waypoint-note's parent trail-doc path). The source note is
-        // referenced by path only (path-as-identity).
-        let source_path = fm.references.clone();
-        let trail_id = self
-            .oplog
-            .and_then(|log| log.doc_id_for_path(&fm.in_trail).unwrap_or(None))
-            .unwrap_or_default();
-        // Waypoint id (the legacy `WaypointRow.waypoint_id` column) is
-        // the op-log's `doc_id` for the waypoint-note's own path under
-        // path-as-identity — sourced from the same lookup the trail-doc
-        // ingest uses to seed its row.
-        let waypoint_id = self
-            .oplog
-            .and_then(|log| log.doc_id_for_path(self.rel_path).unwrap_or(None))
-            .unwrap_or_default();
-        let row = WaypointRow {
-            waypoint_path: self.rel_path.to_string(),
-            waypoint_id,
-            trail_id,
-            source_path,
-            // Tree-position columns are owned by the trail-doc ingest
-            // path; written as the empty / NULL default here. The trail-
-            // doc ingest that follows `append_waypoint` enqueues both, so
-            // the canonical values land within the same indexer drain.
-            parent_waypoint_id: None,
-            tree_path: String::new(),
-        };
-        if let Err(e) = self.store.upsert_trail_waypoint(&row) {
-            tracing::warn!(
-                error = %e,
-                path = %self.rel_path,
-                "indexer: upsert_trail_waypoint failed",
-            );
-        }
-    }
-
-    /// Trail-doc ingest: clear + re-insert every row for `trail_id` so
-    /// tree-shape changes (re-parent, reorder, remove) propagate to the
-    /// derived table. Frontmatter is the source of truth.
-    ///
-    /// status: trail-waypoints-derived-table
-    /// status: trail-side-trail-shape
-    fn rebuild_trail_doc_rows(self) {
-        use crate::store::dto::WaypointRow;
-        use crate::trails::{parse_trail_doc_for, walk_waypoints_depth_first};
-        let Ok(fm) = parse_trail_doc_for(self.rel_path, self.contents) else { return };
-        // status: store-path-is-identity
-        // The trail's id is the op-log's `doc_id` for the trail-doc's
-        // path; absent (oplog not seeded yet) is a soft no-op so the
-        // next ingest re-derives once the cell is populated.
-        let Some(log) = self.oplog else { return };
-        let trail_id = match log.doc_id_for_path(self.rel_path) {
-            Ok(Some(id)) => id,
-            _ => return,
-        };
-        // Capture existing rows BEFORE the clear so we can preserve each
-        // row's `source_path` (that column is owned by the per-waypoint
-        // ingest path and isn't recoverable from the trail-doc alone).
-        let existing_by_path: std::collections::HashMap<String, String> = self
-            .store
-            .waypoints_of(&trail_id)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| (r.waypoint_path, r.source_path))
-            .collect();
-        if let Err(e) = self.store.delete_trail_waypoints_by_trail(&trail_id) {
-            tracing::warn!(
-                error = %e,
-                trail_id = %trail_id,
-                "indexer: delete_trail_waypoints_by_trail failed",
-            );
-        }
-        let store = self.store;
-        walk_waypoints_depth_first(&fm.waypoints, &mut |parent_path, entry, tree_path| {
-            let source_path = existing_by_path
-                .get(&entry.path)
-                .cloned()
-                .unwrap_or_default();
-            // status: store-path-is-identity
-            // Waypoint id / parent waypoint id are the op-log doc_ids
-            // for each waypoint-note path. Both default to empty when
-            // the lookup misses — the rows still wire correctly via
-            // `waypoint_path` / `source_path`.
-            let waypoint_id = log
-                .doc_id_for_path(&entry.path)
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-            let parent_waypoint_id = parent_path
-                .and_then(|p| log.doc_id_for_path(p).ok().flatten());
-            let row = WaypointRow {
-                waypoint_path: entry.path.clone(),
-                waypoint_id,
-                trail_id: trail_id.clone(),
-                source_path,
-                parent_waypoint_id,
-                tree_path: tree_path.to_string(),
-            };
-            if let Err(e) = store.upsert_trail_waypoint(&row) {
-                tracing::warn!(
-                    error = %e,
-                    path = %entry.path,
-                    "indexer: upsert_trail_waypoint (trail-doc walk) failed",
-                );
-            }
+    pre_existing: bool,
+    prior_meta: &[MetaEntry],
+    new_meta: &[MetaEntry],
+    card_events: Vec<crate::rules::RuleEvent>,
+) -> Vec<crate::rules::RuleEvent> {
+    let mut events = card_events;
+    if pre_existing && crate::rules::meta_changed(prior_meta, new_meta) {
+        events.push(crate::rules::RuleEvent::FrontmatterChanged {
+            path: rel_path.to_string(),
         });
+    }
+    events
+}
+
+/// Re-derive the lenient-validation problems report for a note on ingest
+/// (`docs/kinds.md`): when the note's `hiker.kind` names a registered kind,
+/// validate the flattened frontmatter against the definition and replace
+/// the derived `note_problems` rows; otherwise clear them (unregistered
+/// kinds are never validated). Violations only ever produce report rows —
+/// the write is never blocked, the file never rewritten. Soft-error: a
+/// store failure is logged, never propagated.
+///
+/// status: kind-lenient-validation
+fn update_note_problems(
+    store: &mut Store,
+    kinds: Option<&crate::kinds::Registry>,
+    rel_path: &str,
+    entries: &[MetaEntry],
+) {
+    use crate::kinds::RefTarget;
+    let Some(registry) = kinds else { return };
+    let kind = entries
+        .iter()
+        .find(|e| e.key == "hiker.kind")
+        .and_then(|e| registry.get(&e.value));
+    let problems = match kind {
+        Some(kind) => {
+            let reader: &Store = store;
+            let resolve = |path: &str| -> RefTarget {
+                match reader.note_exists(path) {
+                    Ok(true) => RefTarget::Found {
+                        kind: reader.meta_value(path, "hiker.kind").ok().flatten(),
+                    },
+                    _ => RefTarget::Missing,
+                }
+            };
+            crate::kinds::validate_note(kind, entries, &resolve)
+        }
+        None => Vec::new(),
+    };
+    if let Err(e) = store.replace_note_problems(rel_path, &problems) {
+        tracing::warn!(
+            error = %e,
+            path = %rel_path,
+            "indexer: replace_note_problems failed",
+        );
     }
 }
 
@@ -1123,30 +1195,45 @@ impl<'a> WaypointIngest<'a> {
 /// id, and re-insert one row per card with its column + ordinal. The
 /// board-doc frontmatter is the source of truth (clear-then-reinsert).
 /// Soft-error: a parse failure (non-board note, mid-edit) is a silent
-/// no-op.
+/// no-op. The registry extends the parse gate to board-like kinds, so a
+/// sprint board-doc derives `board_cards` rows exactly like a plain board
+/// (`sprint-board-subtype`).
+///
+/// Returns the `card-moved` trigger events the replace exposed: the prior
+/// rows are read before the clear-then-reinsert, and a note card present
+/// in both row sets under a different column is a move (`rule-triggers` —
+/// DnD, MCP ops, and hand edits all converge at this one derived-table
+/// seam). Empty for non-boards and on any soft-error.
 ///
 /// status: board-cards-derived-table
+/// status: sprint-board-subtype
+/// status: rule-triggers
 fn update_board_cards_if_relevant(
     store: &mut Store,
-    oplog: Option<&OpLog>,
+    layered: Option<&LayeredDoc>,
+    kinds: Option<&crate::kinds::Registry>,
     rel_path: &str,
     contents: &str,
-) {
+) -> Vec<crate::rules::RuleEvent> {
     use crate::boards::parse_board_for;
     use crate::store::dto::BoardCardRow;
     if !rel_path.ends_with(".md") {
-        return;
+        return Vec::new();
     }
-    let Ok(board) = parse_board_for(rel_path, contents) else { return };
+    let Ok(board) = parse_board_for(rel_path, contents, kinds) else {
+        return Vec::new();
+    };
     // status: store-path-is-identity
-    // The board's storage key is the op-log's `doc_id` for the
-    // board-doc's path; absent (oplog not seeded yet) is a soft no-op so
+    // The board's storage key is the layered doc's `doc_id` for the
+    // board-doc's path; absent (layered not seeded yet) is a soft no-op so
     // the next ingest re-derives once the cell is populated.
-    let Some(log) = oplog else { return };
+    let Some(log) = layered else { return Vec::new() };
     let board_id = match log.doc_id_for_path(rel_path) {
         Ok(Some(id)) => id,
-        _ => return,
+        _ => return Vec::new(),
     };
+    // The before-rows for the card-moved diff, read prior to the replace.
+    let prior_rows = store.cards_of(&board_id).unwrap_or_default();
     let mut rows: Vec<BoardCardRow> = Vec::new();
     for col in &board.columns {
         for (ordinal, card) in col.cards.iter().enumerate() {
@@ -1169,6 +1256,60 @@ fn update_board_cards_if_relevant(
     }
     if let Err(e) = store.replace_board_cards(&board_id, &rows) {
         tracing::warn!(error = %e, path = %rel_path, "indexer: replace_board_cards failed");
+        return Vec::new();
+    }
+    crate::rules::card_moves(rel_path, &prior_rows, &rows)
+}
+
+/// Re-derive `list_refs` rows for a list-like note (epic / plan / any
+/// registered list-like kind) on ingest — the `board_cards` lifecycle
+/// exactly (`pm-epic-derived-table`): parse the `hiker.refs` frontmatter
+/// through the registry-aware list-doc gate, clear every existing row for
+/// the list's path, and re-insert one row per member in order. The
+/// frontmatter is the source of truth (clear-then-reinsert); keyed on the
+/// note's vault path directly (path-as-identity), so no layered-doc handle is
+/// needed. Soft-error: a parse failure (non-list note, mid-edit, no
+/// registry attached) is a silent no-op.
+///
+/// status: pm-epic-derived-table
+fn update_list_refs_if_relevant(
+    store: &mut Store,
+    kinds: Option<&crate::kinds::Registry>,
+    rel_path: &str,
+    contents: &str,
+) {
+    if !rel_path.ends_with(".md") {
+        return;
+    }
+    let Ok(doc) = crate::pm::parse_list_doc_for(rel_path, contents, kinds) else {
+        return;
+    };
+    if let Err(e) = store.replace_list_refs(rel_path, &doc.refs) {
+        tracing::warn!(error = %e, path = %rel_path, "indexer: replace_list_refs failed");
+    }
+}
+
+/// Clear the derived `list_refs` rows for a list-like note moved to trash
+/// via `IndexJob::DeleteNote`. `list_refs` has no FK cascade off `notes`,
+/// so the rows are dropped by list path — a single note (`rel`) plus every
+/// member of a deleted folder (`entry.members`), mirroring the board /
+/// trail cleanups. Rows pointing at a deleted *member* note stay: the
+/// rollup counts a missing member under `backlog` until the user edits the
+/// epic. Soft-error: a clear failure is logged, never propagated.
+/// status: pm-epic-derived-table
+fn clear_list_refs_for_delete(store: &mut Store, rel: &str, entry: &crate::trash::Entry) {
+    let mut paths: Vec<&str> = vec![rel];
+    if let Some(members) = &entry.members {
+        paths.extend(members.iter().map(String::as_str));
+    }
+    for p in paths {
+        if let Err(e) = store.delete_list_refs_by_list(p) {
+            tracing::warn!(
+                error = %e,
+                path = %p,
+                "indexer: delete_list_refs_by_list (delete-note) failed",
+            );
+        }
     }
 }
 
@@ -1242,6 +1383,17 @@ fn process_delete(store: &mut Store, rel_path: &str) -> Result<bool, Error> {
             error = %e,
             path = %rel_path,
             "indexer: delete_board_cards_by_board_path failed",
+        );
+    }
+    // status: pm-epic-derived-table
+    // Drop any list_refs rows for a deleted list-like note (list_path
+    // match). Rows pointing at a deleted *member* stay — the rollup counts
+    // a missing member under `backlog` until the user edits the epic.
+    if let Err(e) = store.delete_list_refs_by_list(rel_path) {
+        tracing::warn!(
+            error = %e,
+            path = %rel_path,
+            "indexer: delete_list_refs_by_list failed",
         );
     }
     // status: store-path-is-identity / ingest-delete-cascade

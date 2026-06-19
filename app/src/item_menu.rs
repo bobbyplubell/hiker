@@ -1,12 +1,14 @@
 //! Shared right-click menu for any list item that references a note/path.
 //!
 //! Every sidebar list whose rows point at a vault note shows the same base
-//! options — Open, Reveal in file tree, Copy path, Properties — so the menu
-//! lives here once instead of being re-listed per surface (status:
-//! ctxmenu-item-base). A surface with no extra actions calls
+//! options — Open, Reveal in file tree, Open in graph, Copy path, Properties
+//! — so the menu lives here once instead of being re-listed per surface
+//! (status: ctxmenu-item-base). A surface with no extra actions calls
 //! [`attach_note_item_menu`] directly; a surface that needs contextual entries
 //! builds with [`note_item_base`] and composes its own section, dispatching the
-//! shared part through [`apply_item_action`].
+//! shared part through [`apply_item_action`]. Surfaces whose pane owns its
+//! response (the graph engines) host their menu through the shared
+//! [`latched_menu_popup`] instead of `Response::context_menu`.
 
 use egui_workbench::menu::{Action, Menu};
 
@@ -22,6 +24,11 @@ pub(crate) enum ItemAction {
     Open,
     /// Reveal the note's row in the file tree.
     RevealInFiles,
+    /// Open/focus the Graph tab on this note's neighbourhood (depth 2, the
+    /// code view's default). One base entry, every surface — files, search,
+    /// backlinks, board cards, graph nodes, … — with zero per-surface
+    /// wiring. status: open-in-graph
+    OpenInGraph,
     /// Open the note's Properties tab.
     Properties,
 }
@@ -36,10 +43,11 @@ pub(crate) struct BaseOpts {
 
 /// The universal base menu for a list item that references a note/path.
 ///
-/// Order: Open · (Reveal in file tree) · Copy path · Properties — all in one
-/// section. `wrap` lifts an [`ItemAction`] into the caller's own action type so
-/// a surface can compose extra entries onto the same `Menu<A>`; surfaces with
-/// no extras pass the identity closure and get a `Menu<ItemAction>`.
+/// Order: Open · (Reveal in file tree) · Open in graph · Copy path ·
+/// Properties — all in one section. `wrap` lifts an [`ItemAction`] into the
+/// caller's own action type so a surface can compose extra entries onto the
+/// same `Menu<A>`; surfaces with no extras pass the identity closure and get
+/// a `Menu<ItemAction>`.
 pub(crate) fn note_item_base<A: 'static>(
     path: &str,
     opts: BaseOpts,
@@ -52,6 +60,7 @@ pub(crate) fn note_item_base<A: 'static>(
             wrap(ItemAction::RevealInFiles),
         ));
     }
+    menu = menu.action_with(Action::new("Open in graph", wrap(ItemAction::OpenInGraph)));
     let copy_path = path.to_owned();
     menu = menu.custom(move |ui| {
         if ui.button("Copy path").clicked() {
@@ -70,6 +79,9 @@ pub(crate) fn apply_item_action(app: &mut AppState, action: ItemAction, path: &s
     match action {
         ItemAction::Open => crate::editor_pane::open_file(app, path, false),
         ItemAction::RevealInFiles => crate::search::reveal_in_files(app, path),
+        // Focus the Graph tab on this note's 2-hop neighbourhood (the code
+        // view's default depth). status: open-in-graph
+        ItemAction::OpenInGraph => crate::panels::graph::open_focused(app, path, 2),
         ItemAction::Properties => crate::files::sidebar::open_properties(app, path),
     }
 }
@@ -104,4 +116,41 @@ pub(crate) fn attach_note_item_menu(
         let owned = path.to_owned();
         ctx.defer(move |app| apply_item_action(app, action, &owned));
     }
+}
+
+/// Render a latched context menu as a floating popup at its captured position.
+/// For surfaces whose pane owns its `Response` (the graph engines), where
+/// `Response::context_menu` isn't available — the host latches
+/// `(node key, pointer pos)` on a right-click and calls this each frame. Same
+/// menu, hosted in an `egui::Area`. Returns the picked action; clears the
+/// latch on pick, Esc, or a press outside the popup.
+pub(crate) fn latched_menu_popup<A>(
+    ui: &egui::Ui,
+    id: egui::Id,
+    latch: &mut Option<(String, egui::Pos2)>,
+    menu: Menu<A>,
+) -> Option<A> {
+    let Some((_, pos)) = latch else { return None };
+    let pos = *pos;
+    let mut picked = None;
+    let area = egui::Area::new(id)
+        .fixed_pos(pos)
+        .order(egui::Order::Foreground)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::menu(ui.style()).show(ui, |ui| {
+                picked = egui_workbench::menu::show(ui, menu);
+            });
+        });
+    let rect = area.response.rect;
+    let pressed_outside = ui.input(|i| {
+        i.pointer.any_pressed()
+            && i.pointer
+                .interact_pos()
+                .is_some_and(|p| !rect.expand(2.0).contains(p))
+    });
+    let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+    if picked.is_some() || pressed_outside || esc {
+        *latch = None;
+    }
+    picked
 }

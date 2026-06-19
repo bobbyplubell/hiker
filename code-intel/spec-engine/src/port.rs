@@ -1,10 +1,10 @@
 //! The `DerivedNodeSource` port — spec-engine's only backend dependency (`derived-node-source-port`).
 //!
-//! Source-neutral by design: nothing here is code-specific. Code (SCIP/LSP), Jira, infra, … are
+//! Source-neutral by design: nothing here is code-specific. Code (SCIP/LSP), infra, … are
 //! interchangeable impls. Generality lives in the graph model (`model.rs`), not in this trait;
 //! keep it minimal and push domain richness into node `kind` / edge `relation` / attributes.
 
-use crate::model::{EdgeKind, NodeHandle, SourceId};
+use crate::model::{EdgeKind, NodeHandle, Resolution, SourceId};
 
 /// Where a derived node lives in its source: file:line for code, but generalizes to URL / row / ticket.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,8 +44,14 @@ pub trait DerivedNodeSource {
     fn locate(&self, h: &NodeHandle) -> Option<SourceLoc>;
     /// Source text of a node (for preview / highlight / fingerprinting input).
     fn content(&self, h: &NodeHandle) -> Option<String>;
-    /// Change-fingerprint of a node (for drift).
+    /// Change-fingerprint of a node (for drift) at `Code` resolution — the symbol's own definition.
     fn fingerprint(&self, h: &NodeHandle) -> Option<Fingerprint>;
+    /// Change-fingerprint at a C4 `resolution` (`spec-resolution-c4`): `Code` = the symbol body;
+    /// coarser levels hash structure / API so finer churn doesn't drift. Default ignores resolution
+    /// and falls back to [`Self::fingerprint`], so backends opt in incrementally.
+    fn fingerprint_at(&self, h: &NodeHandle, _resolution: Resolution) -> Option<Fingerprint> {
+        self.fingerprint(h)
+    }
     /// Neighbors of a node, filtered to the requested edge kinds (blast radius).
     fn neighbors(&self, h: &NodeHandle, kinds: &[EdgeKind]) -> Vec<NodeHandle>;
     /// What this source supports.

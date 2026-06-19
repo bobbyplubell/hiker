@@ -121,26 +121,6 @@ pub fn sync_workbench_tabs(&mut self) {
         existing.insert(tab.id, handle);
     }
 
-    // Attention badge on the Sync tab: decorate its label with a warning glyph
-    // + count of items needing the user (blocked docs + held content-key change
-    // + a surfaced last-error). Quiet (no suffix) when healthy. Tab labels are
-    // plain text, so we mirror the toolbar's red-badge INTENT as a "(!) N" suffix
-    // rather than a per-glyph background. ASCII marker — egui's default font
-    // tofus U+26A0. status: sync-attention-badge
-    if let Some(service) = app.vault_session.services.sync.clone() {
-        let count = service.state_snapshot().attention_count();
-        if count > 0 {
-            for w in &mut want {
-                if matches!(
-                    app.tab_by_id(w.id).map(|t| &t.kind),
-                    Some(crate::tab::TabKind::Sync)
-                ) {
-                    w.label = format!("{} (!) {count}", w.label);
-                }
-            }
-        }
-    }
-
     let want_ids: std::collections::HashSet<TabId> =
         want.iter().map(|w| w.id).collect();
 
@@ -367,10 +347,6 @@ impl<'a> Host<HikerWbTab, String> for HikerWbBehavior<'a> {
     }
 
     fn side_bar_action_buttons(&mut self, ui: &mut egui::Ui, mode: &String) {
-        if mode == "chat" {
-            self.chat_action_buttons(ui);
-            return;
-        }
         if mode == "files" {
             // `+` split-button: primary mints a note; the caret dropdown picks
             // any document type. status: sidebar-new-item-button, split-add-button
@@ -627,56 +603,6 @@ impl<'a> HikerWbBehavior<'a> {
         });
     }
 
-    /// Chat section header buttons (new / delete session), re-homed from
-    /// the retired bespoke secondary side bar onto the generic per-mode
-    /// `side_bar_action_buttons("chat")` path. The session picker lives in
-    /// the chat body's top chrome row. [feature-consumer-sidebar]
-    fn chat_action_buttons(&mut self, ui: &mut egui::Ui) {
-        let active_id = self.app.chat_state.registry.active.clone();
-        if active_id.is_some()
-            && ui
-                .add(egui::Button::image(crate::icons::ICONS.image(crate::icons::Icon::Trash)).small())
-                .on_hover_text("Delete this session")
-                .clicked()
-            && let Some(id) = active_id.as_deref()
-        {
-            let vault_root = self.app.vault_session.vault_root.clone();
-            let chats_dir = crate::chat::session::chats_dir(&self.app.vault_session.config);
-            if let Err(err) = crate::chat::session::delete(
-                &mut self.app.chat_state.registry,
-                &vault_root,
-                &chats_dir,
-                id,
-            ) {
-                tracing::warn!(error = %err, "chat: delete failed");
-            }
-        }
-        if ui
-            .add(egui::Button::image(crate::icons::ICONS.image(crate::icons::Icon::Plus)).small())
-            .on_hover_text("New session")
-            .clicked()
-        {
-            let vault_root = self.app.vault_session.vault_root.clone();
-            let (model, provider) = self
-                .app
-                .vault_session
-                .config
-                .read()
-                .map(|c| (c.llm.provider.model.clone(), c.llm.provider.backend.clone()))
-                .unwrap_or_else(|_| ("stub-model".into(), "stub".into()));
-            let chats_dir = crate::chat::session::chats_dir(&self.app.vault_session.config);
-            if let Err(err) = crate::chat::session::create_new(
-                &mut self.app.chat_state.registry,
-                &vault_root,
-                &chats_dir,
-                &model,
-                &provider,
-            ) {
-                tracing::warn!(error = %err, "chat: create_new failed");
-            }
-        }
-    }
-
     fn render_tab_body(&mut self, ui: &mut egui::Ui, tab_id: TabId, kind: &TabKind) {
         crate::profile_scope!("render_tab_body", tab_kind_name(kind));
         let _g = crate::profiling::FrameProf::guard(tab_kind_name(kind));
@@ -716,21 +642,20 @@ impl<'a> HikerWbBehavior<'a> {
             TabKind::QueueDetail { task_id } => panels::queue::show_detail(ui, app, task_id),
             TabKind::Settings => panels::settings::show(ui, app),
             TabKind::Properties { path } => panels::properties::show(ui, app, path),
-            TabKind::Graph => panels::graph::show(ui, app, tab_id),
+            TabKind::Graph { .. } => panels::graph::show(ui, app, tab_id),
             TabKind::Board { path } => panels::board::show(ui, app, tab_id, path, rt),
             TabKind::Canvas { path } => panels::canvas::show(ui, app, tab_id, path, rt),
             TabKind::BoardsIndex => panels::boards_index::show(ui, app),
-            TabKind::Agent { session_id } => crate::chat::render::show_tab(ui, app, session_id),
+            TabKind::Rules => panels::rules::show(ui, app),
             TabKind::PatchReview => panels::patch_review::show(ui, app),
             TabKind::IndexerDetail => panels::indexer_detail::show(ui, app, rt),
-            TabKind::Sync => panels::sync::show(ui, app, rt),
-            TabKind::Changes => panels::changes::show(ui, app),
+            TabKind::GitDiff => panels::git_diff::show(ui, app),
             TabKind::ClusterReview { config_json } => {
                 clusters::panel::show(ui, app, tab_id, config_json)
             }
             TabKind::ClusterGraph { tree_id } => panels::cluster_graph::show(ui, app, tree_id),
-            TabKind::CodeGraph { project_path } => {
-                panels::code_graph::show(ui, app, tab_id, project_path)
+            TabKind::CodeGraph { source } => {
+                panels::code_graph::show(ui, app, tab_id, source)
             }
             TabKind::ProjectConfig { source_note } => {
                 panels::project_config::show(ui, app, tab_id, source_note.as_deref())
@@ -754,15 +679,14 @@ const fn tab_kind_name(kind: &TabKind) -> &'static str {
         TabKind::QueueDetail { .. } => "tab:QueueDetail",
         TabKind::Settings => "tab:Settings",
         TabKind::Properties { .. } => "tab:Properties",
-        TabKind::Graph => "tab:Graph",
+        TabKind::Graph { .. } => "tab:Graph",
         TabKind::Board { .. } => "tab:Board",
         TabKind::Canvas { .. } => "tab:Canvas",
         TabKind::BoardsIndex => "tab:BoardsIndex",
-        TabKind::Agent { .. } => "tab:Agent",
+        TabKind::Rules => "tab:Rules",
         TabKind::PatchReview => "tab:PatchReview",
         TabKind::IndexerDetail => "tab:IndexerDetail",
-        TabKind::Sync => "tab:Sync",
-        TabKind::Changes => "tab:Changes",
+        TabKind::GitDiff => "tab:GitDiff",
         TabKind::ClusterReview { .. } => "tab:ClusterReview",
         TabKind::ClusterGraph { .. } => "tab:ClusterGraph",
         TabKind::CodeGraph { .. } => "tab:CodeGraph",

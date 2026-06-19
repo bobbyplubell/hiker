@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::StopSignal;
+use crate::tasks::queue::StopSignal;
 use crate::audit::{AgentLog, Entry};
 use hiker_llm::{Client, Message};
 

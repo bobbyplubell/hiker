@@ -422,7 +422,7 @@ impl Menus<'_> {
         }
         // Pending whole-file proposals first — they're the most actionable
         // versions and the user is most likely to be looking for them. Reads
-        // the per-frame op-log cache populated in
+        // the per-frame layered-doc cache populated in
         // `refresh_whole_file_proposals` (each row is a pending whole-body
         // `Replace` / `Create` op, not a `staging.db` row).
         let mine: Vec<_> = app
@@ -452,10 +452,12 @@ impl Menus<'_> {
                 }
             }
         }
-        // Accepted-op history. The newest op (index 0, newest-first) is the
-        // current version on disk.
-        let log = app.vault_session.services.oplog.as_ref();
-        let history = hiker_core::ops::op_writes::path_history(log, path, 20)
+        // Snapshot version history. The newest snapshot (index 0,
+        // newest-first) mirrors the current version on disk. Sourced from
+        // plain-file snapshots — a version is just its timestamp (the op-log
+        // attribution layer is retired).
+        let log = app.vault_session.services.layered.as_ref();
+        let history = hiker_core::ops::op_writes::snapshot_history(log, path, 20)
             .ok()
             .unwrap_or_default();
         if !history.is_empty() {
@@ -469,16 +471,10 @@ impl Menus<'_> {
                 let ts = VersionTimeFmt.hms(row.timestamp_ms);
                 let badge = if i == 0 { " · current" } else { "" };
                 if ui
-                    .button(
-                        egui::RichText::new(format!(
-                            "{ts}  {}{badge}",
-                            row.author.as_wire(),
-                        ))
-                        .small(),
-                    )
+                    .button(egui::RichText::new(format!("{ts}{badge}")).small())
                     .clicked()
                 {
-                    pick = Some(Pick::Version { op_id: row.op_id.clone() });
+                    pick = Some(Pick::Version { op_id: row.snapshot_id.clone() });
                     ui.close();
                 }
             }

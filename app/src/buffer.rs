@@ -76,6 +76,22 @@ pub struct Buffer {
     /// the indexed (= on-disk) version without re-reading the file every
     /// frame. Refreshed in lockstep with `loaded_hash`.
     pub loaded_text: String,
+    /// Snapshot of the file's committed content at git HEAD (`git show
+    /// HEAD:<path>`), feeding the dirty-diff gutter (`git-dirty-diff-gutter`,
+    /// G4) — the editor gutter marks lines that diverge from the last commit.
+    /// `Some(text)` for a tracked file (empty string = an untracked / newly
+    /// added file, so the whole buffer reads as added); `None` when git is
+    /// disabled, the engine is absent, or the HEAD lookup failed (no dirty-diff
+    /// gutter then). Refreshed off-frame by the panel (open / save / HEAD move),
+    /// never recomputed per paint — the same fingerprint-cache discipline as
+    /// `loaded_text`. status: git-dirty-diff-gutter
+    pub git_head_text: Option<String>,
+    /// The `loaded_hash` the `git_head_text` snapshot was last taken at, so the
+    /// panel re-fetches HEAD only on a load / save (a new `loaded_hash`) rather
+    /// than every frame — the same coarse-refresh discipline as the index-hash
+    /// badge. `None` forces a fetch on the first frame the buffer is shown.
+    /// status: git-dirty-diff-gutter
+    pub git_head_refreshed_for: Option<String>,
     /// Editor document + selection + history + decoration state.
     pub editor: Editor,
     /// Editor viewport + layout cache.
@@ -194,9 +210,24 @@ pub struct Buffer {
     /// Which agent session's pending ops are in scope for the inline review.
     /// `None` selects the whole pending queue (all sessions). The file pill
     /// flips this when the user picks a session row, and the diff overlay /
-    /// accept-reject pass it to the op-log seams so the hunks and flips are
+    /// accept-reject pass it to the layered-doc seams so the hunks and flips are
     /// scoped to one session at a time. Per `patch-review-multi-session`.
     pub active_session: Option<String>,
+    /// Ephemeral per-table overflow state (`widget-table-overflow-scroll`),
+    /// keyed by each pipe table's byte-range start within this buffer. Toggled
+    /// by the table's right-click context menu (Fit ⇄ Scrollable) and updated by
+    /// the inset wheel-scroll; default-absent = Fit at offset 0. Deliberately NOT
+    /// persisted / encoded in the markdown — a fresh session starts every table
+    /// Fit. The byte-range-start key drifts if the doc above the table is edited;
+    /// that just resets the table to Fit (acceptable for an ephemeral view flip).
+    pub table_overflow: crate::panels::buffer::widgets::tables::TableViewMap,
+    /// The active in-place table cell edit (`widget-table-cell-edit-inplace`), if
+    /// any: which cell of which table is being edited in a popover. While set, the
+    /// owning table suppresses its whole-table reveal and stays fully rendered;
+    /// the overlay editor seeded with the cell's source lives in a thread-local
+    /// (keyed by buffer path), and edits splice into this buffer's cell byte
+    /// range through the ordinary layered-doc binding. Ephemeral, never persisted.
+    pub editing_cell: Option<crate::panels::buffer::table_cell_edit::CellEdit>,
 }
 
 /// Per-buffer find-bar UI state (`editor-find-in-note`). The match index
@@ -310,11 +341,18 @@ pub struct DecorationCache {
     /// it scans viewport-scoped diagram spans and re-checks their source.
     pub diagram_diagnostics: Option<CachedDeco>,
     pub index_diff: Option<CachedDeco>,
+    /// Dirty-diff gutter markers vs git HEAD (`git-dirty-diff-gutter`, G4).
+    /// Separate from `index_diff` (which is vs the last disk read) so the two
+    /// gutters cache independently; keyed on (doc id, HEAD-text fingerprint).
+    pub git_diff: Option<CachedDeco>,
     pub active_line: Option<CachedDeco>,
     pub occurrence: Option<CachedDeco>,
     pub bracket_match: Option<CachedDeco>,
     pub special_chars: Option<CachedDeco>,
     pub chunk_boundaries: Option<CachedDeco>,
+    /// Tree-sitter syntax marks for read-only code buffers (`code-syntax-highlight`).
+    /// Keyed on doc id only — code files never edit, so this is one parse per open.
+    pub ts_syntax: Option<CachedDeco>,
     /// Diagram-widget span byte-ranges for the current doc revision, used to
     /// derive the per-family reveal fingerprint that keys the widget layers
     /// (`widget-render-cache`). Refilled only on an edit (doc_id change).
@@ -396,6 +434,11 @@ pub(crate) fn buffer_key_for_source(source: &crate::tab::BufferSource) -> String
         BufferSource::Trash { trash_path, .. } => {
             format!("\0trash:{}", trash_path)
         }
+        // Distinct prefix so a read-only code view never shares a key with an
+        // editable `Vault` buffer of the same path. status: code-read-only-view
+        BufferSource::CodeFile { path } => {
+            format!("\0code:{}", path)
+        }
     }
 }
 
@@ -409,6 +452,22 @@ impl Buffer {
         loaded_hash: String,
         cfg: Option<&hiker_core::config::Config>,
         vault: Option<Arc<hiker_core::vault::Vault>>,
+    ) -> Self {
+        Self::with_config_vault_and_code(path, contents, loaded_hash, cfg, vault, None)
+    }
+
+    /// Like [`with_config_and_vault`] but also wires the `[[code:` authoring
+    /// autocomplete via an optional [`CodeCompletionProvider`]. The real
+    /// editor-open paths supply one (built from the vault session); preview /
+    /// test buffers pass `None` and keep note-only `[[` completion.
+    /// status: spec-code-link
+    pub fn with_config_vault_and_code(
+        path: String,
+        contents: &str,
+        loaded_hash: String,
+        cfg: Option<&hiker_core::config::Config>,
+        vault: Option<Arc<hiker_core::vault::Vault>>,
+        code: Option<Arc<crate::code_sources::CodeCompletionProvider>>,
     ) -> Self {
         let loaded_text = contents.to_string();
         let editor = Editor::new(contents);
@@ -470,7 +529,7 @@ impl Buffer {
         // pass None to keep the source out of the read-only view).
         if let Some(v) = vault {
             view.completion_sources.push(Arc::new(
-                crate::completion_sources::WikilinkSource { vault: v },
+                crate::completion_sources::WikilinkSource { vault: v, code },
             ));
         }
         Self {
@@ -478,6 +537,10 @@ impl Buffer {
             path,
             loaded_hash,
             loaded_text,
+            // Filled off-frame by the panel's dirty-diff refresh once git +
+            // tracked status are known; `None` keeps the gutter dark until then.
+            git_head_text: None,
+            git_head_refreshed_for: None,
             editor,
             view,
             paint_cache: PaintCache::default(),
@@ -514,6 +577,8 @@ impl Buffer {
             find_ui: FindUi::default(),
             agent_proposal: None,
             active_session: None,
+            table_overflow: crate::panels::buffer::widgets::tables::TableViewMap::new(),
+            editing_cell: None,
         }
     }
 

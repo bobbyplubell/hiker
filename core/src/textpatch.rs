@@ -6,7 +6,7 @@
 //! patch-review surface uses the same anchor-resolution rules to decide where
 //! to render decorations. Pure functions, no I/O — formerly part of the
 //! retired `core::staging` module, lifted out intact when staging moved onto
-//! the op log.
+//! the layered doc.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

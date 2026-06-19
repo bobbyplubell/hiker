@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 
-use super::Source;
+use super::source::Source;
 
 /// Random scatter seed of `n` points in a `box_size`-wide box centered on
 /// the origin. Deterministic LCG — the force layout converges from any
@@ -207,7 +207,10 @@ pub(super) fn build_warm_seed(
 
 #[cfg(test)]
 mod warm_seed_tests {
-    use super::super::{LayoutKind, LayoutTree, NodeDescriptor, Style};
+    use crate::graph_view::source::NodeDescriptor;
+    use crate::graph_view::styling::Style;
+    use hiker_graph::{LayoutKind, LayoutTree};
+
     use super::*;
 
     /// Minimal [`Source`] for the warm-seed helper: each node's key is its
@@ -327,7 +330,10 @@ mod warm_seed_tests {
 
 #[cfg(test)]
 mod adaptive_anchor_tests {
-    use super::super::{LayoutKind, LayoutTree, NodeDescriptor, Style};
+    use crate::graph_view::source::NodeDescriptor;
+    use crate::graph_view::styling::Style;
+    use hiker_graph::{LayoutKind, LayoutTree};
+
     use super::*;
 
     /// A [`Source`] with a fixed node count and an explicit edge list, keyed by

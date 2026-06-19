@@ -294,7 +294,7 @@ async fn ingesting_trail_doc_and_waypoint_populates_derived_table() {
     // Trail-doc + waypoint in the trail-doc's *visible* companion folder
     // (`trails/my-trail/`, per note-companion-folder). status:
     // trail-path-references — no `hiker.id`; the trail's storage key is its
-    // op-log doc_id, looked up below.
+    // layered-doc doc_id, looked up below.
     std::fs::create_dir_all(dir.path().join("trails/my-trail")).unwrap();
     let trail_doc =
         "---\nhiker:\n  kind: trail\n  waypoints:\n    - path: trails/my-trail/0001--raptor.md\n---\nbody\n";
@@ -308,15 +308,15 @@ async fn ingesting_trail_doc_and_waypoint_populates_derived_table() {
     let store = Store::open(dir.path()).unwrap();
     let vault = crate::vault::Vault::open(dir.path()).unwrap();
     // status: store-path-is-identity / op-log-bootstraps-first
-    // The trail / waypoint derived-table re-derive reads the op-log's
+    // The trail / waypoint derived-table re-derive reads the layered doc's
     // doc_id mapping; bootstrap + attach before any ingest. The waypoint
     // now lives in the visible companion folder, so the main bootstrap pass
     // seeds it — no explicit `.hiker/` seed needed.
-    let oplog = std::sync::Arc::new(crate::oplog::OpLog::open(dir.path()).unwrap());
-    crate::ops::op_writes::bootstrap(&vault, &oplog).unwrap();
+    let layered = std::sync::Arc::new(crate::editing::LayeredDoc::open(dir.path()).unwrap());
+    crate::ops::op_writes::bootstrap(&vault, &layered).unwrap();
     let waypoint_rel = "trails/my-trail/0001--raptor.md".to_string();
     let handle = start(vault, store, mock_loader());
-    handle.attach_oplog(oplog.clone());
+    handle.attach_layered(layered.clone());
     let mut prog = handle.subscribe_progress();
     await_event(&mut prog, |e| matches!(e, ProgressEvent::ModelLoaded)).await;
 
@@ -349,13 +349,13 @@ async fn ingesting_trail_doc_and_waypoint_populates_derived_table() {
     .await;
 
     // Verify derived rows. status: store-path-is-identity —
-    // `trail_id` / `waypoint_id` are now the op-log doc_ids for the
+    // `trail_id` / `waypoint_id` are now the layered-doc doc_ids for the
     // trail-doc / waypoint-note paths, not the legacy `hiker.id` stamps.
-    let trail_doc_id = oplog
+    let trail_doc_id = layered
         .doc_id_for_path("trails/my-trail.md")
         .unwrap()
         .expect("trail-doc seeded");
-    let waypoint_doc_id = oplog
+    let waypoint_doc_id = layered
         .doc_id_for_path(&waypoint_rel)
         .unwrap()
         .expect("waypoint seeded");
@@ -393,4 +393,150 @@ async fn txt_files_are_indexed() {
     assert!(!chunks.is_empty());
     assert!(chunks.iter().any(|c| c.text.contains("first paragraph")));
     assert!(chunks.iter().any(|c| c.text.contains("second paragraph")));
+}
+
+/// Ingesting a sprint board-doc derives `board_cards` rows exactly like a
+/// plain board once the kind registry is attached — the indexer's
+/// `update_board_cards_if_relevant` is one of the three registry-aware
+/// parse-gate callers (`sprint-board-subtype`). An unregistered board-like
+/// pretender stays inert.
+#[tokio::test]
+async fn sprint_board_doc_ingest_derives_board_cards() {
+    let dir = tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("boards")).unwrap();
+    fs::write(dir.path().join("story.md"), b"the story\n").unwrap();
+    let sprint = "---\nhiker:\n  kind: sprint\n  columns:\n    - name: Doing\n      cards:\n        - { path: story.md }\n---\n";
+    fs::write(dir.path().join("boards/s1.md"), sprint).unwrap();
+    let pretender = "---\nhiker:\n  kind: zettel\n  columns:\n    - name: Doing\n      cards:\n        - { path: story.md }\n---\n";
+    fs::write(dir.path().join("boards/z.md"), pretender).unwrap();
+
+    let store = Store::open(dir.path()).unwrap();
+    let vault = crate::vault::Vault::open(dir.path()).unwrap();
+    let layered = std::sync::Arc::new(crate::editing::LayeredDoc::open(dir.path()).unwrap());
+    crate::ops::op_writes::bootstrap(&vault, &layered).unwrap();
+    let handle = start(vault, store, mock_loader());
+    handle.attach_layered(layered.clone());
+    handle.attach_kind_registry(std::sync::Arc::new(crate::kinds::builtin_registry()));
+    let mut prog = handle.subscribe_progress();
+    await_event(&mut prog, |e| matches!(e, ProgressEvent::ModelLoaded)).await;
+
+    for p in ["story.md", "boards/s1.md", "boards/z.md"] {
+        handle.index_path(p).await.unwrap();
+        await_event(&mut prog, |e| {
+            matches!(e, ProgressEvent::Finished { path } if path == p)
+        })
+        .await;
+    }
+
+    let reader = Store::open(dir.path()).unwrap();
+    let containing = reader.boards_containing_note("story.md").unwrap();
+    assert_eq!(containing.len(), 1, "sprint rows derived; pretender inert");
+    assert_eq!(containing[0].board_path, "boards/s1.md");
+    assert_eq!(containing[0].column_name, "Doing");
+}
+
+/// Ingesting a note whose `hiker.kind` names a registered kind re-derives
+/// its lenient-validation problems into the store; a clean note (or one
+/// with an unregistered kind) keeps no rows. `kind-lenient-validation` —
+/// the write is never blocked, the file never rewritten.
+#[tokio::test]
+async fn ingest_derives_lenient_validation_problems() {
+    let dir = tempdir().unwrap();
+    fs::write(
+        dir.path().join("bad-story.md"),
+        b"---\nhiker:\n  kind: story\npriority: soon\ndue: someday\n---\nbody\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("good-story.md"),
+        b"---\nhiker:\n  kind: story\npriority: 2\ndue: 2026-07-01\n---\nbody\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("unregistered.md"),
+        b"---\nhiker:\n  kind: zettel\npriority: soon\n---\nbody\n",
+    )
+    .unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let handle = start(crate::vault::Vault::open(dir.path()).unwrap(), store, mock_loader());
+    // Use the built-in PM set (story carries number/date fields).
+    handle.attach_kind_registry(std::sync::Arc::new(crate::kinds::builtin_registry()));
+    let mut prog = handle.subscribe_progress();
+    await_event(&mut prog, |e| matches!(e, ProgressEvent::ModelLoaded)).await;
+
+    for p in ["bad-story.md", "good-story.md", "unregistered.md"] {
+        handle.index_path(p).await.unwrap();
+        await_event(&mut prog, |e| {
+            matches!(e, ProgressEvent::Finished { path } if path == p)
+        })
+        .await;
+    }
+
+    let reader = Store::open(dir.path()).unwrap();
+    // The file is untouched on disk (never rewritten)...
+    let raw_body = fs::read_to_string(dir.path().join("bad-story.md")).unwrap();
+    assert!(raw_body.contains("priority: soon"));
+    // ...and carries one problem per violated primitive.
+    let problems = reader.note_problems("bad-story.md").unwrap();
+    let fields: Vec<&str> = problems.iter().map(|p| p.field.as_str()).collect();
+    assert_eq!(fields, vec!["due", "priority"]);
+    assert!(reader.note_problems("good-story.md").unwrap().is_empty());
+    // Unregistered `hiker.kind` values stay inert — never validated.
+    assert!(reader.note_problems("unregistered.md").unwrap().is_empty());
+}
+
+/// Ingesting a list-like note (`hiker.kind: epic` from the registry)
+/// derives `list_refs` rows in ref order; an unregistered list-like
+/// pretender stays inert; deleting the list-doc clears its rows — the
+/// `board_cards` lifecycle exactly (`pm-epic-derived-table`).
+#[tokio::test]
+async fn list_doc_ingest_derives_and_delete_clears_list_refs() {
+    let dir = tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("epics")).unwrap();
+    let epic =
+        "---\nhiker:\n  kind: epic\n  refs:\n    - { path: b.md }\n    - { path: a.md }\n---\nframing\n";
+    fs::write(dir.path().join("epics/e1.md"), epic).unwrap();
+    let pretender = epic.replace("kind: epic", "kind: roadmap");
+    fs::write(dir.path().join("epics/z.md"), pretender).unwrap();
+
+    let store = Store::open(dir.path()).unwrap();
+    let handle = start(crate::vault::Vault::open(dir.path()).unwrap(), store, mock_loader());
+    handle.attach_kind_registry(std::sync::Arc::new(crate::kinds::builtin_registry()));
+    let mut prog = handle.subscribe_progress();
+    await_event(&mut prog, |e| matches!(e, ProgressEvent::ModelLoaded)).await;
+
+    for p in ["epics/e1.md", "epics/z.md"] {
+        handle.index_path(p).await.unwrap();
+        await_event(&mut prog, |e| {
+            matches!(e, ProgressEvent::Finished { path } if path == p)
+        })
+        .await;
+    }
+
+    let reader = Store::open(dir.path()).unwrap();
+    let members = reader.members_of("epics/e1.md").unwrap();
+    assert_eq!(
+        members.iter().map(|m| m.member_path.as_str()).collect::<Vec<_>>(),
+        ["b.md", "a.md"],
+        "rows derived in ref order"
+    );
+    assert!(
+        reader.members_of("epics/z.md").unwrap().is_empty(),
+        "unregistered kind derives nothing"
+    );
+    let containing = reader.lists_containing_note("a.md").unwrap();
+    assert_eq!(containing.len(), 1);
+    assert_eq!(containing[0].list_path, "epics/e1.md");
+
+    // Delete clears the list's derived rows.
+    handle
+        .enqueue(IndexJob::Delete { rel_path: "epics/e1.md".into() })
+        .await
+        .unwrap();
+    await_event(&mut prog, |e| {
+        matches!(e, ProgressEvent::Deleted { path } if path == "epics/e1.md")
+    })
+    .await;
+    let reader = Store::open(dir.path()).unwrap();
+    assert!(reader.members_of("epics/e1.md").unwrap().is_empty());
 }

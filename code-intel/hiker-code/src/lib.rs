@@ -5,5 +5,14 @@
 //! Next: `scip_adapter` — parse a `.scip`, build the graph (range-containment for call edges,
 //! `relationships` for impl/type edges), implement `DerivedNodeSource`.
 
+pub mod churn;
+pub mod governance;
 pub mod scip_adapter;
-pub use scip_adapter::{CodeGraph, GraphNode, ScipAdapter};
+pub mod seeds;
+pub use churn::{churn_report, churn_window, ChurnReport, CommitChurn, FileChurn, SpecChurn};
+pub use governance::{GovState, Governance};
+pub use scip_adapter::{
+    collapse, crate_qualified_sym, index_short_forms, short_sym, symbol_changed_vs, CodeGraph,
+    CollapsedGraph, GraphNode, ScipAdapter,
+};
+pub use seeds::{comment_seeds, CommentCrawl, CommentSeed};

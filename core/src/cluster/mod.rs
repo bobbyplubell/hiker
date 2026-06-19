@@ -396,8 +396,7 @@ impl Default for LeidenParams {
 /// lower-case without the leading dot, e.g. `"md"` or `"txt"`) that the
 /// build pass + triage classifier accept. `"md"` matches both `.md` and
 /// `.markdown` (the indexer treats them identically). Empty vec = no
-/// filter = every indexable extension is in scope (legacy behavior; old
-/// persisted trees deserialize cleanly via `#[serde(default)]`).
+/// filter = every indexable extension is in scope (the default).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum BuildScope {
@@ -477,21 +476,10 @@ pub struct Params {
     pub min_cluster_size: u32,
     /// `None` → defaults to `min_cluster_size` at runtime.
     pub min_samples: Option<u32>,
-    /// Legacy termination knob from the pre-ops-framework build pipeline.
-    /// Replaced by the per-branch recursion checks on `Db::split_cluster`
-    /// (`recurse` + `leaf_min_size` + `leaf_cohesion_threshold`). Kept
-    /// deserializable so persisted `cluster_trees.method` JSON from before
-    /// the ops-framework migration round-trips; `skip_serializing` so new
-    /// rows don't carry the dead field. Per `cluster-op-split`'s "Surviving
-    /// / changed knobs" table.
-    #[serde(default, skip_serializing)]
-    pub min_clusters_to_recurse: u32,
     pub summary_confidence_threshold: f32,
     pub include_outliers: bool,
     pub summarize: SummarizeMode,
     /// Leiden-specific tunables. Dormant unless `algorithm == Leiden`.
-    /// `serde(default)` keeps old persisted `cluster_trees.method` JSON
-    /// (which predates this field) deserializing cleanly.
     /// Per `cluster-leiden-params`.
     #[serde(default)]
     pub leiden: LeidenParams,
@@ -535,7 +523,6 @@ impl Default for Params {
             algorithm: Algorithm::Hdbscan,
             min_cluster_size: 5,
             min_samples: None,
-            min_clusters_to_recurse: 4,
             summary_confidence_threshold: 0.5,
             include_outliers: true,
             summarize: SummarizeMode::Llm,

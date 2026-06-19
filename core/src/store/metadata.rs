@@ -14,8 +14,8 @@ use rusqlite::params;
 use rusqlite::types::ToSql;
 
 use super::dto::{
-    title_from_path, MetaEntry, MetaFilter, NoteMetaRow, NoteOrder, NoteQuery, NoteQueryRow,
-    OrderDir,
+    title_from_path, MetaEntry, MetaFilter, NoteMetaRow, NoteOrder, NoteProblem, NoteQuery,
+    NoteQueryRow, OrderDir,
 };
 use super::error::Error;
 use super::Store;
@@ -120,13 +120,23 @@ impl Store {
 
         for f in &q.filters {
             match f {
-                MetaFilter::Equals { key, value } => {
-                    sql.push_str(
+                MetaFilter::Equals { key, values } => {
+                    // Value-list OR inside one EXISTS (`query-filter-grammar`).
+                    // An empty list matches nothing; SQLite rejects `IN ()`,
+                    // so compile it to a constant-false term instead.
+                    if values.is_empty() {
+                        sql.push_str(" AND 0");
+                        continue;
+                    }
+                    let placeholders = vec!["?"; values.len()].join(",");
+                    sql.push_str(&format!(
                         " AND EXISTS (SELECT 1 FROM note_meta m \
-                         WHERE m.note_id = n.path AND m.key = ? AND m.value = ?)",
-                    );
+                         WHERE m.note_id = n.path AND m.key = ? AND m.value IN ({placeholders}))",
+                    ));
                     binds.push(Box::new(key.clone()));
-                    binds.push(Box::new(value.clone()));
+                    for v in values {
+                        binds.push(Box::new(v.clone()));
+                    }
                 }
                 MetaFilter::Exists { key } => {
                     sql.push_str(
@@ -151,6 +161,37 @@ impl Store {
                     }
                     sql.push(')');
                 }
+                MetaFilter::Board { board_path, columns } => {
+                    // Board membership joins through the derived
+                    // `board_cards` table (`query-filter-grammar`); freeform
+                    // cards never appear there, so only note cards match.
+                    // `columns` is the (possibly category-expanded,
+                    // `kind-column-state-map`) name set: `None` = whole
+                    // board; an empty set matches nothing (SQLite rejects
+                    // `IN ()`, so compile it to a constant-false term).
+                    sql.push_str(
+                        " AND EXISTS (SELECT 1 FROM board_cards b \
+                         WHERE b.card_note_path = n.path AND b.board_path = ?",
+                    );
+                    binds.push(Box::new(board_path.clone()));
+                    match columns {
+                        Some(cols) if cols.is_empty() => sql.push_str(" AND 0"),
+                        Some(cols) => {
+                            let placeholders = vec!["?"; cols.len()].join(",");
+                            sql.push_str(&format!(" AND b.column_name IN ({placeholders})"));
+                            for c in cols {
+                                binds.push(Box::new(c.clone()));
+                            }
+                        }
+                        None => {}
+                    }
+                    sql.push(')');
+                }
+                MetaFilter::MatchNone => {
+                    // Constant-false term (no bind): a predicate-less query
+                    // matches nothing rather than the whole vault.
+                    sql.push_str(" AND 0");
+                }
             }
         }
 
@@ -160,6 +201,15 @@ impl Store {
                 sql.push_str(" AND n.path GLOB ?");
                 binds.push(Box::new(format!("{prefix}/*")));
             }
+        }
+        if let Some(glob) = &q.path_glob {
+            sql.push_str(" AND n.path GLOB ?");
+            binds.push(Box::new(glob.clone()));
+        }
+        // status: rule-condition-reuses-queries
+        if let Some(path) = &q.path_eq {
+            sql.push_str(" AND n.path = ?");
+            binds.push(Box::new(path.clone()));
         }
 
         // Meta-keyed ordering uses a correlated scalar subquery so a note
@@ -260,5 +310,164 @@ impl Store {
             }
         }
         Ok(())
+    }
+
+    /// Every indexed `note_meta` row for one note, in key order — the
+    /// before-rows read the rule pass diffs across `replace_note_metadata`
+    /// to detect `frontmatter-changed` (`docs/rules.md`).
+    ///
+    /// status: rule-triggers
+    pub fn note_metadata(&self, note_id: &str) -> Result<Vec<MetaEntry>, Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT key, value, num FROM note_meta WHERE note_id = ?1 ORDER BY key, value",
+        )?;
+        let rows = stmt
+            .query_map(params![note_id], |row| {
+                Ok(MetaEntry { key: row.get(0)?, value: row.get(1)?, num: row.get(2)? })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Distinct note paths whose indexed `(key, num)` mirror falls in
+    /// `(gt, lte]` — the `date-passed` sweep's "crossings since the last
+    /// watermark" read over the epoch mirror (`docs/rules.md`). Exclusive
+    /// at the watermark so a crossing fires exactly once.
+    ///
+    /// status: rule-triggers
+    pub fn note_paths_with_meta_num_between(
+        &self,
+        key: &str,
+        gt: f64,
+        lte: f64,
+    ) -> Result<Vec<String>, Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT m.note_id FROM note_meta m
+             JOIN notes n ON n.path = m.note_id AND n.skipped = 0
+             WHERE m.key = ?1 AND m.num IS NOT NULL AND m.num > ?2 AND m.num <= ?3
+             ORDER BY m.note_id",
+        )?;
+        let rows = stmt
+            .query_map(params![key, gt, lte], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// One value from the store's `meta(key, value)` sidecar table — the
+    /// same row family `chunk_vecs_dim` lives in. Backs the rules layer's
+    /// date-sweep watermark.
+    ///
+    /// status: rule-triggers
+    pub fn meta_kv_get(&self, key: &str) -> Result<Option<String>, Error> {
+        use rusqlite::OptionalExtension;
+        let v = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(v)
+    }
+
+    /// Upsert one `meta(key, value)` sidecar row.
+    ///
+    /// status: rule-triggers
+    pub fn meta_kv_set(&self, key: &str, value: &str) -> Result<(), Error> {
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// One indexed frontmatter value for `(note_path, key)`, or `None` when
+    /// the note carries no such key. A list-valued key collapses to its
+    /// first row in `value` order — a deterministic `ORDER BY` so repeated
+    /// calls return the same row rather than whichever the engine happens to
+    /// surface. Backs the query layer's category expansion (reading a
+    /// board-doc's `hiker.kind`, `kind-column-state-map`) and the lenient
+    /// validation's ref-target kind check (`kind-lenient-validation`).
+    pub fn meta_value(&self, note_path: &str, key: &str) -> Result<Option<String>, Error> {
+        use rusqlite::OptionalExtension;
+        let v = self
+            .conn
+            .query_row(
+                "SELECT value FROM note_meta WHERE note_id = ?1 AND key = ?2 \
+                 ORDER BY value LIMIT 1",
+                params![note_path, key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(v)
+    }
+
+    /// Replace the `note_problems` rows for `note_path` in one transaction.
+    /// Called by the indexer right after `replace_note_metadata` — the
+    /// lenient-validation report is a derived view, re-derived on ingest
+    /// like `note_meta`. An empty slice clears any stale rows (a note that
+    /// became clean, or stopped carrying a registered kind).
+    ///
+    /// status: kind-lenient-validation
+    pub fn replace_note_problems(
+        &mut self,
+        note_path: &str,
+        problems: &[NoteProblem],
+    ) -> Result<(), Error> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM note_problems WHERE note_path = ?1", params![note_path])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO note_problems (note_path, field, message) VALUES (?1, ?2, ?3)",
+            )?;
+            for p in problems {
+                stmt.execute(params![note_path, p.field, p.message])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The lenient-validation problems recorded for one note (empty =
+    /// clean or never validated). Backs the per-note badge / report.
+    pub fn note_problems(&self, note_path: &str) -> Result<Vec<NoteProblem>, Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT field, message FROM note_problems WHERE note_path = ?1 ORDER BY field, message",
+        )?;
+        let rows = stmt
+            .query_map(params![note_path], |row| {
+                Ok(NoteProblem { field: row.get(0)?, message: row.get(1)? })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Every note carrying validation problems, with its problem count —
+    /// the vault-wide problems report / badge data, one indexed query.
+    pub fn notes_with_problems(&self) -> Result<Vec<(String, u32)>, Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT note_path, COUNT(*) FROM note_problems GROUP BY note_path ORDER BY note_path",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?.max(0) as u32))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// True when any indexed row for `key` carries a numeric mirror. One
+    /// probe on the `(key, num)` index; the query layer uses it to order a
+    /// field by its numeric mirror when present and by its text value
+    /// otherwise (`docs/queries.md` §"Filter grammar").
+    pub fn meta_key_has_num(&self, key: &str) -> Result<bool, Error> {
+        let found: i64 = self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM note_meta WHERE key = ?1 AND num IS NOT NULL)",
+            params![key],
+            |row| row.get(0),
+        )?;
+        Ok(found != 0)
     }
 }

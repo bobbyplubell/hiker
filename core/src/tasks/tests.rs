@@ -33,7 +33,7 @@ async fn submit_and_complete_round_trip() {
     let q = Queue::new(cfg);
     let handle = q
         .submit(task(
-            TaskKind::AutoTag { source_path: "a.md".into() },
+            TaskKind::RaptorTriageMatch { tree_id: "t".into(), source_path: "a.md".into() },
             Priority::Normal,
             TaskShape::Direct,
         ))
@@ -55,7 +55,7 @@ async fn cancel_queued_task_resolves_handle() {
     let q = Queue::new(TasksConfig::default());
     let handle = q
         .submit(task(
-            TaskKind::AutoTag { source_path: "a.md".into() },
+            TaskKind::RaptorTriageMatch { tree_id: "t".into(), source_path: "a.md".into() },
             Priority::Normal,
             TaskShape::Direct,
         ))
@@ -79,7 +79,7 @@ async fn priority_ordering_high_drains_first() {
     let q = Queue::new(cfg);
     let _low = q
         .submit(task(
-            TaskKind::AutoTag { source_path: "low.md".into() },
+            TaskKind::RaptorTriageMatch { tree_id: "t".into(), source_path: "low.md".into() },
             Priority::Low,
             TaskShape::Direct,
         ))
@@ -88,7 +88,7 @@ async fn priority_ordering_high_drains_first() {
     tokio::time::sleep(Duration::from_millis(2)).await;
     let high_handle = q
         .submit(task(
-            TaskKind::AutoTag { source_path: "hi.md".into() },
+            TaskKind::RaptorTriageMatch { tree_id: "t".into(), source_path: "hi.md".into() },
             Priority::High,
             TaskShape::Direct,
         ))
@@ -124,7 +124,7 @@ async fn schema_violation_rejects_submit() {
         ..Default::default()
     });
     let mut t = task(
-        TaskKind::AutoTag { source_path: "a.md".into() },
+        TaskKind::RaptorTriageMatch { tree_id: "t".into(), source_path: "a.md".into() },
         Priority::Normal,
         TaskShape::Direct,
     );
@@ -153,14 +153,14 @@ async fn mcp_checkout_filters_min_priority() {
     });
     let _low = q
         .submit(task(
-            TaskKind::AutoTag { source_path: "lo.md".into() },
+            TaskKind::RaptorTriageMatch { tree_id: "t".into(), source_path: "lo.md".into() },
             Priority::Low,
             TaskShape::Direct,
         ))
         .await;
     let normal = q
         .submit(task(
-            TaskKind::AutoTag { source_path: "no.md".into() },
+            TaskKind::RaptorTriageMatch { tree_id: "t".into(), source_path: "no.md".into() },
             Priority::Normal,
             TaskShape::Direct,
         ))
@@ -187,7 +187,7 @@ async fn lease_expiry_requeues_via_tick() {
     });
     let h = q
         .submit(task(
-            TaskKind::AutoTag { source_path: "a.md".into() },
+            TaskKind::RaptorTriageMatch { tree_id: "t".into(), source_path: "a.md".into() },
             Priority::Normal,
             TaskShape::Direct,
         ))

@@ -52,10 +52,10 @@ pub(crate) mod bootstrap;
 pub(crate) mod canvas_activity;
 #[path = "src/projects_activity/mod.rs"]
 pub(crate) mod projects_activity;
+#[path = "src/code_sources.rs"]
+pub(crate) mod code_sources;
 #[path = "src/charts.rs"]
 pub(crate) mod charts;
-#[path = "src/chat/mod.rs"]
-pub(crate) mod chat;
 #[path = "src/clusters/mod.rs"]
 pub(crate) mod clusters;
 #[path = "src/command_center.rs"]
@@ -90,10 +90,10 @@ pub(crate) mod search;
 pub(crate) mod side_panel_persist;
 #[path = "src/sidebar/mod.rs"]
 pub(crate) mod sidebar;
+#[path = "src/source_control/mod.rs"]
+pub(crate) mod source_control;
 #[path = "src/state.rs"]
 pub(crate) mod state;
-#[path = "src/sync_service/mod.rs"]
-pub(crate) mod sync_service;
 #[path = "src/tab.rs"]
 pub(crate) mod tab;
 #[path = "src/titlebar.rs"]

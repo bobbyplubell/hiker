@@ -93,12 +93,18 @@ fn render_body(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>) {
 /// it. Tree construction (the nesting authority) lives in `tree.rs`; this is
 /// the egui paint over its output.
 fn render_composed(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>) {
-    let (notes, waypoints) = match ctx.services.read_store.lock() {
+    // Smart-folder membership recomputes from the indexed store on render,
+    // like the sibling derived projections below — query-docs come from one
+    // `hiker.kind = query` lookup, members from `run_query`, never a vault
+    // walk (`smart-folder-view`).
+    let (notes, waypoints, folders) = match ctx.services.read_store.lock() {
         Ok(s) => (
             s.notes_with_meta().unwrap_or_default(),
             s.all_trail_waypoints().unwrap_or_default(),
+            hiker_core::queries::smart_folders(&s, ctx.vault, &ctx.services.kinds)
+                .unwrap_or_default(),
         ),
-        Err(_) => (Vec::new(), Vec::new()),
+        Err(_) => (Vec::new(), Vec::new(), Vec::new()),
     };
     if notes.is_empty() {
         ui.add_space(8.0);
@@ -112,7 +118,7 @@ fn render_composed(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>) {
         .filter(|n| n.kind.as_deref() == Some("cluster-tree"))
         .map(|n| n.path.clone())
         .collect();
-    let forest = tree::build_composed(&notes, &waypoints);
+    let forest = tree::build_composed(&notes, &waypoints, &folders);
     for node in &forest {
         render_node(ui, ctx, node, 0, &tree_paths);
     }
@@ -126,6 +132,10 @@ fn node_icon(kind: NodeKind) -> egui::Image<'static> {
         NodeKind::Trail => icons::Icon::Boot,
         NodeKind::Waypoint => icons::Icon::Bookmark,
         NodeKind::Session => icons::Icon::Chat,
+        // The query glyph marks a smart-folder header (`smart-folder-view`).
+        NodeKind::Query => icons::Icon::Search,
+        NodeKind::QueryMember => icons::Icon::File,
+        NodeKind::QueryError => icons::Icon::Warning,
         NodeKind::Note => icons::Icon::File,
     };
     icons::ICONS.image(icon)
@@ -133,7 +143,9 @@ fn node_icon(kind: NodeKind) -> egui::Image<'static> {
 
 /// Recursively render one derived node. Nodes with children get a collapse
 /// chevron (keyed by path or label); leaves open their note on click.
-/// Read-only: no drag, no placement mutation (`vault-view-readonly-lens`).
+/// Read-only as a lens (`vault-view-readonly-lens`): rows are drag SOURCES
+/// (the uniform vault-path payload, `interaction.md` [drag-note-payload]) but
+/// never drop targets — dragging out mutates nothing here.
 ///
 /// A row whose path is a cluster-tree note gets a rich force-directed preview
 /// thumbnail before its label (`vault-view-row-previews`); the generic
@@ -180,9 +192,36 @@ fn render_node(
         {
             row_tree_thumbnail(ui, ctx, path);
         }
-        let btn = egui::Button::image_and_text(node_icon(node.kind), node.label.clone())
-            .frame(false);
-        let resp = ui.add(btn);
+        // A smart-folder member is a *virtual* row — the note lives at its
+        // real path elsewhere — so it renders italic, with a muted "ref"
+        // badge appended below, per the lens's shared not-a-real-residence
+        // marking (`smart-folder-view`).
+        let label: egui::WidgetText = if node.kind == NodeKind::QueryMember {
+            egui::RichText::new(node.label.clone()).italics().into()
+        } else {
+            node.label.clone().into()
+        };
+        // Rows with a path open a note, so they carry the full note-row
+        // grammar: drag senses for the vault-path payload below, and the
+        // pointer cursor pairs with the button's themed hover wash
+        // (`interaction.md` [hover-open-signal] / [drag-note-payload]).
+        let btn = egui::Button::image_and_text(node_icon(node.kind), label).frame(false);
+        let resp = if node.path.is_some() {
+            ui.add(btn.sense(egui::Sense::click_and_drag()))
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+        } else {
+            ui.add(btn)
+        };
+        if let Some(p) = node.path.as_deref() {
+            crate::widgets::note_row::note_drag_source(ui, &resp, p, &node.label);
+        }
+        if node.kind == NodeKind::QueryMember {
+            ui.label(
+                egui::RichText::new("ref")
+                    .small()
+                    .color(hiker_theme::muted()),
+            );
+        }
         // Exactly one hover affordance per row, so nothing overlaps:
         //  - a regular note row → the rich read-only markdown preview;
         //  - a cluster-tree row → its own inline thumbnail + expand preview;
@@ -201,17 +240,24 @@ fn render_node(
             resp
         };
         if let Some(p) = node.path.as_deref() {
-            crate::item_menu::attach_note_item_menu(
-                &resp,
-                ctx,
-                p,
-                crate::item_menu::BaseOpts { reveal: true },
-            );
+            // A smart-folder header composes the host-contextual scoped-graph
+            // verb onto the base; every other row keeps the plain base menu.
+            // status: graph-scoped-query
+            if node.kind == NodeKind::Query {
+                query_header_menu(&resp, ctx, p);
+            } else {
+                crate::item_menu::attach_note_item_menu(
+                    &resp,
+                    ctx,
+                    p,
+                    crate::item_menu::BaseOpts { reveal: true },
+                );
+            }
         }
         if resp.clicked()
             && let Some(p) = node.path.clone()
         {
-            let sticky = ui.input(|i| i.modifiers.command);
+            let sticky = crate::widgets::note_row::open_sticky(ui.input(|i| i.modifiers));
             ctx.defer(move |app| editor_pane::open_file(app, &p, sticky));
         }
     });
@@ -220,6 +266,36 @@ fn render_node(
         for child in &node.children {
             render_node(ui, ctx, child, depth + 1, tree_paths);
         }
+    }
+}
+
+/// The smart-folder header's context menu: the shared note-item base plus
+/// the host-contextual "Open in graph, scoped" verb — the vault graph
+/// bounded to this query's match set (`graph-scoped-query`; the contextual
+/// composition `ctxmenu-contextual-extend` exists for). Dispatch defers
+/// through `ctx`, the standard app-surface path.
+fn query_header_menu(resp: &egui::Response, ctx: &mut SurfaceCtx<'_>, path: &str) {
+    enum Verb {
+        Base(crate::item_menu::ItemAction),
+        OpenScoped,
+    }
+    let mut chosen = None;
+    resp.context_menu(|ui| {
+        let menu = crate::item_menu::note_item_base(
+            path,
+            crate::item_menu::BaseOpts { reveal: true },
+            Verb::Base,
+        )
+        .section()
+        .action("Open in graph, scoped", Verb::OpenScoped);
+        chosen = egui_workbench::menu::show(ui, menu);
+    });
+    if let Some(verb) = chosen {
+        let owned = path.to_owned();
+        ctx.defer(move |app| match verb {
+            Verb::Base(a) => crate::item_menu::apply_item_action(app, a, &owned),
+            Verb::OpenScoped => crate::panels::graph::open_scoped(app, &owned),
+        });
     }
 }
 
@@ -301,13 +377,17 @@ fn note_row(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>, rel: &str, depth: usize
     let indent = 8.0 + depth as f32 * 14.0;
     ui.horizontal(|ui| {
         ui.add_space(indent);
-        let resp = ui.add(
-            egui::Button::image_and_text(
-                icons::ICONS.image(icons::Icon::File),
-                basename(rel),
+        let resp = ui
+            .add(
+                egui::Button::image_and_text(
+                    icons::ICONS.image(icons::Icon::File),
+                    basename(rel),
+                )
+                .frame(false)
+                .sense(egui::Sense::click_and_drag()),
             )
-            .frame(false),
-        );
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        crate::widgets::note_row::note_drag_source(ui, &resp, rel, basename(rel));
         // The rich markdown hover preview is this row's single hover affordance —
         // no separate path tooltip, so the two don't overlap.
         if resp.hovered() {
@@ -320,7 +400,7 @@ fn note_row(ui: &mut egui::Ui, ctx: &mut SurfaceCtx<'_>, rel: &str, depth: usize
             crate::item_menu::BaseOpts { reveal: true },
         );
         if resp.clicked() {
-            let sticky = ui.input(|i| i.modifiers.command);
+            let sticky = crate::widgets::note_row::open_sticky(ui.input(|i| i.modifiers));
             let rel_owned = rel.to_string();
             ctx.defer(move |app| editor_pane::open_file(app, &rel_owned, sticky));
         }

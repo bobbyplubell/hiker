@@ -19,8 +19,10 @@ mod notes;
 mod boards;
 mod centroids;
 mod chunks;
+mod lists;
 mod metadata;
 mod search;
+mod spec_anchors;
 mod trails;
 
 #[cfg(test)]
@@ -89,7 +91,7 @@ use vec::read_chunk_vecs_dim;
 /// callers, so they're gone.
 ///
 /// v12 made the note's vault path its identity (`op-log-path-identity`):
-/// `notes.id` (the minted ULID / op-log doc_id) is dropped — `notes.path` is
+/// `notes.id` (the minted ULID / layered-doc doc_id) is dropped — `notes.path` is
 /// now the primary key. `chunks.note_id` becomes `chunks.note_path`
 /// (FK → `notes(path)` ON DELETE/UPDATE CASCADE), and the vec-join key
 /// `chunk_vecs.chunk_id` is `"<note_path>:<idx>"`. The derived-table key
@@ -148,7 +150,34 @@ impl Store {
             });
         }
 
-        conn.execute_batch(&format!(
+        create_schema(&conn, dim_arg)?;
+
+        if user_version == 0 {
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tracing::info!(
+                schema_version = SCHEMA_VERSION,
+                "store: created index db schema",
+            );
+        }
+        // Seed the chunk_vecs_dim meta row on first open if it's not already
+        // there. Idempotent: an existing row (any value) is left alone — the
+        // live writer's `ensure_chunk_vecs_dim` is the only path that bumps
+        // it.
+        conn.execute(
+            "INSERT OR IGNORE INTO meta (key, value) VALUES ('chunk_vecs_dim', ?1)",
+            params![dim_arg.to_string()],
+        )?;
+        let dim = read_chunk_vecs_dim(&conn)?.unwrap_or(DEFAULT_EMBED_DIM);
+        Ok(Self { conn, db_path, dim })
+    }
+}
+
+/// Idempotent schema setup (`CREATE TABLE IF NOT EXISTS` throughout) —
+/// the body of [`Store::open`], split out so the open path stays inside
+/// the function-length budget as derived tables accrete. `dim` sizes the
+/// `chunk_vecs` embedding column on a brand-new vault.
+fn create_schema(conn: &Connection, dim: usize) -> Result<(), Error> {
+    conn.execute_batch(&format!(
             r#"
             CREATE TABLE IF NOT EXISTS notes (
                 path             TEXT PRIMARY KEY,
@@ -258,11 +287,31 @@ impl Store {
             CREATE INDEX IF NOT EXISTS board_cards_note_path  ON board_cards(card_note_path);
             CREATE INDEX IF NOT EXISTS board_cards_board_path ON board_cards(board_path);
 
+            -- status: pm-epic-derived-table
+            -- Derived index of list-like membership edges (`docs/pm.md`):
+            -- one row per path entry in a list-like note's `hiker.refs`
+            -- frontmatter (epics, plans, any registered list-like kind). The
+            -- `board_cards` lifecycle exactly: re-derived on ingest
+            -- (clear-by-list + re-insert), cleared on list-doc delete,
+            -- re-keyed on rename. Generic over the shape — the table is pure
+            -- structure; what a membership *means* stays on the kind. Keyed
+            -- on vault paths (path-as-identity). Added without a
+            -- schema-version bump (`CREATE TABLE IF NOT EXISTS`).
+            CREATE TABLE IF NOT EXISTS list_refs (
+                list_path   TEXT NOT NULL,
+                member_path TEXT NOT NULL,
+                position    INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS list_refs_list_path   ON list_refs(list_path);
+            CREATE INDEX IF NOT EXISTS list_refs_member_path ON list_refs(member_path);
+
             -- status: store-rebuild-chunk-vecs-on-dim-change
-            -- Tiny key/value sidecar for store-wide metadata. Today the only
-            -- key is `chunk_vecs_dim` (the live embedding dim, set by
-            -- ensure_chunk_vecs_dim). vec0 doesn't surface the dim in
-            -- PRAGMA table_info, so we persist it here ourselves. Added
+            -- Tiny key/value sidecar for store-wide metadata:
+            -- `chunk_vecs_dim` (the live embedding dim, set by
+            -- ensure_chunk_vecs_dim — vec0 doesn't surface the dim in
+            -- PRAGMA table_info, so we persist it here ourselves) and the
+            -- vault rules layer's `rules.sweep.<rule>` date-sweep
+            -- watermarks (`rule-triggers`). Added
             -- without a schema-version bump — `CREATE TABLE IF NOT EXISTS`
             -- makes it forward-compatible with older v7 dbs (they get the
             -- table on first open and the dim falls back to
@@ -307,29 +356,35 @@ impl Store {
             CREATE INDEX IF NOT EXISTS note_meta_note      ON note_meta(note_id);
             CREATE INDEX IF NOT EXISTS note_meta_key_value ON note_meta(key, value);
             CREATE INDEX IF NOT EXISTS note_meta_key_num   ON note_meta(key, num);
-            "#,
-            dim = dim_arg,
-        ))?;
 
-        if user_version == 0 {
-            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-            tracing::info!(
-                schema_version = SCHEMA_VERSION,
-                "store: created index db schema",
+            -- status: kind-lenient-validation
+            -- Derived per-note kind-validation problems (`docs/kinds.md`);
+            -- the `note_meta` lifecycle, no schema-version bump.
+            CREATE TABLE IF NOT EXISTS note_problems (
+                note_path TEXT NOT NULL, field TEXT NOT NULL, message TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS note_problems_path ON note_problems(note_path);
+
+            -- status: spec-anchor-index
+            -- Derived index of spec-slug anchors: every bare `[slug]` token a
+            -- note defines, so `[[spec:slug]]` links (`wikilink-spec-links`)
+            -- resolve with one indexed lookup instead of a vault walk.
+            -- Re-derived from content on every ingest — including the
+            -- unchanged short-circuit, so pre-existing dbs backfill on their
+            -- next full scan (the table is added without a schema-version
+            -- bump). Cleared on skip / delete; re-keyed on rename.
+            CREATE TABLE IF NOT EXISTS spec_anchors (
+                slug      TEXT NOT NULL,
+                note_path TEXT NOT NULL,
+                PRIMARY KEY (slug, note_path)
             );
-        }
-        // Seed the chunk_vecs_dim meta row on first open if it's not already
-        // there. Idempotent: an existing row (any value) is left alone — the
-        // live writer's `ensure_chunk_vecs_dim` is the only path that bumps
-        // it.
-        conn.execute(
-            "INSERT OR IGNORE INTO meta (key, value) VALUES ('chunk_vecs_dim', ?1)",
-            params![dim_arg.to_string()],
-        )?;
-        let dim = read_chunk_vecs_dim(&conn)?.unwrap_or(DEFAULT_EMBED_DIM);
-        Ok(Self { conn, db_path, dim })
-    }
+            CREATE INDEX IF NOT EXISTS spec_anchors_path ON spec_anchors(note_path);
+            "#,
+        dim = dim,
+    ))?;
+    Ok(())
+}
 
+impl Store {
     /// Live `chunk_vecs` embedding dimension. Equal to the loaded
     /// `Embedder::dim()` after `ensure_chunk_vecs_dim` has run.
     pub const fn dim(&self) -> usize {

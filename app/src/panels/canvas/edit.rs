@@ -14,7 +14,7 @@
 //! Two write paths by kind:
 //! - **File node** → edits the one shared `session.buffers[path]` editor through
 //!   the reusable embedded buffer view, so typing on the canvas shows in any open
-//!   tab of that note and rides the op-log binding (one dirty buffer, save /
+//!   tab of that note and rides the layered-doc binding (one dirty buffer, save /
 //!   autosave / agent-review for free).
 //! - **Text node** → edits the node's own `text` (which lives in the `.canvas`,
 //!   not a vault note), committing an [`EditOp::SetText`] through the pane's
@@ -239,7 +239,7 @@ fn show_file_edit(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId, file: &s
 /// Edit a Text node: render the transient editor over the node's body, then
 /// reconcile any change back into the `.canvas` via `SetText`. The editor is the
 /// source of truth while editing; on every changed frame we persist the new body
-/// (the op-log binding folds repeated small edits, like the move path does).
+/// (the layered-doc binding folds repeated small edits, like the move path does).
 /// status: canvas-text-node-markdown
 fn show_text_edit(
     ui: &mut egui::Ui,
@@ -283,16 +283,20 @@ fn render_text_widget(
         cache: &mut edit.decorations,
         folds: &EMPTY_FOLDS,
         loaded_text: &body,
+        // No dirty-diff gutter in a canvas node editor. status: git-dirty-diff-gutter
+        git_head_text: None,
         theme: Some(theme),
         live_preview: true,
         render_widgets: true,
         is_markdown: true,
+        code_language: None,
         dpr,
         font_px,
         chunk_boundaries: false,
         show_whitespace: false,
         highlight_trailing_whitespace: false,
         diff: None,
+        conflict: None,
         resolve_title: None,
         // Canvas node editing renders through the in-memory caches only.
         // status: widget-render-disk-cache
@@ -300,6 +304,14 @@ fn render_text_widget(
         // No note-bound resolver here: inline-CSV charts render; external
         // `data:` charts fall back to source. status: widget-chart-render
         chart_resolver: None,
+        // No vault binding → `![alt](path)` image cells fall back to source.
+        // status: widget-table-render
+        image_resolver: None,
+        // Canvas node editing renders tables Fit-only (no overflow toggle here).
+        // status: widget-table-overflow-scroll
+        table_overflow: &EMPTY_TABLE_OVERFLOW,
+        // No in-place table cell edit on a canvas node. status: widget-table-cell-edit-inplace
+        editing_table: None,
     };
     let mut rebuild = |state: &EditorState, view: &mut ViewState| {
         rebuild_editor_layers(state, view, &mut deco_ctx);
@@ -333,3 +345,10 @@ fn is_markdownish(file: &str) -> bool {
 /// never folds), borrowed `'static` so it isn't allocated per frame.
 static EMPTY_FOLDS: std::sync::LazyLock<std::collections::HashSet<u64>> =
     std::sync::LazyLock::new(std::collections::HashSet::new);
+
+/// An always-empty per-table overflow map for the Text-node decoration rebuild:
+/// canvas editing renders tables Fit-only, borrowed `'static`.
+/// status: widget-table-overflow-scroll
+static EMPTY_TABLE_OVERFLOW: std::sync::LazyLock<
+    crate::panels::buffer::widgets::tables::TableViewMap,
+> = std::sync::LazyLock::new(crate::panels::buffer::widgets::tables::TableViewMap::new);

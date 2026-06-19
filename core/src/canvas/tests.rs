@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use tempfile::TempDir;
 
-use crate::oplog::OpLog;
+use crate::editing::LayeredDoc;
 use crate::vault::Vault;
 
 const CANVAS: &str = r##"{
@@ -64,10 +64,10 @@ async fn canvas_file_ref_follows_note_move_no_log() {
 }
 
 #[tokio::test]
-async fn canvas_file_ref_follows_note_move_through_oplog() {
+async fn canvas_file_ref_follows_note_move_through_layered_doc() {
     let td = TempDir::new().unwrap();
     let vault = Vault::open(td.path()).unwrap();
-    let log = Arc::new(OpLog::open(td.path()).unwrap());
+    let log = Arc::new(LayeredDoc::open(td.path()).unwrap());
     write(&vault, "diagrams/board.canvas", CANVAS);
 
     let touched = super::on_note_moved(
@@ -81,7 +81,7 @@ async fn canvas_file_ref_follows_note_move_through_oplog() {
     .await;
     assert_eq!(touched, 1, "the referencing canvas should be rewritten via op-log");
 
-    // The op-log materializes the new bytes to disk on user_save, so the file
+    // The layered doc writes the new bytes to disk on user_save, so the file
     // reflects the rewrite without a separate write.
     let after = vault.read_file("diagrams/board.canvas").unwrap();
     assert!(after.contains("\"file\": \"new/path.md\""), "op-log save must persist rewrite");

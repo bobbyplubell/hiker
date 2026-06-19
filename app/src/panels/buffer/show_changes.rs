@@ -83,31 +83,19 @@ impl AppState {
     /// recent accepted ops. Method on `AppState` so the lint exempts it
     /// from `single_call_fn`.
     pub fn show_diff_source_menu(&mut self, ui: &mut egui::Ui, path: &str) {
-        // Gather recent ops at open time so the submenu is plain data.
+        // Gather recent snapshot versions at open time so the submenu is
+        // plain data. Sourced from the plain-file snapshot tree (the op-log
+        // history engine + per-write attribution are retired, so a version
+        // is just its timestamp).
         let history: Result<Vec<HistoryRow>, ()> = {
-            let log = self.vault_session.services.oplog.as_ref();
-            hiker_core::ops::op_writes::path_history(log, path, 20)
+            let log = self.vault_session.services.layered.as_ref();
+            hiker_core::ops::op_writes::snapshot_history(log, path, 20)
                 .map_err(|_| ())
                 .map(|rows| {
                     rows.into_iter()
-                        .map(|row| {
-                            let author = {
-                                let wire = row.author.as_wire();
-                                if wire.is_empty() {
-                                    "\u{2014}".to_string()
-                                } else {
-                                    wire
-                                }
-                            };
-                            HistoryRow {
-                                label: format!(
-                                    "{}  \u{00b7}  {}  \u{00b7}  {}",
-                                    relative_ts(row.timestamp_ms),
-                                    row.op_kind,
-                                    author
-                                ),
-                                op_id: row.op_id.clone(),
-                            }
+                        .map(|row| HistoryRow {
+                            label: relative_ts(row.timestamp_ms),
+                            op_id: row.snapshot_id.clone(),
                         })
                         .collect()
                 })

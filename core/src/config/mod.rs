@@ -29,14 +29,16 @@ use crate::errors::HikerError;
 
 mod io;
 mod patch;
+pub mod recovery;
 pub mod sections;
 pub mod vcs;
 
+use recovery::HistoryConfig;
 use vcs::GitSection;
 use sections::{
-    AcpConfig, BoardsConfig, ChatConfig, ClusteringConfig, EditorConfig, InboxConfig,
-    IndexingConfig, LlmConfig, McpConfig, OpLogConfig, RenderConfig, SearchConfig, SuggestionsConfig,
-    SyncSection, TasksConfig, TrailsConfig, VaultConfig, WikilinksConfig,
+    BoardsConfig, ClusteringConfig, EditorConfig, InboxConfig,
+    IndexingConfig, LlmConfig, McpConfig, EditingConfig, RenderConfig, SearchConfig, SuggestionsConfig,
+    TasksConfig, TrailsConfig, VaultConfig, WikilinksConfig,
 };
 
 use io::{atomic_write, deep_merge, display_path, write_defaults};
@@ -98,14 +100,12 @@ pub struct Config {
     /// status: wikilink-ambiguous-resolution
     #[serde(default)]
     pub wikilinks: WikilinksConfig,
-    #[serde(default)]
-    pub acp: AcpConfig,
     /// status: op-log-config-section
-    #[serde(default, rename = "op-log")]
-    pub op_log: OpLogConfig,
-    /// status: sync-config-section
+    #[serde(default, rename = "editing")]
+    pub editing: EditingConfig,
+    /// status: plain-file-snapshots
     #[serde(default)]
-    pub sync: SyncSection,
+    pub history: HistoryConfig,
     /// status: git-config-section
     #[serde(default)]
     pub git: GitSection,
@@ -117,22 +117,31 @@ pub struct Config {
     /// status: inbox-rules
     #[serde(default)]
     pub inbox: InboxConfig,
-    /// Legacy `[extract]` table from old vaults: web-source acquisition
-    /// (scrape / crawl / feed) moved to external producers, so `core` no
-    /// longer interprets these tunables. The field is kept solely to keep
-    /// strict-load (`deny_unknown_fields`) from rejecting an old vault TOML
-    /// that still carries the table; it's parsed as an opaque value and never
-    /// written back (`skip_serializing`).
-    #[serde(default, skip_serializing)]
-    pub extract: Option<toml::Value>,
-    /// status: settings-section-chat
-    #[serde(default)]
-    pub chat: ChatConfig,
     /// status: render-cache-diagrams-toggle
     #[serde(default)]
     pub render: RenderConfig,
     #[serde(default)]
     pub ui: Ui,
+    /// The `[kinds.<name>]` registry entries, kept as raw TOML values so
+    /// `kinds::Registry::compile` can produce strict-load errors naming the
+    /// offending entry (a typed serde field would lose the entry context
+    /// once the merged document deserializes). Validated in
+    /// `validate_cross_field`; the built-in PM set is merged in as the
+    /// lowest config layer by `Config::load`, so defaults stay empty here
+    /// (and out of auto-created files). See `docs/kinds.md`.
+    ///
+    /// status: kind-registry
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub kinds: std::collections::BTreeMap<String, toml::Value>,
+    /// The `[rules.<name>]` vault-rule entries (`docs/rules.md`), kept as
+    /// raw TOML values exactly like `kinds` so `rules::RuleSet::compile`
+    /// can produce strict-load errors naming the offending entry.
+    /// Validated in `validate_cross_field` against the compiled kind
+    /// registry; the live engine recompiles at vault open.
+    ///
+    /// status: rule-shape
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub rules: std::collections::BTreeMap<String, toml::Value>,
 }
 
 /// How a plain (no-modifier) scroll behaves in the canvas view. `auto` picks per
@@ -193,13 +202,6 @@ pub struct Ui {
     /// scrolling over a note card always scrolls that card. [canvas-scroll-mode]
     #[serde(default)]
     pub canvas_scroll_mode: CanvasScrollMode,
-    /// Legacy `[ui] canvas_scroll_zooms` bool, superseded by `canvas_scroll_mode`.
-    /// Kept (opaque, never written back via `skip_serializing`) only so strict
-    /// load (`deny_unknown_fields`) doesn't reject an old vault TOML that still
-    /// carries it; the value is ignored, so an existing vault adopts the new
-    /// `auto` default. [canvas-scroll-mode]
-    #[serde(default, skip_serializing)]
-    pub canvas_scroll_zooms: Option<bool>,
     /// Whether a two-finger horizontal trackpad swipe navigates Back/Forward
     /// (browser-style). Default `true`. Turn off if it misfires during ordinary
     /// horizontal scrolling. [navigation-swipe-disable]
@@ -222,7 +224,6 @@ impl Default for Ui {
             reader_hide_tabs: false,
             reader_hide_toolbar: false,
             canvas_scroll_mode: CanvasScrollMode::Auto,
-            canvas_scroll_zooms: None,
             swipe_nav_enabled: true,
             hover_previews_enabled: true,
         }
@@ -251,17 +252,16 @@ impl Default for Config {
             trails: TrailsConfig::default(),
             boards: BoardsConfig::default(),
             wikilinks: WikilinksConfig::default(),
-            acp: AcpConfig::default(),
-            op_log: OpLogConfig::default(),
-            sync: SyncSection::default(),
+            editing: EditingConfig::default(),
+            history: HistoryConfig::default(),
             git: GitSection::default(),
             suggestions: SuggestionsConfig::default(),
             clustering: ClusteringConfig::default(),
             inbox: InboxConfig::default(),
-            extract: None,
-            chat: ChatConfig::default(),
             render: RenderConfig::default(),
             ui: Ui::default(),
+            kinds: std::collections::BTreeMap::new(),
+            rules: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -357,15 +357,28 @@ impl Config {
         let user_doc = load_user_doc(paths.user.as_deref())?;
         let vault_doc = load_vault_doc(&paths.vault)?;
 
-        // Deep-merge user under vault (vault wins per-key). Tables recurse;
-        // arrays and scalars replace.
-        let mut merged: toml::Value =
-            user_doc.unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()));
+        // Deep-merge built-ins under user under vault (vault wins per-key).
+        // Tables recurse; arrays and scalars replace. The built-in PM kinds
+        // are the lowest layer — registry entries in the same TOML format
+        // users write, so a vault that redefines `kinds.story.fields`
+        // replaces the list wholesale while untouched keys keep their
+        // built-in values, and `[kinds.<name>] enabled = false` disables an
+        // entry (`kind-builtin-pm-set`).
+        let mut merged: toml::Value = crate::kinds::builtin_kinds_value();
+        if let Some(user) = user_doc {
+            deep_merge(&mut merged, user);
+        }
         deep_merge(&mut merged, vault_doc);
 
         check_schema_version(&merged, &paths)?;
         let cfg = deserialize_strict(merged, &paths)?;
         validate_cross_field(&cfg)?;
+        // Wire the (previously dead) `[indexing] ignored_paths` into the
+        // per-vault composed ignore matcher, alongside the vault-root
+        // `.gitignore` / `.hikerignore` read from disk. Consulted by the
+        // indexer walk, the watcher route, and `vault::list_dir`. See
+        // `core::ignore` (Phase B of code-as-reference-content).
+        crate::ignore::register(vault_root, &cfg.indexing.ignored_paths);
         Ok(cfg)
     }
 
@@ -594,6 +607,32 @@ fn validate_cross_field(cfg: &Config) -> Result<(), HikerError> {
     if let Err(e) = crate::inbox::Rules::validate(&cfg.inbox.rules) {
         tracing::error!(error = %e, "invalid [inbox] rules");
         return Err(HikerError::Config(format!("[inbox] {e}")));
+    }
+    validate_registries(cfg)
+}
+
+/// The registry half of the cross-field hook: the `[kinds.<name>]` table
+/// compiles first (the inbox-rules posture — an invalid entry aborts
+/// startup naming the offender while notes validated *against* it stay
+/// lenient, `kind-lenient-validation`), then the `[rules.<name>]` table
+/// compiles beside the kinds it references — an unknown trigger, a
+/// condition outside the queries grammar, an unknown verb, the reserved
+/// `script` verb, or a malformed board / kind reference aborts startup
+/// naming the rule (`docs/rules.md`).
+///
+/// status: kind-registry
+/// status: rule-shape
+fn validate_registries(cfg: &Config) -> Result<(), HikerError> {
+    let kinds = match crate::kinds::Registry::compile(&cfg.kinds) {
+        Ok(registry) => registry,
+        Err(e) => {
+            tracing::error!(error = %e, "invalid [kinds] registry");
+            return Err(HikerError::Config(e.to_string()));
+        }
+    };
+    if let Err(e) = crate::rules::RuleSet::compile(&cfg.rules, &kinds) {
+        tracing::error!(error = %e, "invalid [rules] entry");
+        return Err(HikerError::Config(e.to_string()));
     }
     Ok(())
 }

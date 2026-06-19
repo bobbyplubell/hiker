@@ -35,7 +35,6 @@ use tokio::sync::{oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use hiker_core::vault::Vault;
-use hiker_core::activity::Activity;
 use hiker_core::audit::AgentLog;
 use hiker_core::autosave::Autosave;
 use hiker_core::config::Config;
@@ -93,6 +92,10 @@ pub struct AppState {
     /// registry hands every activity a state slice, so this is a
     /// zero-field marker. status: feature-trash-panel
     pub trash_state: crate::trash::State,
+    /// Per-activity UI state for the Source-Control (git) activity (G3b):
+    /// the cached `status()` read + the manual-mode commit-message buffer.
+    /// Owned here per `feature-state-ownership`.
+    pub source_control_state: crate::source_control::State,
     /// Per-activity UI state for the `canvases` activity (lists the
     /// vault's `.canvas` files). Effectively stateless — the listing is
     /// read fresh from disk — so a zero-field marker keeps the registry
@@ -101,10 +104,10 @@ pub struct AppState {
     /// Per-activity state marker for the Projects sidebar (listing is read fresh from the store's
     /// frontmatter index each frame). status: code-graph-view-source
     pub projects_activity_state: crate::projects_activity::State,
-    /// Per-activity state for the migrated docked `chat` sidebar: the
-    /// in-memory session registry + the lazy-discover gate. Relocated
-    /// off `Session::chat` / `Session::chat_discovered`.
-    pub chat_state: crate::chat::state::State,
+    /// repo_id → bound `ScipAdapter` registry for `[[code:<repo_id>/<symbol>]]` spec→code wikilinks.
+    /// Lazily populated when such a link is first navigated; survives the session. Default-constructed
+    /// (no per-vault state to seed). status: spec-code-link
+    pub code_sources: crate::code_sources::Registry,
     /// Per-session activity descriptor registry. Built in
     /// `bootstrap::open_vault` from `activity::builtin_activities()` plus
     /// (in Phase 3) plugin-derived activities. Sidebar/activity/hamburger
@@ -119,13 +122,6 @@ pub struct AppState {
     /// returns. Lives on `AppState` so the narrow `SurfaceCtx` borrow can
     /// reach it disjointly from the other fields. See `activity::SurfaceCtx`.
     pub pending_effects: Vec<crate::activity::Effect>,
-    /// What the sync engine last surfaced as needing the user — the blocked-doc
-    /// paths, whether a content-key change is held, and whether a last-error is
-    /// present. The update loop diffs the live snapshot against this each frame
-    /// and fires a toast ONLY on a new item appearing (a transition), so a
-    /// silent no-op round never spams. Reset on vault swap (fresh `AppState`).
-    /// status: sync-attention-badge
-    pub sync_attention_seen: SyncAttentionSeen,
     pub vault_switch: VaultSwitchState,
     /// IDE-style layout host. Wraps the editor tabs + side bars +
     /// activity bar + status bar. Kept on the top-level state so its
@@ -191,13 +187,12 @@ pub struct VaultSession {
 
 pub struct Services {
     pub read_store: Arc<Mutex<Store>>,
-    /// The vault's op log: the text write substrate every producer
+    /// The vault's layered doc: the text write substrate every producer
     /// rides on (`op-log-ops-producer-helpers`). User saves and agent edits
     /// route through `core::ops::op_writes` against this handle. Seeded from the
     /// on-disk vault at open by `core::ops::op_writes::bootstrap`.
-    pub oplog: Arc<hiker_core::oplog::OpLog>,
+    pub layered: Arc<hiker_core::editing::LayeredDoc>,
     pub trees: Arc<Db>,
-    pub activity: Arc<Activity>,
     pub autosave: Arc<Autosave>,
     pub watcher: Arc<Watcher>,
     pub indexer: Arc<Handle>,
@@ -219,18 +214,22 @@ pub struct Services {
     /// read tools surface. The host writes it each frame via
     /// `refresh_ui_context_snapshot`; the MCP handler only reads.
     pub mcp_ui_context: hiker_mcp::ui_context::Shared,
-    /// The live `hiker-sync` engine, present only when `[sync].enabled`. When
-    /// sync is off this is `None` and nothing is constructed (no keys, no
-    /// swarm, no listener). The Sync page renders a disabled state in that
-    /// case. Wrapped in `Arc` so the page can clone a handle to spawn async
-    /// `force_sync` / `discover` work off the frame loop.
-    pub sync: Option<Arc<crate::sync_service::SyncService>>,
     /// The live git transport engine (`git.md`), present only when `[sync]
-    /// .enabled` and `[sync].transport = "git"`. Mutually exclusive with the
-    /// libp2p `sync` engine above by the single-bidirectional rule
-    /// (`sync-single-bidirectional-transport`) — at most one of `sync` /
-    /// `git_sync` is `Some`. The save site pokes whichever is present.
+    /// .enabled` and `[sync].transport = "git"`. The save site pokes it when
+    /// present. status: git-commit-on-save
     pub git_sync: Option<Arc<crate::git_sync::GitSyncEngine>>,
+    /// status: kind-registry
+    /// The compiled kind registry (`docs/kinds.md`), built once at vault
+    /// open from the strict-loaded `[kinds]` config. Read by the smart-
+    /// folder lens (board `category` expansion) and shared with the MCP
+    /// server's generated kind tools.
+    pub kinds: Arc<hiker_core::kinds::Registry>,
+    /// status: rule-firings-panel
+    /// The live vault rules engine (`docs/rules.md`), compiled once at
+    /// vault open from the strict-loaded `[rules]` config and attached to
+    /// the indexer (which runs every rule pass). The Rules panel reads the
+    /// registered set + the failed-firings ring from this handle.
+    pub rules: Arc<hiker_core::rules::Engine>,
 }
 
 pub struct VaultEvents {
@@ -241,20 +240,14 @@ pub struct VaultEvents {
     /// Bounded ring buffer drained from `indexer_events_rx` each frame
     /// (capped at `INDEXER_EVENTS_MAX`).
     pub indexer_events: VecDeque<String>,
-    /// Receiver for human-readable sync progress lines pushed by the sync
-    /// service and its background tasks. Drained each frame into
-    /// `sync_events`. Present even when sync is disabled (the channel just
+    /// Receiver for human-readable git-transport progress lines pushed by the
+    /// git engine and its background tasks. Drained each frame into
+    /// `sync_events`. Present even when git is disabled (the channel just
     /// stays empty) so the wiring is uniform.
     pub sync_events_rx: Mutex<UnboundedReceiver<String>>,
     /// Bounded ring buffer drained from `sync_events_rx` each frame (capped at
-    /// `SYNC_EVENTS_MAX`). Backs the Sync page's progress log.
+    /// `SYNC_EVENTS_MAX`). Backs the git progress log.
     pub sync_events: VecDeque<String>,
-    /// Receiver for on-demand fork-diff fetch results pushed by the sync
-    /// service's `fetch_fork_diff` task: `(path, Ok(their_text) | Err(message))`.
-    /// Drained each frame into `panels.sync.fork_diffs` (the Sync page's
-    /// "view diff" cache), mirroring the `sync_events` relay. Present even when
-    /// sync is disabled (the channel just stays empty). [sync-fork-diff]
-    pub fork_diff_rx: Mutex<UnboundedReceiver<crate::sync_service::ForkDiffResult>>,
     /// Latest task-queue snapshot pushed by the background pollster
     /// (`bootstrap::spawn_snapshot_poller`). The UI thread `.borrow()`s
     /// this each frame instead of calling `tasks.snapshot().await` from
@@ -265,6 +258,16 @@ pub struct VaultEvents {
     /// `ui_cache.skipped_paths` which is populated from this channel each
     /// frame; the read-store mutex never gets locked on the UI thread.
     pub skipped_paths_rx: watch::Receiver<HashSet<String>>,
+    /// Latest pending-proposals snapshot pushed by the background pollster
+    /// (every ~1s). Populates `ui_cache.pending_snapshot` each frame so the
+    /// badge / pill consumers never walk the layered doc — and never take its
+    /// mutex — on the UI thread.
+    pub pending_proposals_rx:
+        watch::Receiver<Vec<hiker_core::ops::op_writes::PendingProposal>>,
+    /// Latest whole-file-proposals snapshot from the same pollster tick,
+    /// populating `ui_cache.whole_file_proposals` each frame.
+    pub whole_file_proposals_rx:
+        watch::Receiver<Vec<hiker_core::ops::op_writes::WholeFileProposal>>,
 }
 
 impl Drop for VaultSession {
@@ -306,6 +309,16 @@ pub struct Session {
     /// tab-state persistence on exit; restored on startup and applied to each
     /// pane on first creation. status: canvas-view-state-persist
     pub canvas_views: HashMap<String, hiker_core::autosave::CanvasViewState>,
+    /// Persisted graph-view state (the vault link-graph engine's view: node
+    /// positions, projection, focus, toggles, pan/zoom), keyed by the graph
+    /// tab's persist key (`:graph`). Feeds tab-state persistence on exit;
+    /// restored on startup and applied to the panel on first render.
+    /// status: graph-view-state-persist
+    pub graph_views: HashMap<String, hiker_core::autosave::GraphViewState>,
+    /// Persisted code-graph-view state (level / filters / focus + the engine
+    /// view), keyed by `CodeSource::key()`. Same lifecycle as `graph_views`.
+    /// status: graph-view-state-persist
+    pub code_graph_views: HashMap<String, hiker_core::autosave::CodeGraphViewState>,
 }
 
 impl Default for Session {
@@ -322,6 +335,8 @@ impl Default for Session {
             last_autosave_tick: Instant::now(),
             pending_mutations: HashSet::new(),
             canvas_views: HashMap::new(),
+            graph_views: HashMap::new(),
+            code_graph_views: HashMap::new(),
         }
     }
 }
@@ -341,6 +356,25 @@ pub enum NavTarget {
     /// page). Lets the global Back/Forward stack walk in-archive link history
     /// the same way it walks notes. [zim-nav-stack]
     ZimArticle { zim_path: String, article: Option<String> },
+    /// A drill location inside a code-graph tab: which source, the selected node, and the
+    /// display scope (overview or an n-hop neighbourhood of the selection). Folds the code
+    /// view's drill history into the global stack so global Back/Forward walks code-graph
+    /// navigation too. status: code-graph-view-source
+    CodeGraphNode {
+        source: crate::tab::CodeSource,
+        selected: Option<String>,
+        scope: crate::tab::Scope,
+    },
+    /// A focus location inside the singleton vault Graph tab: the focus
+    /// anchor (a note rel-path) and the display scope (overview or its
+    /// n-hop neighbourhood). The vault twin of `CodeGraphNode`, so global
+    /// Back/Forward walks vault-graph drills too — and an "Open in graph"
+    /// seeds `(None, Overview)` underneath the focused entry, so Back from
+    /// the neighbourhood is the full-vault overview. status: graph-nav-extract
+    VaultGraphNode {
+        focus: Option<String>,
+        scope: crate::tab::Scope,
+    },
 }
 
 #[derive(Default)]
@@ -371,13 +405,13 @@ pub struct NavState {
 #[derive(Default)]
 pub struct UiCache {
     pub task_snapshot: Vec<TaskRecord>,
-    /// Per-frame snapshot of the vault's pending agent ops, read off the op
-    /// log (`op_writes::list_pending_proposals`). Drives the pending-count
+    /// Per-frame snapshot of the vault's pending agent ops, read off the
+    /// layered doc (`op_writes::list_pending_proposals`). Drives the pending-count
     /// badge (toolbar / status bar / Patch-review tab) and the chat-card
     /// "still-live" op-id set. Populated in `main::refresh_pending_proposals`.
     pub pending_snapshot: Vec<hiker_core::ops::op_writes::PendingProposal>,
     /// Per-frame snapshot of pending whole-file (`write_note`-shaped)
-    /// proposals read off the op log. Backs the buffer review surface — the
+    /// proposals read off the layered doc. Backs the buffer review surface — the
     /// status-bar version dropdown's pending-proposal section, the pending-
     /// rewrite banner, and the agent-diff toggle — replacing the prior
     /// `pending_snapshot` feed for that surface. Populated in
@@ -403,15 +437,30 @@ pub struct PanelStates {
     /// theme choice). Keyed by vault path (one builder per CSV). status: chart-csv-tab
     pub chart_builders: HashMap<String, crate::panels::charts_tab::Pane>,
     pub graph: Option<crate::panels::graph::VaultPanel>,
+    /// A focus/nav target waiting for the vault graph panel to be built —
+    /// set by `graph::open_focused` / a Back/Forward restore that lands
+    /// before the panel's first render, consumed (silently, never
+    /// re-recorded) by `graph::show`. status: graph-tab-focus
+    pub graph_pending_nav: Option<(Option<String>, crate::tab::Scope)>,
+    /// A query-doc scope waiting for the vault graph panel to be built —
+    /// set by `graph::open_scoped` before the panel's first render, consumed
+    /// by `graph::show`. status: graph-scoped-query
+    pub graph_pending_scope: Option<String>,
     pub cluster_graph: HashMap<String, crate::panels::cluster_graph::ClusterView>,
     /// Per-project-note code-graph view state (the bound SCIP adapter + render engine + toggles).
     /// Keyed by the project-note path. status: code-graph-view-source
-    pub code_graph: HashMap<String, crate::panels::code_graph::CodeGraphView>,
+    pub code_graph: HashMap<String, crate::panels::code_graph::View>,
+    /// A spec waiting to be LIT on a code-graph view that isn't built yet —
+    /// `(view key, spec slug)`, set by the vault graph's spec → code-graph
+    /// jump, consumed by `code_graph::show` after the build.
+    /// status: vault-graph-spec-drift-badge
+    pub code_graph_pending_light: Option<(String, String)>,
     /// Per-tab project-config form state (name + source rows). Keyed by tab id.
-    pub project_config: HashMap<TabId, crate::panels::project_config::ProjectConfigForm>,
+    pub project_config: HashMap<TabId, crate::panels::project_config::Form>,
     pub home: crate::panels::home::State,
-    /// Sync page local UI state — the per-fork "view diff" cache. [sync-fork-diff]
-    pub sync: crate::panels::sync::State,
+    /// Git diff-summary tab local state (picked revs + cached commit/file
+    /// lists). status: diff-summary-panel
+    pub git_diff: crate::panels::git_diff::State,
     /// Floating live edit-preview overlay render cache. One slot suffices —
     /// at most one popup is up at a time (the span under the main caret).
     /// status: widget-edit-popup-preview
@@ -658,6 +707,16 @@ pub struct FileTreeState {
     pub expanded: HashSet<String>,
     pub dir_cache: HashMap<String, Vec<hiker_core::vault::DirEntryDto>>,
     pub selected_folder: Option<String>,
+    /// Multi-selected rows (rel_paths, files + folders). A plain click selects a
+    /// single row; Cmd/Ctrl-click toggles one; Shift-click selects the visible
+    /// range from [`selection_anchor`](Self::selection_anchor). Drives the row
+    /// highlight; the OPEN file stays `ctx.active_path`. [filetree-multiselect]
+    pub selection: HashSet<String>,
+    /// Anchor row for a Shift-range selection — the last plain/toggle click.
+    pub selection_anchor: Option<String>,
+    /// Visible rows in render order (rel_paths of entry rows), captured once per
+    /// frame so a Shift-click can resolve the contiguous range. [filetree-multiselect]
+    pub flat_order: Vec<String>,
     pub trash_expanded: bool,
     pub renaming: Option<String>,
     pub renaming_text: String,
@@ -736,18 +795,6 @@ pub struct Toast {
     pub undo: Option<UndoSpec>,
 }
 
-/// The last sync-attention state the update loop notified on, so a toast fires
-/// only when a NEW item appears (a transition), never on every silent round.
-/// status: sync-attention-badge
-#[derive(Default)]
-pub struct SyncAttentionSeen {
-    /// Blocked-doc paths we've already toasted about.
-    pub blocked_paths: HashSet<String>,
-    /// `(label, reason)` of per-doc/per-peer errors we've already toasted.
-    pub errored: HashSet<(String, String)>,
-    /// The peer fingerprint of a held content-key change we've already toasted.
-    pub pending_key_peer: Option<String>,
-}
 
 #[derive(Clone, Copy)]
 pub enum ToastLevel {
@@ -814,6 +861,9 @@ pub enum Modal {
 ///   — removes one waypoint (and any side-trail descendants) from a trail
 ///   via `core::trails::ops::remove_waypoint` (notes move to trash).
 /// - Trash sidebar: `EmptyTrash` — purges every trashed item.
+/// - Trash sidebar rows: `PurgeTrashItem { trashed_name }` — permanently
+///   deletes one trashed item (the row menu's Purge verb arms it; see
+///   `crate::trash`).
 /// - Settings: `ResetScope { scope_path }` — writes `""` to the named
 ///   scope file and reloads config from disk.
 /// - Settings (embedder swap): `ReloadEmbedder { scope, model_id }` —
@@ -828,6 +878,9 @@ pub enum ConfirmIntent {
         waypoint_path: String,
     },
     EmptyTrash,
+    PurgeTrashItem {
+        trashed_name: String,
+    },
     ResetScope {
         scope_path: PathBuf,
     },
@@ -871,6 +924,64 @@ impl AppState {
             created_at: Instant::now(),
             undo: None,
         });
+    }
+
+    /// Accept / reject pending ops through the GUARDED flip seam
+    /// (`op_writes::flip_op_status_checked`): an accept re-verifies the
+    /// one-sprint invariant against the accepted state at this moment
+    /// (`derived-status-rule`'s apply-time half) — a violation returns the
+    /// typed `SprintConflict` and the op stays pending, with the refusal
+    /// reason surfaced by the caller's error toast on the review row.
+    /// Every review-surface flip in the app routes through here (or
+    /// [`Self::flip_batch_checked`]), so no accept path skips the check.
+    pub fn flip_ops_checked(
+        &self,
+        rel: &str,
+        op_ids: &[String],
+        accept: bool,
+    ) -> Result<(), hiker_core::errors::HikerError> {
+        let services = &self.vault_session.services;
+        let store = services.read_store.lock().map_err(|_| {
+            hiker_core::errors::HikerError::Io("read store lock poisoned".to_string())
+        })?;
+        let ctx = hiker_core::ops::op_writes::FlipCtx {
+            vault: &self.vault_session.vault,
+            store: &store,
+            kinds: &services.kinds,
+        };
+        hiker_core::ops::op_writes::flip_op_status_checked(
+            &services.layered,
+            &ctx,
+            rel,
+            op_ids,
+            accept,
+        )
+    }
+
+    /// Batch sibling of [`Self::flip_ops_checked`]: accept / reject a
+    /// multi-doc batch as one unit through
+    /// `op_writes::flip_batch_status_checked`, with the same apply-time
+    /// one-sprint re-check on accept.
+    pub fn flip_batch_checked(
+        &self,
+        batch_id: &str,
+        accept: bool,
+    ) -> Result<Vec<String>, hiker_core::errors::HikerError> {
+        let services = &self.vault_session.services;
+        let store = services.read_store.lock().map_err(|_| {
+            hiker_core::errors::HikerError::Io("read store lock poisoned".to_string())
+        })?;
+        let ctx = hiker_core::ops::op_writes::FlipCtx {
+            vault: &self.vault_session.vault,
+            store: &store,
+            kinds: &services.kinds,
+        };
+        hiker_core::ops::op_writes::flip_batch_status_checked(
+            &services.layered,
+            &ctx,
+            batch_id,
+            accept,
+        )
     }
 
     pub fn tab_by_id(&self, id: TabId) -> Option<&Tab> {
@@ -1042,6 +1153,18 @@ impl AppState {
                 );
             }
         }
+        ConfirmIntent::PurgeTrashItem { trashed_name } => {
+            // The confirmed half of the trash row's Purge verb
+            // (`interaction.md` [destructive-verbs-in-menu]): the modal armed
+            // in `crate::trash` lands here, and only here does data die.
+            let trash = hiker_core::trash::Trash::open(&state.vault_session.vault_root);
+            match trash.permanent_delete(&trashed_name) {
+                Ok(()) => state.push_toast(format!("Purged {trashed_name}"), ToastLevel::Info),
+                Err(err) => {
+                    state.push_toast(format!("Purge failed: {err}"), ToastLevel::Error);
+                }
+            }
+        }
         ConfirmIntent::ResetScope { scope_path } => {
             if let Err(err) = std::fs::write(&scope_path, "") {
                 state.push_toast(
@@ -1103,6 +1226,29 @@ mod nav_tests {
             zim_path: z.to_string(),
             article: article.map(str::to_string),
         }
+    }
+    fn vault_graph(focus: Option<&str>, scope: crate::tab::Scope) -> NavTarget {
+        NavTarget::VaultGraphNode { focus: focus.map(str::to_string), scope }
+    }
+
+    /// The open-focused seeding contract (`graph-tab-focus`): the overview
+    /// entry lands under the focused one, so Back from the neighbourhood is
+    /// the full-vault overview; a drill records on top and walks back
+    /// drill → focused → overview; re-pushing the same focus location
+    /// dedupes (the per-settle push in `graph::show` relies on it).
+    #[test]
+    fn vault_graph_drills_seed_and_walk_back_to_overview() {
+        use crate::tab::Scope;
+        let mut nav = NavState::default();
+        nav.push(file("a"));
+        // open_focused: overview seed, then the focused entry.
+        nav.push(vault_graph(None, Scope::Overview));
+        nav.push(vault_graph(Some("boards/b.md"), Scope::Hops(2)));
+        nav.push(vault_graph(Some("boards/b.md"), Scope::Hops(2))); // settle re-push → deduped
+        nav.push(vault_graph(Some("notes/a.md"), Scope::Hops(2))); // drill
+        assert_eq!(nav.back(), Some(vault_graph(Some("boards/b.md"), Scope::Hops(2))));
+        assert_eq!(nav.back(), Some(vault_graph(None, Scope::Overview)));
+        assert_eq!(nav.back(), Some(file("a")), "out of the graph entirely");
     }
 
     #[test]

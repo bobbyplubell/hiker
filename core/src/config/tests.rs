@@ -1,6 +1,6 @@
 use super::*;
 use super::io::deep_merge;
-use super::sections::{SyncMode, TreeSortBy};
+use super::sections::TreeSortBy;
 use std::fs;
 use tempfile::tempdir;
 
@@ -48,26 +48,6 @@ fn auto_create_writes_defaults() {
 }
 
 #[test]
-fn legacy_extract_section_tolerated() {
-    // Web-source acquisition (scrape / crawl / feed) moved to external
-    // producers, so `core` no longer interprets `[extract]`. An old vault TOML
-    // that still carries the table must still load under strict-load — the
-    // legacy table is parsed as an opaque value, not rejected as an unknown
-    // field, and is never written back.
-    let toml = r#"schema_version = 1
-[extract]
-auto_globs = ["inbox/", "**/*.pdf"]
-clip_folder = "captures/"
-feed_default_poll = "6h"
-"#;
-    let cfg: Config = toml::from_str(toml).unwrap();
-    assert!(cfg.extract.is_some(), "legacy [extract] table is tolerated");
-    // It's dropped on serialize-back, not round-tripped.
-    let back = toml::to_string_pretty(&cfg).unwrap();
-    assert!(!back.contains("[extract]"), "legacy table is not re-emitted");
-}
-
-#[test]
 fn write_back_canvas_scroll_mode_validates_allowed_values() {
     // status: canvas-scroll-mode
     // `[ui] canvas_scroll_mode` is an enum-as-string (`auto`/`pan`/`zoom`): a
@@ -94,46 +74,35 @@ fn write_back_canvas_scroll_mode_validates_allowed_values() {
 }
 
 #[test]
-fn legacy_canvas_scroll_zooms_tolerated_and_adopts_auto() {
-    // status: canvas-scroll-mode
-    // The old bool `[ui] canvas_scroll_zooms` was superseded by the tri-state
-    // `canvas_scroll_mode`. An old vault TOML that still carries the bool must
-    // still load under strict-load (`deny_unknown_fields`) — it's absorbed by an
-    // opaque, ignored field — and the vault adopts the new `auto` default rather
-    // than inheriting the old pan/zoom choice.
-    let toml = r#"schema_version = 1
-[ui]
-canvas_scroll_zooms = true
+fn current_valid_config_round_trips_on_load() {
+    // A current-schema vault config.toml with valid sections loads cleanly
+    // and the values land in the merged Config. No compat shims: the loader
+    // is strict (`deny_unknown_fields`) over the current schema only.
+    let dir = tempdir().unwrap();
+    let cfg_toml = r#"schema_version = 1
+[editing]
+review_required = false
+[editor]
+word_wrap = false
 "#;
-    let cfg: Config = toml::from_str(toml).unwrap();
-    assert_eq!(cfg.ui.canvas_scroll_mode, CanvasScrollMode::Auto);
-    // The legacy key is dropped on serialize-back, not round-tripped.
-    let back = toml::to_string_pretty(&cfg).unwrap();
-    assert!(!back.contains("canvas_scroll_zooms"), "legacy key is not re-emitted");
+    let vault_path = dir.path().join(".hiker").join("config.toml");
+    fs::create_dir_all(vault_path.parent().unwrap()).unwrap();
+    fs::write(&vault_path, cfg_toml).unwrap();
+    let cfg = Config::load(dir.path()).expect("current-valid config must load");
+    assert!(!cfg.editing.review_required);
+    assert!(!cfg.editor.word_wrap);
 }
 
 #[test]
-fn chat_section_round_trips() {
-    // status: settings-section-chat
-    // A well-formed [chat] table loads under strict-load; `chats_dir`
-    // overrides the default and an omitted table takes the default.
-    let toml = "schema_version = 1\n[chat]\nchats_dir = \"conversations/\"\n";
-    let cfg: Config = toml::from_str(toml).unwrap();
-    assert_eq!(cfg.chat.chats_dir, "conversations/");
-    // Default when absent.
-    let cfg2: Config = toml::from_str("schema_version = 1\n").unwrap();
-    assert_eq!(cfg2.chat.chats_dir, "chats/");
-    // Default round-trips through serialize → deserialize.
-    let s = toml::to_string_pretty(&Config::default()).unwrap();
-    let back: Config = toml::from_str(&s).unwrap();
-    assert_eq!(back.chat.chats_dir, "chats/");
-}
-
-#[test]
-fn chat_section_rejects_unknown_key() {
-    let bad = "[chat]\nmystery = true\n";
-    let err = toml::from_str::<Config>(bad).unwrap_err();
-    assert!(err.to_string().contains("mystery"));
+fn unknown_section_hard_fails() {
+    // Strict load: an unknown top-level table (a typo, or a stale removed
+    // section like `[sync]` / `[op-log]`) hard-fails. Pre-1.0, no compat
+    // shims — a stale config.toml is intended to abort vault open loudly.
+    let dir = tempdir().unwrap();
+    let vault_path = dir.path().join(".hiker").join("config.toml");
+    fs::create_dir_all(vault_path.parent().unwrap()).unwrap();
+    fs::write(&vault_path, "schema_version = 1\n[totally_bogus]\nx = 1\n").unwrap();
+    assert!(Config::load(dir.path()).is_err());
 }
 
 #[test]
@@ -261,176 +230,60 @@ fn editor_view_toggles_persist_and_reload() {
 }
 
 #[test]
-fn op_log_section_round_trips() {
+fn editing_section_round_trips() {
     // status: op-log-config-section
-    // The whole `[op-log]` section must survive a serialize → parse round
-    // trip with its renamed (`op-log`) table key. Mirrors `defaults_round_trip`.
+    // The whole `[editing]` section must survive a serialize → parse round
+    // trip with its renamed (`editing`) table key. Mirrors `defaults_round_trip`.
     let cfg = Config::default();
     let s = toml::to_string_pretty(&cfg).unwrap();
-    assert!(s.contains("[op-log]"), "section key not renamed: {s}");
+    assert!(s.contains("[editing]"), "section key not renamed: {s}");
     let back: Config = toml::from_str(&s).unwrap();
-    assert_eq!(back.op_log.metadata_retention_days, 365);
-    assert_eq!(back.op_log.rejected_retention_days, 14);
-    assert!(!back.op_log.auto_reject_on_drift);
-    assert!(back.op_log.review_required);
-    assert!((back.op_log.compact_threshold - 4.0).abs() < f32::EPSILON);
+    assert_eq!(back.editing.metadata_retention_days, 365);
+    assert_eq!(back.editing.rejected_retention_days, 14);
+    assert!(!back.editing.auto_reject_on_drift);
+    assert!(back.editing.review_required);
 }
 
 #[test]
-fn op_log_keys_persist_and_reload() {
+fn editing_keys_persist_and_reload() {
     // status: op-log-config-section
-    // Every write-back-eligible `[op-log]` key must survive a
+    // Every write-back-eligible `[editing]` key must survive a
     // `Config::set` → `Config::load` round-trip, flipped away from its
     // in-code default. Mirrors `editor_view_toggles_persist_and_reload`.
     let dir = tempdir().unwrap();
     Config::set(
         SettingsScope::Vault,
-        "op-log.metadata_retention_days",
+        "editing.metadata_retention_days",
         &serde_json::json!(30),
         dir.path(),
     )
     .unwrap();
     Config::set(
         SettingsScope::Vault,
-        "op-log.rejected_retention_days",
+        "editing.rejected_retention_days",
         &serde_json::json!(7),
         dir.path(),
     )
     .unwrap();
     Config::set(
         SettingsScope::Vault,
-        "op-log.auto_reject_on_drift",
+        "editing.auto_reject_on_drift",
         &serde_json::Value::Bool(true),
         dir.path(),
     )
     .unwrap();
     Config::set(
         SettingsScope::Vault,
-        "op-log.review_required",
+        "editing.review_required",
         &serde_json::Value::Bool(false),
         dir.path(),
     )
     .unwrap();
-    Config::set(
-        SettingsScope::Vault,
-        "op-log.compact_threshold",
-        &serde_json::json!(8.0),
-        dir.path(),
-    )
-    .unwrap();
     let cfg = Config::load(dir.path()).unwrap();
-    assert_eq!(cfg.op_log.metadata_retention_days, 30);
-    assert_eq!(cfg.op_log.rejected_retention_days, 7);
-    assert!(cfg.op_log.auto_reject_on_drift);
-    assert!(!cfg.op_log.review_required);
-    assert!((cfg.op_log.compact_threshold - 8.0).abs() < f32::EPSILON);
-}
-
-#[test]
-fn sync_section_round_trips_and_overrides() {
-    // status: sync-config-section
-    // Defaults apply when `[sync]` is absent; a full override block
-    // (mode = "server", an enrolled device, enabled = true) parses into
-    // the expected struct. Mirrors `op_log_section_round_trips`.
-
-    // Absent section → documented defaults.
-    let cfg: Config = toml::from_str("schema_version = 1\n").unwrap();
-    assert!(!cfg.sync.enabled);
-    assert_eq!(cfg.sync.mode, SyncMode::Peer);
-    assert!(cfg.sync.server_url.is_empty());
-    assert!(cfg.sync.discovery);
-    assert!(cfg.sync.devices.is_empty());
-
-    // Defaults survive a serialize → parse round trip.
-    let s = toml::to_string_pretty(&Config::default()).unwrap();
-    assert!(s.contains("[sync]"), "section missing: {s}");
-    let back: Config = toml::from_str(&s).unwrap();
-    assert!(!back.sync.enabled);
-    assert_eq!(back.sync.mode, SyncMode::Peer);
-
-    // Override block parses with snake_case mode + a device fingerprint.
-    let over: Config = toml::from_str(
-        r#"schema_version = 1
-[sync]
-enabled = true
-mode = "server"
-server_url = "/dns4/hub.example/tcp/4001"
-discovery = false
-devices = ["ABCDEFG-HIJKLMN"]
-"#,
-    )
-    .unwrap();
-    assert!(over.sync.enabled);
-    assert_eq!(over.sync.mode, SyncMode::Server);
-    assert_eq!(over.sync.server_url, "/dns4/hub.example/tcp/4001");
-    assert!(!over.sync.discovery);
-    assert_eq!(over.sync.devices, vec!["ABCDEFG-HIJKLMN".to_string()]);
-}
-
-#[test]
-fn op_log_compact_threshold_rejects_below_one() {
-    // status: op-log-config-section
-    let dir = tempdir().unwrap();
-    assert!(Config::set(
-        SettingsScope::Vault,
-        "op-log.compact_threshold",
-        &serde_json::json!(0.5),
-        dir.path(),
-    )
-    .is_err());
-}
-
-#[test]
-fn write_back_sync_mode_validates_allowed_values() {
-    // status: sync-config-section
-    // Mirrors the `vault.tree.sort_by` enum-as-string precedent: a member
-    // of the allowed set (`peer`/`server`/`both`) is accepted and lands on
-    // the typed field; anything else is rejected by the eligibility path.
-    let dir = tempdir().unwrap();
-    let cfg = Config::set(
-        SettingsScope::Vault,
-        "sync.mode",
-        &serde_json::Value::String("server".into()),
-        dir.path(),
-    )
-    .unwrap();
-    assert_eq!(cfg.sync.mode, SyncMode::Server);
-
-    let err = Config::set(
-        SettingsScope::Vault,
-        "sync.mode",
-        &serde_json::Value::String("bogus".into()),
-        dir.path(),
-    )
-    .unwrap_err();
-    assert!(err.to_string().contains("invalid value"));
-}
-
-#[test]
-fn write_back_sync_keys_eligible_at_vault_scope() {
-    // status: sync-config-section
-    // The non-secret `[sync]` keys persist through the write-back path.
-    let dir = tempdir().unwrap();
-    Config::set(SettingsScope::Vault, "sync.enabled", &serde_json::Value::Bool(true), dir.path()).unwrap();
-    Config::set(SettingsScope::Vault, "sync.discovery", &serde_json::Value::Bool(false), dir.path()).unwrap();
-    Config::set(
-        SettingsScope::Vault,
-        "sync.server_url",
-        &serde_json::Value::String("/dns4/hub.example/tcp/4001".into()),
-        dir.path(),
-    )
-    .unwrap();
-    let cfg = Config::set(
-        SettingsScope::Vault,
-        "sync.devices",
-        &serde_json::json!(["ABCDEFG-HIJKLMN"]),
-        dir.path(),
-    )
-    .unwrap();
-    assert!(cfg.sync.enabled);
-    assert!(!cfg.sync.discovery);
-    assert_eq!(cfg.sync.server_url, "/dns4/hub.example/tcp/4001");
-    assert_eq!(cfg.sync.devices, vec!["ABCDEFG-HIJKLMN".to_string()]);
+    assert_eq!(cfg.editing.metadata_retention_days, 30);
+    assert_eq!(cfg.editing.rejected_retention_days, 7);
+    assert!(cfg.editing.auto_reject_on_drift);
+    assert!(!cfg.editing.review_required);
 }
 
 #[test]
@@ -527,7 +380,7 @@ fn write_back_positive_int_rejects_zero_and_floats() {
     // Zero is not a positive integer.
     assert!(Config::set(
         SettingsScope::Vault,
-        "llm.agent.iteration_cap",
+        "editing.metadata_retention_days",
         &serde_json::json!(0),
         dir.path(),
     )
@@ -536,7 +389,7 @@ fn write_back_positive_int_rejects_zero_and_floats() {
     // serde_json carries the no-decimal vs. decimal distinction.
     assert!(Config::set(
         SettingsScope::Vault,
-        "llm.agent.iteration_cap",
+        "editing.metadata_retention_days",
         &serde_json::json!(10.5),
         dir.path(),
     )
@@ -580,4 +433,95 @@ fn write_back_llm_keys_eligible_via_vault_scope() {
     )
     .unwrap();
     assert_eq!(cfg.llm.provider.model, "claude-haiku-4-5");
+}
+
+#[test]
+fn kinds_builtins_merge_under_user_and_vault() {
+    // status: kind-builtin-pm-set
+    // Built-ins are the lowest deep-merge layer (built-ins <- user <-
+    // vault). A vault that redefines `kinds.story.fields` replaces the
+    // list wholesale (arrays replace) while untouched entries keep their
+    // built-in values; `enabled = false` disables an entry.
+    let mut merged = crate::kinds::builtin_kinds_value();
+    let vault: toml::Value = toml::from_str(
+        r#"
+[kinds.story]
+shape = "leaf"
+fields = [ { name = "urgency", type = "number" } ]
+
+[kinds.plan]
+enabled = false
+"#,
+    )
+    .unwrap();
+    deep_merge(&mut merged, vault);
+    let cfg: Config = merged.try_into().unwrap();
+    let reg = crate::kinds::Registry::compile(&cfg.kinds).unwrap();
+
+    // Override replaced story's field list wholesale.
+    let story = reg.get("story").unwrap();
+    assert_eq!(story.fields.len(), 1);
+    assert_eq!(story.fields[0].name, "urgency");
+    // Untouched built-ins survive; the disabled one is gone.
+    assert!(reg.get("task").is_some());
+    assert!(reg.get("sprint").is_some());
+    assert!(reg.get("epic").is_some());
+    assert!(reg.get("plan").is_none());
+}
+
+#[test]
+fn kinds_invalid_entry_fails_cross_field_naming_offender() {
+    // status: kind-registry
+    // The registry is strict-load: an invalid entry aborts the load with an
+    // error naming the offending `[kinds.<name>]` table (the inbox-rules
+    // posture). The TOML itself parses — the failure is the cross-field
+    // validation hook.
+    let cfg: Config = toml::from_str(
+        "schema_version = 1\n[kinds.sprint]\nshape = \"board-like\"\nstates = [ { name = \"Todo\" } ]\n",
+    )
+    .unwrap();
+    let err = validate_cross_field(&cfg).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("[kinds.sprint]"), "{msg}");
+    assert!(msg.contains("category"), "{msg}");
+}
+
+#[test]
+fn kinds_default_config_carries_no_entries() {
+    // The built-ins are a merge layer, not defaults — so auto-created
+    // config files never freeze them, and `Config::default()` stays empty.
+    assert!(Config::default().kinds.is_empty());
+    let s = toml::to_string_pretty(&Config::default()).unwrap();
+    assert!(!s.contains("[kinds"), "defaults must not serialize kinds: {s}");
+}
+
+#[test]
+fn rules_invalid_entry_fails_cross_field_naming_offender() {
+    // status: rule-shape
+    // The `[rules.<name>]` table is strict-load beside `[kinds.<name>]`:
+    // the reserved `script` verb (and any other invalid entry) aborts the
+    // load naming the offending rule.
+    let cfg: Config = toml::from_str(
+        "schema_version = 1\n[rules.bad]\non = \"note-created\"\ndo = [ { script = { src = \"x\" } } ]\n",
+    )
+    .unwrap();
+    let err = validate_cross_field(&cfg).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("[rules.bad]"), "{msg}");
+    assert!(msg.contains("reserved"), "{msg}");
+}
+
+#[test]
+fn rules_valid_entry_passes_cross_field() {
+    // status: rule-shape
+    let cfg: Config = toml::from_str(
+        "schema_version = 1\n[rules.ok]\non = \"card-moved\"\ndo = [ { add_to_board = { board = \"boards/b.md\" } } ]\n",
+    )
+    .unwrap();
+    assert!(validate_cross_field(&cfg).is_ok());
+    assert_eq!(cfg.rules.len(), 1);
+    // Defaults stay empty and never serialize a [rules] table.
+    assert!(Config::default().rules.is_empty());
+    let s = toml::to_string_pretty(&Config::default()).unwrap();
+    assert!(!s.contains("[rules"), "defaults must not serialize rules: {s}");
 }

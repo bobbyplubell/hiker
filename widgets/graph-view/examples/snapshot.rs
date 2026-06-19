@@ -15,9 +15,10 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui;
 use hiker_graph::LayoutKind;
-use hiker_graph_view::graph_view::{
-    Corner, MinimapShape, NodeDescriptor, NodeShape, Source, State, Style,
-};
+use hiker_graph_view::graph_view::minimap::{Corner, IndicatorMode, Minimap, Shape};
+use hiker_graph_view::graph_view::source::{NodeDescriptor, NodeShape, Source};
+use hiker_graph_view::graph_view::styling::Style;
+use hiker_graph_view::graph_view::State;
 use hiker_projection::{Complex, Mobius, ProjectionKind};
 use synthetic::{LayeredGraph, SyntheticGraph};
 
@@ -160,7 +161,7 @@ fn render_poincare_tuned(
 /// corner Poincaré minimap of the given `shape`, to a PNG at `out_path`.
 fn render_minimap(
     kind: ProjectionKind,
-    shape: MinimapShape,
+    shape: Shape,
     out_path: &PathBuf,
 ) -> Result<(u32, u32), String> {
     let renderer = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -180,10 +181,16 @@ fn render_minimap(
             state.projection.strength = STRENGTH;
             state.toggles.show_labels = false;
             state.toggles.show_preview = false;
-            state.show_minimap = true;
-            state.minimap_corner = Corner::BottomRight;
-            state.minimap_shape = shape;
+            let host_rect = ui.max_rect();
             state.ui(ui, &graph, |_p, _r, _t, _b, _a| {});
+            // The corner overview is now a standalone `Minimap` composed over the
+            // main pane (a Poincaré disk of dots), not an inline State branch.
+            let mut minimap = Minimap::new();
+            minimap.enabled = true;
+            minimap.corner = Corner::BottomRight;
+            minimap.shape = shape;
+            minimap.indicator = IndicatorMode::Off;
+            minimap.ui(ui, host_rect, &graph, &graph.positions(), None);
         });
 
     harness.run();
@@ -200,8 +207,9 @@ fn render_minimap(
     }
 }
 
-/// Render one frame of the click-to-expand swap at a forced `swap_t`, with the
-/// main (Euclidean) content as Off (Affine), to a PNG at `out_path`.
+/// Render one frame of the click-to-expand swap at a forced `swap_t`: the main
+/// pane is Off (Affine) and the `Minimap` overview grows from the corner to fill
+/// the pane as `swap_t` runs 0 → 1, to a PNG at `out_path`.
 fn render_expand(swap_t: f32, out_path: &PathBuf) -> Result<(u32, u32), String> {
     let renderer = std::panic::catch_unwind(AssertUnwindSafe(|| {
         egui_kittest::wgpu::WgpuTestRenderer::new()
@@ -220,11 +228,14 @@ fn render_expand(swap_t: f32, out_path: &PathBuf) -> Result<(u32, u32), String> 
             state.projection.strength = STRENGTH;
             state.toggles.show_labels = false;
             state.toggles.show_preview = false;
-            state.show_minimap = true;
-            state.minimap_corner = Corner::BottomRight;
-            state.minimap_shape = MinimapShape::Circle;
-            state.set_swap_t_for_demo(swap_t);
+            let host_rect = ui.max_rect();
             state.ui(ui, &graph, |_p, _r, _t, _b, _a| {});
+            let mut minimap = Minimap::new();
+            minimap.enabled = true;
+            minimap.corner = Corner::BottomRight;
+            minimap.shape = Shape::Circle;
+            minimap.set_swap_t_for_demo(swap_t);
+            minimap.ui(ui, host_rect, &graph, &graph.positions(), None);
         });
 
     harness.run();
@@ -349,8 +360,11 @@ impl Source for ColoredOverviewSource {
                         egui::Stroke::NONE
                     },
                     hover_stroke: egui::Stroke::new(2.0, highlight),
+                    badge: None,
+                    bug_badge: None,
                     label: None,
                     label_min_zoom: 0.9,
+                    label_scale: 1.0,
                     click_path: Some(format!("card-{index}")),
                     tooltip: None,
                 }
@@ -483,11 +497,11 @@ fn render_modes(target: &Path, rec: &mut Recorder) {
 /// corner, in both frame shapes, plus one over a Fisheye main pane.
 fn render_minimaps(target: &Path, rec: &mut Recorder) {
     let minimap_jobs = [
-        ("minimap-circle", ProjectionKind::Affine, MinimapShape::Circle,
+        ("minimap-circle", ProjectionKind::Affine, Shape::Circle,
          target.join("proj-graph-minimap-circle.png")),
-        ("minimap-square", ProjectionKind::Affine, MinimapShape::Square,
+        ("minimap-square", ProjectionKind::Affine, Shape::Square,
          target.join("proj-graph-minimap-square.png")),
-        ("minimap-fisheye", ProjectionKind::Fisheye, MinimapShape::Circle,
+        ("minimap-fisheye", ProjectionKind::Fisheye, Shape::Circle,
          target.join("proj-graph-minimap-fisheye.png")),
     ];
     for (label, kind, shape, path) in &minimap_jobs {

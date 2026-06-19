@@ -63,13 +63,20 @@ pub async fn create_with_suffix(
     // Created event, not at function entry.
     watcher.suppress(created.clone());
 
-    // Explicitly index the new file (the watcher event was suppressed).
-    let _ = jobs
+    // Explicitly index the new file. The watcher event was suppressed, so
+    // this job is the only ingest path — a dropped send leaves the note
+    // invisible to search until a rescan, and must not pass silently.
+    if let Err(e) = jobs
         .send(IndexJob::Upsert {
             rel_path: created.clone(),
             force: false,
         })
-        .await;
+        .await
+    {
+        tracing::warn!(error = %e, path = %created,
+            "index upsert not queued for created note; unsearchable until \
+             the next scan");
+    }
     Ok(created)
 }
 
@@ -102,14 +109,53 @@ pub async fn create_at(
     // Created/Modified events, not at function entry.
     watcher.suppress(created.clone());
 
-    // Explicitly index the new file (the watcher events were suppressed).
-    let _ = jobs
+    // Explicitly index the new file. The watcher events were suppressed, so
+    // this job is the only ingest path — a dropped send must not be silent.
+    if let Err(e) = jobs
         .send(IndexJob::Upsert {
             rel_path: created.clone(),
             force: false,
         })
-        .await;
+        .await
+    {
+        tracing::warn!(error = %e, path = %created,
+            "index upsert not queued for created note; unsearchable until \
+             the next scan");
+    }
     Ok(created)
+}
+
+/// Inject a ` ^id` block marker onto the un-anchored block at `block_range` in
+/// the note at `rel`, writing the result to disk through the watcher-suppress +
+/// reindex path (the same plumbing the rename-rewrite pass uses for its
+/// cross-note edits). A no-op write (the block already carries the id) is
+/// skipped. Reads the note fresh so the `block_range` the caller computed
+/// against the same body stays valid.
+///
+/// status: wikilink-block-anchor-autoinject
+pub async fn inject_block_marker(
+    watcher: &Watcher,
+    jobs: &IndexJobTx,
+    vault: &Vault,
+    rel: &str,
+    block_range: &std::ops::Range<usize>,
+    id: &str,
+) -> Result<(), HikerError> {
+    let body = vault.read_file(rel)?;
+    let new_body = crate::wikilink::inject_block_marker(&body, block_range, id);
+    if new_body == body {
+        return Ok(());
+    }
+    watcher.suppress(rel.to_string());
+    vault.write_file(rel, &new_body)?;
+    watcher.suppress(rel.to_string());
+    let _ = jobs
+        .send(IndexJob::Upsert {
+            rel_path: rel.to_string(),
+            force: false,
+        })
+        .await;
+    Ok(())
 }
 
 /// Atomic note rename. Routes through the indexer task so the fs rename and

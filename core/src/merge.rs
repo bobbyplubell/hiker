@@ -1,4 +1,4 @@
-//! Pure-text span diff + 3-way text merge — the dep-clean engine the op-log
+//! Pure-text span diff + 3-way text merge — the dep-clean engine the layered-doc
 //! apply paths and (later) the unified conflict surface ride on. No Yrs, no
 //! I/O: just text in, spans/merged-text out. `similar` is confined here. See
 //! docs/diff.md and docs/sync.md (`sync-three-way-merge`).
@@ -15,7 +15,7 @@ const DIFF_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Byte offset of every char start in `s`, plus a trailing `s.len()`
 /// sentinel — so a char index from a char-level diff maps straight to a byte
-/// offset (the op-log records edits in byte positions).
+/// offset (the layered doc records edits in byte positions).
 fn char_byte_bounds(s: &str) -> Vec<usize> {
     let mut bounds: Vec<usize> = s.char_indices().map(|(i, _)| i).collect();
     bounds.push(s.len());
@@ -50,10 +50,25 @@ pub(crate) fn multi_span_delta(before: &str, after: &str) -> Vec<(usize, usize, 
     }
     let before_bounds = char_byte_bounds(before);
     let after_bounds = char_byte_bounds(after);
+    let started = std::time::Instant::now();
     let diff = TextDiff::configure()
         .algorithm(Algorithm::Myers)
         .timeout(DIFF_TIMEOUT)
         .diff_chars(before, after);
+    // `similar` doesn't report that its deadline fired — it just returns
+    // coarser ops. Wall-clock is the only available signal, so warn when the
+    // budget was plausibly exhausted: the spans this save records are wider
+    // than the real edit, and future 3-way merges against them lose locality
+    // (disjoint concurrent edits can start surfacing as same-region
+    // conflicts). Content stays correct either way.
+    if started.elapsed() >= DIFF_TIMEOUT {
+        tracing::warn!(
+            before_bytes = before.len(),
+            after_bytes = after.len(),
+            "span diff hit its time budget; recording coarser edit spans \
+             for this save (merge locality degraded, content unaffected)"
+        );
+    }
 
     let mut spans = Vec::new();
     // The open run, in `before` char indices: `[run_start, run_end)` is the
@@ -535,58 +550,6 @@ fn push_line(out: &mut String, first: &mut bool, line: &str) {
 /// and keep.
 fn span_overlaps_any(start: usize, end: usize, spans: &[(usize, usize, String)]) -> bool {
     spans.iter().any(|(ts, tl, _)| start < ts + tl && *ts < end)
-}
-
-/// Same-region overlap DETECTION for the sync conflict gate
-/// (`sync-conflict-detect-same-region`): given the common `base`, our divergent
-/// text `ours`, and the peer's divergent text `theirs`, return `true` iff any of
-/// OUR divergent byte ranges overlaps THEIRS — i.e. both sides edited the same
-/// region and a merge would interleave a genuine conflict rather than merge
-/// two disjoint edits. This is the predicate side of [`three_way_merge`]'s
-/// span-drop rule, factored out so the dialer can BLOCK on overlap before
-/// applying the peer delta without changing the merge callers' behavior. A pure
-/// fast-forward (`ours == base` or `theirs == base`) yields no spans on one side
-/// and so never overlaps — disjoint-region edits return `false` (auto-merge).
-///
-/// status: sync-conflict-detect-same-region
-pub(crate) fn spans_overlap(base: &str, ours: &str, theirs: &str) -> bool {
-    let our_spans = multi_span_delta(base, ours);
-    let their_spans = multi_span_delta(base, theirs);
-    // A span that is byte-identical on both sides is the SAME edit converging,
-    // not a conflict — e.g. one side already merged the other's change, so its
-    // diff-against-base reproduces that change verbatim. Such a span never
-    // contends with its identical twin. We only flag a span that genuinely
-    // DIFFERS from the other side's edit in the same region.
-    our_spans.iter().any(|(start, removed_len, inserted)| {
-        let end = start + removed_len;
-        // An exact twin on the other side (same anchor, same removed length,
-        // same inserted text) means both replicas already hold this edit — skip
-        // it, it can't conflict with itself.
-        let has_identical_twin = their_spans
-            .iter()
-            .any(|(ts, tl, tins)| ts == start && tl == removed_len && tins == inserted);
-        if has_identical_twin {
-            return false;
-        }
-        // Range intersection with a DIFFERING span (the `three_way_merge`
-        // predicate) is a genuine same-region overlap.
-        if their_spans.iter().any(|(ts, tl, tins)| {
-            *start < ts + tl && *ts < end && (ts != start || tl != removed_len || tins != inserted)
-        }) {
-            return true;
-        }
-        // Coincident anchor: two CONCURRENT INSERTIONS at the exact same byte
-        // offset (both zero-width, same `start`) with DIFFERENT inserted text
-        // are a genuine same-region conflict — a positional merge would
-        // interleave them —
-        // yet the strict half-open-range test misses them (a zero-width range
-        // overlaps nothing). Detection-only: `three_way_merge` keeps its strict
-        // rule, so its existing callers are unchanged.
-        *removed_len == 0
-            && their_spans
-                .iter()
-                .any(|(ts, tl, tins)| *tl == 0 && *ts == *start && tins != inserted)
-    })
 }
 
 /// The minimal single-span edit turning `before` into `after`, as

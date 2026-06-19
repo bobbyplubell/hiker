@@ -9,36 +9,30 @@
 
 use emath::{Pos2, Rect, Vec2};
 use hiker_canvas::geometry::{Point, Rect as CanvasRect};
-use hiker_projection::{
-    clamp_inside_disk, forward, inverse, magnification, Complex, Mobius, ProjectionConfig,
-    ProjectionKind, DEFAULT_BOUNDARY_RADIUS,
-};
+use hiker_projection::{magnification, Complex, Mobius, ProjectionConfig, ProjectionKind};
+// The view-layer lens shared with the graph-view engine: the disk operator
+// (+inverse) and the screen↔disk map. The camera keeps its f64 framing and
+// converts at the boundary (the disk math is f32 either way). [proj-canvas-mode]
+use hiker_projection_view::{lens_disk, lens_disk_inverse, screen_to_disk};
 
 /// The smallest and largest zoom factors the camera clamps to.
 const MIN_SCALE: f32 = 0.002;
 const MAX_SCALE: f32 = 20.0;
 
-/// Scroll-zoom clamp for the locked Poincaré disk radius. [proj-canvas-mode]
-const POINCARE_ZOOM_MIN: f32 = 0.3;
-const POINCARE_ZOOM_MAX: f32 = 25.0;
+// The locked Poincaré disk frame, its `DISK_FILL` / scroll-zoom constants, the
+// `zoom_poincare` scroll law, and the disk operator (+inverse) + screen↔disk map
+// now live in the shared `hiker_projection_view` crate — the single source of
+// truth with the graph-view engine (these were hand-synced "mirrors the graph
+// view" copies). `poincare_disk` stays as a thin viewport-local delegate.
+// [proj-canvas-mode]
 
-/// Fraction of the viewport's shorter half-dimension the locked Poincaré disk
-/// fills, leaving a small margin so the boundary ring isn't flush against the
-/// edge.
-const DISK_FILL: f32 = 0.92;
-
-/// The locked Poincaré disk frame for a viewport: its centre (the viewport
-/// centre) and radius (`DISK_FILL` of the shorter half-dimension × `zoom`).
-/// Deliberately a pure function of `viewport` + `zoom` *only* — it must NOT
-/// depend on the camera's `pan`/`scale`, so the disk stays fixed-CENTERED to the
-/// pane as the user navigates (the disk IS the viewport; navigation is Möbius
-/// `nav` drag + click fly-to, never affine pan/zoom). Scroll-zoom scales the
-/// RADIUS only — the centre is zoom-invariant (always the viewport centre), so
-/// the disk grows/shrinks centred and never drifts. Mirrors the graph view's
-/// `poincare_disk`. [proj-canvas-mode]
+/// The locked Poincaré disk frame for a viewport — a pure function of `viewport`
+/// + `zoom` (centre = viewport centre, radius = `DISK_FILL` of the shorter
+/// half-dimension × `zoom`), independent of the camera's `pan`/`scale` so the
+/// disk stays fixed-CENTERED to the pane. Delegates to
+/// [`hiker_projection_view::poincare_disk`]. [proj-canvas-mode]
 fn poincare_disk(viewport: Rect, zoom: f32) -> (Pos2, f32) {
-    let radius = 0.5 * viewport.size().min_elem() * DISK_FILL * zoom;
-    (viewport.center(), radius)
+    hiker_projection_view::poincare_disk(viewport, zoom)
 }
 
 /// Default lower / upper bounds for the per-card lens scale (`proj-card-scale`).
@@ -144,16 +138,11 @@ impl Lens {
     /// through here, so they pick up navigation automatically; Off/Fisheye never
     /// apply `nav`, keeping them byte-identical. [proj-poincare-nav]
     fn disk(&self, p: Point) -> Complex {
-        let rel = [
+        let rel = Vec2::new(
             ((p.x - self.focus.x) / self.scale) as f32,
             ((p.y - self.focus.y) / self.scale) as f32,
-        ];
-        let z = forward(Complex::from(rel), self.cfg);
-        if self.cfg.kind == ProjectionKind::Poincare {
-            self.nav.apply(z)
-        } else {
-            z
-        }
+        );
+        lens_disk(rel, self.cfg, self.nav)
     }
 
     /// Map a disk point back to lensed-world space (the inverse of the
@@ -184,19 +173,18 @@ impl Lens {
         if !self.active() {
             return p;
         }
-        let z = Complex::from([
+        // The framed lensed point IS a disk coordinate; [`lens_disk_inverse`] undoes
+        // the Poincaré nav recentre and the projection inverse (exact round-trip),
+        // then we un-frame back to world space at f64. [proj-poincare-nav]
+        let z = Complex::new(
             ((p.x - self.focus.x) / self.scale) as f32,
             ((p.y - self.focus.y) / self.scale) as f32,
-        ]);
-        // Under Poincaré the lensed point lives in the *post-nav* disk, so undo
-        // the navigation recentre before the projection inverse so the round-trip
-        // stays exact. [proj-poincare-nav]
-        let z = if self.cfg.kind == ProjectionKind::Poincare {
-            self.nav.invert().apply(z)
-        } else {
-            z
-        };
-        self.disk_to_world(inverse(z, self.cfg))
+        );
+        let world_rel = lens_disk_inverse(z, self.cfg, self.nav);
+        Point::new(
+            self.focus.x + f64::from(world_rel.x) * self.scale,
+            self.focus.y + f64::from(world_rel.y) * self.scale,
+        )
     }
 
     /// Local linear magnification at a world position (1.0 under Affine). Couples
@@ -401,20 +389,20 @@ impl Camera {
     /// centre, so it zooms without drifting); clamped. Off/Fisheye use the affine
     /// zoom instead. [proj-canvas-mode]
     pub fn zoom_poincare(&mut self, scroll_y: f32) {
-        self.poincare_zoom = (self.poincare_zoom * (scroll_y * 0.005).exp())
-            .clamp(POINCARE_ZOOM_MIN, POINCARE_ZOOM_MAX);
+        self.poincare_zoom = hiker_projection_view::zoom_poincare(self.poincare_zoom, scroll_y);
     }
 
-    /// The pre-nav disk point of a world position — `forward((w − focus) / scale)`
-    /// WITHOUT the navigation recentre. The fly-to target: a card's resting disk
-    /// point, which the glide carries to the disk centre. [proj-poincare-nav]
+    /// The pre-nav disk point of a world position — the `forward` remap WITHOUT
+    /// the navigation recentre (passing an identity `nav` to [`lens_disk`]). The
+    /// fly-to target: a card's resting disk point, which the glide carries to the
+    /// disk centre. [proj-poincare-nav]
     #[must_use]
     pub fn disk_point(&self, p: Point) -> Complex {
-        let rel = [
+        let rel = Vec2::new(
             ((p.x - self.lens_focus.x) / self.lens_scale) as f32,
             ((p.y - self.lens_focus.y) / self.lens_scale) as f32,
-        ];
-        forward(Complex::from(rel), self.projection)
+        );
+        lens_disk(rel, self.projection, Mobius::identity())
     }
 
     /// The post-nav disk point under a screen position, for the drag-recentre
@@ -427,8 +415,7 @@ impl Camera {
     #[must_use]
     pub fn disk_under_screen(&self, viewport: Rect, screen_pos: Pos2) -> Complex {
         let (center, radius) = poincare_disk(viewport, self.poincare_zoom);
-        let rel = (screen_pos - center) / radius.max(f32::EPSILON);
-        clamp_inside_disk(Complex::new(rel.x, rel.y), DEFAULT_BOUNDARY_RADIUS)
+        screen_to_disk(screen_pos, center, radius)
     }
 
     /// Refresh the per-frame lens framing from the canvas content bounds: the
@@ -536,15 +523,13 @@ impl Camera {
     pub fn screen_to_world(&self, viewport: Rect, pos: Pos2) -> Point {
         if self.projection.kind == ProjectionKind::Poincare {
             let (center, radius) = poincare_disk(viewport, self.poincare_zoom);
-            let rel = (pos - center) / radius.max(f32::EPSILON);
-            let z = clamp_inside_disk(Complex::new(rel.x, rel.y), DEFAULT_BOUNDARY_RADIUS);
-            // Undo nav, then the projection inverse, then the focus/scale framing —
-            // mirroring `Lens::lensed_to_world` but starting from a disk point.
-            let z = self.nav.invert().apply(z);
-            let world_rel = inverse(z, self.projection);
+            let z = screen_to_disk(pos, center, radius);
+            // Undo nav + the projection inverse via the shared operator, then the
+            // focus/scale framing back to f64 world space.
+            let world_rel = lens_disk_inverse(z, self.projection, self.nav);
             return Point::new(
-                self.lens_focus.x + f64::from(world_rel.re) * self.lens_scale,
-                self.lens_focus.y + f64::from(world_rel.im) * self.lens_scale,
+                self.lens_focus.x + f64::from(world_rel.x) * self.lens_scale,
+                self.lens_focus.y + f64::from(world_rel.y) * self.lens_scale,
             );
         }
         self.lens().lensed_to_world(self.screen_to_lensed(viewport, pos))
@@ -878,7 +863,7 @@ mod tests {
             let mut cam = poincare_cam(bounds, 1.0);
             let (center, radius) = cam.poincare_disk_frame(vp);
             assert!((center.x - vp.center().x).abs() < 1e-4 && (center.y - vp.center().y).abs() < 1e-4);
-            let expected = 0.5 * vp.size().min_elem() * super::DISK_FILL;
+            let expected = 0.5 * vp.size().min_elem() * hiker_projection_view::DISK_FILL;
             assert!((radius - expected).abs() < 1e-4, "radius {radius} vs {expected}");
 
             // The focus (centroid) lands at the disk centre regardless of pan/zoom.

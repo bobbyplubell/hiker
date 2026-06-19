@@ -35,7 +35,6 @@ pub const PANEL_SEARCH: PanelId = "search";
 /// `related` are now `View`s inside it (`"context/backlinks"` /
 /// `"context/related"`), not standalone activity ids.
 pub const PANEL_CONTEXT: PanelId = "context";
-pub const PANEL_CHAT: PanelId = "chat";
 
 #[derive(Debug, Clone)]
 pub struct Tab {
@@ -101,13 +100,18 @@ impl TabLink {
 pub enum BufferSource {
     /// Vault file — editable, dirty-tracked, autosaved.
     Vault { path: String },
-    /// Historical version materialized from the op log — read-only.
+    /// Historical version materialized from the layered doc — read-only.
     /// `op_id` is the accepted op (ulid) the content is reconstructed at.
     HistoryVersion { path: String, op_id: String },
-    /// Pending op-log proposal content — read-only.
+    /// Pending layered-doc proposal content — read-only.
     PendingProposal { proposal_id: String, target_path: String },
     /// Trash entry — read-only.
     Trash { trash_path: String, original_path: String },
+    /// A code file (`.rs`, `.py`, …) opened from the vault as read-only
+    /// reference content. Never editable, never autosaved/layered-doc-tracked — code
+    /// is reference content, only `.md` notes are authored. `path` is the
+    /// vault-relative path. status: code-read-only-view
+    CodeFile { path: String },
 }
 
 impl BufferSource {
@@ -119,6 +123,7 @@ impl BufferSource {
             BufferSource::HistoryVersion { path, .. } => path,
             BufferSource::PendingProposal { target_path, .. } => target_path,
             BufferSource::Trash { original_path, .. } => original_path,
+            BufferSource::CodeFile { path } => path,
         }
     }
 }
@@ -132,12 +137,17 @@ pub enum DiffSource {
     Disk { path: String },
     /// Another open buffer's live text.
     LiveBuffer { path: String },
-    /// A historical version's content materialized from the op log
+    /// A historical version's content materialized from the layered doc
     /// (`content_at_op(path, op_id)`); `path` is the vault-relative path
     /// the op touched, retained for restore.
     HistoryVersion { op_id: String, path: String },
-    /// Pending op-log proposal's stored before-text or content.
+    /// Pending layered-doc proposal's stored before-text or content.
     PendingProposal { proposal_id: String },
+    /// The file's content at a git revision (`GitBackend::show` through the
+    /// git transport engine). `rev` is anything `git rev-parse` accepts; a
+    /// path absent at the rev resolves to an empty base so the whole file
+    /// reads as added. status: diff-source-git-ref
+    GitRef { rev: String, path: String },
     /// Trashed file content.
     Trash { trash_path: String },
     /// Empty rope (e.g. comparing a new-note proposal against "no file").
@@ -159,18 +169,26 @@ pub enum TabKind {
     QueueDetail { task_id: String },
     Settings,
     Properties { path: String },
-    /// Vault-wide graph view (deferred — placeholder for v1).
-    Graph,
+    /// Vault-wide graph view. Singleton (one global tab, like Home/Queue),
+    /// but the kind carries an optional **focus target** — open "focused"
+    /// lands the panel in `focus.path`'s depth-bounded neighbourhood instead
+    /// of the full-vault overview (mirroring how `CodeGraph` carries its
+    /// view-source) — and an optional **query scope** (`graph-scoped-query`):
+    /// the query-doc whose matches bound the node universe ("graph of this
+    /// smart folder"). Scope and focus are orthogonal and compose — the
+    /// scope filters the universe, the focus drills within it. `None`/`None`
+    /// is the plain overview open. status: graph-tab-focus
+    Graph { focus: Option<GraphFocus>, scope_query: Option<String> },
     /// Board: a per-doc kanban view over a curated board-doc at `path`.
     /// Columns + card refs come from the board-doc frontmatter; a card move
-    /// rewrites that frontmatter via the op-log. Per-doc (like the cluster
+    /// rewrites that frontmatter via the layered doc. Per-doc (like the cluster
     /// tabs), not a singleton. See `docs/kanban.md`.
     ///
     /// status: board-view
     Board { path: String },
     /// Canvas: a per-doc spatial editor over a `.canvas` JSON Canvas document
     /// at `path`. Nodes + edges come from the file's JSON; an edit
-    /// re-serializes and persists through the op-log exactly like a note.
+    /// re-serializes and persists through the layered doc exactly like a note.
     /// Per-doc (like Board), not a singleton. See `docs/canvas.md`.
     ///
     /// status: canvas-tab
@@ -182,18 +200,23 @@ pub enum TabKind {
     ///
     /// status: board-index-page
     BoardsIndex,
-    /// Chat session as a full tab (vs. docked at bottom of discovery).
-    Agent { session_id: String },
     /// Patch review: lists pending proposals with accept/reject.
     PatchReview,
+    /// Rules panel: every registered vault rule (name, trigger, enabled
+    /// state, last firing) expanding to its recent firings off the layered-doc
+    /// author projection, plus failed firings from the engine's
+    /// diagnostics ring. Read-only in v1 — the TOML is the editing
+    /// surface. Singleton, like Changes. See `docs/rules.md`.
+    ///
+    /// status: rule-firings-panel
+    Rules,
     /// Indexer detail / control: model id, status, reindex.
     IndexerDetail,
-    /// Sync detail / control: device fingerprint, enrollment, force-sync,
-    /// discovery, recent synced items.
-    Sync,
-    /// Unified activity / changes feed: every pending op-log proposal
-    /// plus every accepted op, with author + op + source filter chips.
-    Changes,
+    /// Git diff summary: a read-only viewer over the vault repo — pick a
+    /// base rev (and optionally a head rev), see the changed paths, click a
+    /// row to open the file with the `GitRef` diff overlay. Singleton, like
+    /// Changes. status: diff-summary-panel
+    GitDiff,
     /// Cluster Review tab: two-phase preview-then-persist for a fresh
     /// cluster build over the vault. Payload is the build configuration;
     /// the tab body holds a draft tree until the user persists.
@@ -201,10 +224,11 @@ pub enum TabKind {
     /// Cluster tree visualised as a radial dendrogram. Payload is the
     /// `tree_id` to render.
     ClusterGraph { tree_id: String },
-    /// Code graph: a project note's (`hiker.kind: project`) repo source rendered as a precise
-    /// entity graph through the shared graph engine. Payload is the project-note path. Per-note
-    /// (like Board), not a singleton. See `docs/hiker-code.md` `code-graph-view-source`.
-    CodeGraph { project_path: String },
+    /// Code graph: a code source rendered as a precise entity graph through the shared graph engine.
+    /// The source is either a project note (`hiker.kind: project`, binds a repo descriptor) or a
+    /// `.scip` index opened directly from the file tree (no project note). Per-source (like Board),
+    /// not a singleton. See `docs/hiker-code.md` `code-graph-view-source`.
+    CodeGraph { source: CodeSource },
     /// Project-config form: author/edit a project note via UI (sources → save). `source_note` is
     /// `Some(path)` when editing an existing project note, `None` for a new one. Per-form state on
     /// `AppState::panels.project_config`, keyed by tab id.
@@ -222,6 +246,75 @@ pub enum TabKind {
     /// splices the regenerated block back). See `panels::charts_tab`.
     /// status: chart-csv-tab, chart-open-in-builder
     ChartBuilder { source: ChartSource },
+}
+
+/// Display scope for the code-graph view: the whole graph (`Overview`) or the 1–3-hop
+/// neighbourhood of the **selected** node. Selection and scope are orthogonal — clicking always
+/// selects; the scope dial decides whether the display recenters on it. Lives here (beside
+/// [`CodeSource`]) so both `state::NavTarget` and the code-graph panel share the same type.
+/// status: code-graph-scope-hops
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    Overview,
+    /// 1–3 hops around the selected node (the panel clamps the count).
+    Hops(u8),
+}
+
+/// A [`TabKind::Graph`] tab's optional focus target: the note whose
+/// depth-bounded neighbourhood the panel opens on (the "Open in graph"
+/// dispatch target). The vault analogue of [`CodeSource`]'s view-source
+/// payload. status: graph-tab-focus
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphFocus {
+    /// Vault-relative note path of the focus anchor.
+    pub path: String,
+    /// Neighbourhood depth in hops (the panel clamps to the dial's 1–3).
+    pub depth: u8,
+}
+
+impl GraphFocus {
+    /// Workspace-restore key for a focused graph tab: `graph:<depth>:<path>`
+    /// (the unfocused singleton keeps its historical `:graph` key).
+    /// status: graph-tab-focus
+    pub fn persist_key(&self) -> String {
+        format!("graph:{}:{}", self.depth, self.path)
+    }
+
+    /// Parse a `graph:<depth>:<path>` restore key back into a focus target;
+    /// `None` for malformed keys (the restore path then skips the tab).
+    pub fn from_persist_key(key: &str) -> Option<Self> {
+        let rest = key.strip_prefix("graph:")?;
+        let (depth, path) = rest.split_once(':')?;
+        let depth = depth.parse().ok()?;
+        (!path.is_empty()).then(|| Self { path: path.to_string(), depth })
+    }
+}
+
+/// What a [`TabKind::CodeGraph`] tab is viewing. status: code-graph-view-source
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodeSource {
+    /// A project note (`hiker.kind: project`); its `repo` source descriptor is bound to a SCIP
+    /// adapter. Vault-relative note path.
+    Project(String),
+    /// A `.scip` index opened directly (no project note). Vault-relative path; the repo root for
+    /// previews defaults to the index's own directory.
+    Index(String),
+}
+
+impl CodeSource {
+    /// The vault-relative path this source points at (note or `.scip`).
+    pub fn path(&self) -> &str {
+        match self {
+            CodeSource::Project(p) | CodeSource::Index(p) => p,
+        }
+    }
+    /// Stable per-source key for the per-tab state map (disambiguates note vs index on same stem).
+    pub fn key(&self) -> String {
+        match self {
+            CodeSource::Project(p) => format!("project:{p}"),
+            CodeSource::Index(p) => format!("index:{p}"),
+        }
+    }
 }
 
 /// What a [`TabKind::ChartBuilder`] tab is editing. status: chart-csv-tab
@@ -256,9 +349,8 @@ impl ChartSource {
 
 #[derive(Debug, Clone)]
 pub enum HomeDetail {
-    VersionHistory,
-    /// Per-row version history view: lists every accepted op that
-    /// touched the given vault-relative path, newest first.
+    /// Per-note version history view: lists every plain-file snapshot of the
+    /// given vault-relative path, newest first.
     ActivityRow { path: String },
 }
 
@@ -296,6 +388,18 @@ impl TabKind {
         }
     }
 
+    /// Construct a git-diff editor tab (the diff-summary panel's row open):
+    /// the buffer holds the live vault file; the diff layer shows how it
+    /// differs from the file's content at git rev `rev`.
+    /// status: diff-source-git-ref
+    pub fn git_diff_preview(path: impl Into<String>, rev: impl Into<String>) -> Self {
+        let p = path.into();
+        TabKind::Editor {
+            buffer: BufferSource::Vault { path: p.clone() },
+            diff: Some(DiffSource::GitRef { rev: rev.into(), path: p }),
+        }
+    }
+
     /// Construct a read-only trash-preview editor tab. The buffer holds
     /// the trashed file's on-disk content; no diff layer.
     pub fn trash_preview(
@@ -307,6 +411,16 @@ impl TabKind {
                 trash_path: trash_path.into(),
                 original_path: original_path.into(),
             },
+            diff: None,
+        }
+    }
+
+    /// Construct a read-only code-file editor tab. The buffer holds the code
+    /// file's content read-only (plain text, no syntax highlighting in this
+    /// phase); no diff layer. status: code-read-only-view
+    pub fn code_preview(path: impl Into<String>) -> Self {
+        TabKind::Editor {
+            buffer: BufferSource::CodeFile { path: path.into() },
             diff: None,
         }
     }
@@ -344,10 +458,13 @@ impl TabKind {
                 BufferSource::Trash { original_path, .. } => {
                     format!("Trash · {}", path_basename(original_path))
                 }
+                // Read-only code reference; plain basename like a vault file
+                // (the read-only posture is conveyed by the lock-free chrome,
+                // not a label prefix). status: code-read-only-view
+                BufferSource::CodeFile { path } => path_basename(path),
             },
             TabKind::Home => "Home".to_string(),
             TabKind::HomeDetail { which } => match which {
-                HomeDetail::VersionHistory => "Version history".to_string(),
                 HomeDetail::ActivityRow { path } => {
                     format!("Version history · {}", path_basename(path))
                 }
@@ -358,19 +475,18 @@ impl TabKind {
             }
             TabKind::Settings => "Settings".to_string(),
             TabKind::Properties { path } => format!("Properties · {}", path_basename(path)),
-            TabKind::Graph => "Graph".to_string(),
+            TabKind::Graph { .. } => "Graph".to_string(),
             TabKind::Board { path } => format!("Board · {}", path_basename(path)),
             TabKind::Canvas { path } => format!("Canvas · {}", path_basename(path)),
             TabKind::BoardsIndex => "Boards".to_string(),
-            TabKind::Agent { .. } => "Chat".to_string(),
             TabKind::PatchReview => "Patch review".to_string(),
+            TabKind::Rules => "Rules".to_string(),
             TabKind::IndexerDetail => "Index".to_string(),
-            TabKind::Sync => "Sync".to_string(),
-            TabKind::Changes => "Changes".to_string(),
+            TabKind::GitDiff => "Git diff".to_string(),
             TabKind::ClusterReview { .. } => "Cluster review".to_string(),
             TabKind::ClusterGraph { .. } => "Cluster graph".to_string(),
-            TabKind::CodeGraph { project_path } => {
-                format!("Code graph · {}", path_basename(project_path))
+            TabKind::CodeGraph { source } => {
+                format!("Code graph · {}", path_basename(source.path()))
             }
             TabKind::ProjectConfig { source_note } => match source_note {
                 Some(p) => format!("Project · {}", path_basename(p)),
@@ -394,6 +510,9 @@ impl TabKind {
                 BufferSource::HistoryVersion { .. } => icons::ICONS.image(crate::icons::Icon::Clock),
                 BufferSource::PendingProposal { .. } => icons::ICONS.image(crate::icons::Icon::Edit),
                 BufferSource::Trash { .. } => icons::ICONS.image(crate::icons::Icon::Trash),
+                // Code reference content — the braces glyph reads as "code".
+                // status: code-read-only-view
+                BufferSource::CodeFile { .. } => icons::ICONS.image(crate::icons::Icon::Braces),
             },
             TabKind::Home => icons::ICONS.image(crate::icons::Icon::Home),
             TabKind::HomeDetail { .. } => icons::ICONS.image(crate::icons::Icon::Home),
@@ -401,19 +520,18 @@ impl TabKind {
             TabKind::QueueDetail { .. } => icons::ICONS.image(crate::icons::Icon::Clipboard),
             TabKind::Settings => icons::ICONS.image(crate::icons::Icon::Settings),
             TabKind::Properties { .. } => icons::ICONS.image(crate::icons::Icon::Info),
-            TabKind::Graph => icons::ICONS.image(crate::icons::Icon::Graph),
+            TabKind::Graph { .. } => icons::ICONS.image(crate::icons::Icon::Graph),
             TabKind::Board { .. } => icons::ICONS.image(crate::icons::Icon::Clipboard),
             // The spatial-graph glyph reads closest for a canvas of nodes +
             // edges in the icon set.
             TabKind::Canvas { .. } => icons::ICONS.image(crate::icons::Icon::Graph),
             TabKind::BoardsIndex => icons::ICONS.image(crate::icons::Icon::Clipboard),
-            TabKind::Agent { .. } => icons::ICONS.image(crate::icons::Icon::Chat),
             TabKind::PatchReview => icons::ICONS.image(crate::icons::Icon::Robot),
+            // No dedicated automation glyph; the settings gear reads as
+            // "configured behavior" for the rules surface.
+            TabKind::Rules => icons::ICONS.image(crate::icons::Icon::Settings),
             TabKind::IndexerDetail => icons::ICONS.image(crate::icons::Icon::Compass),
-            // No dedicated sync glyph in the icon set; `Restore` is the
-            // circular-arrow "refresh" mark, the closest fit for sync.
-            TabKind::Sync => icons::ICONS.image(crate::icons::Icon::Restore),
-            TabKind::Changes => icons::ICONS.image(crate::icons::Icon::Clock),
+            TabKind::GitDiff => icons::ICONS.image(crate::icons::Icon::Diff),
             TabKind::ClusterReview { .. } => icons::ICONS.image(crate::icons::Icon::Graph),
             TabKind::ClusterGraph { .. } => icons::ICONS.image(crate::icons::Icon::Graph),
             TabKind::CodeGraph { .. } => icons::ICONS.image(crate::icons::Icon::Graph),
@@ -464,7 +582,22 @@ impl Tab {
             TabKind::Home => (":home".into(), "home".into()),
             TabKind::Queue => (":queue".into(), "queue".into()),
             TabKind::Settings => (":settings".into(), "settings".into()),
-            TabKind::Graph => (":graph".into(), "graph".into()),
+            // The unfocused singleton keeps its historical `:graph` key; a
+            // focused tab round-trips its target through the prefixed key so
+            // the focus param survives a restart, and a query-scoped tab
+            // through `graphq:<query-path>` (scope outranks focus in the key
+            // — the LANDING state restores via the persisted view-state
+            // record either way, the graph-tab-focus posture).
+            // status: graph-tab-focus, graph-scoped-query
+            TabKind::Graph { scope_query: Some(q), .. } => {
+                (format!("graphq:{q}"), "graph".into())
+            }
+            TabKind::Graph { focus: None, scope_query: None } => {
+                (":graph".into(), "graph".into())
+            }
+            TabKind::Graph { focus: Some(f), scope_query: None } => {
+                (f.persist_key(), "graph".into())
+            }
             // Board tabs are per-doc: persist the board-doc path so the
             // tab reopens in board view on restore (the "board:" prefix
             // disambiguates from a plain buffer tab on the same path).
@@ -477,6 +610,8 @@ impl Tab {
             TabKind::Canvas { path } => (format!("canvas:{path}"), "canvas".into()),
             // Singleton Boards index page. status: board-index-page
             TabKind::BoardsIndex => (":boards_index".into(), "boards_index".into()),
+            // Singleton Rules panel. status: rule-firings-panel
+            TabKind::Rules => (":rules".into(), "rules".into()),
             // ZIM tabs are per-archive: persist the archive path so the tab
             // reopens on the main page after restart. The current article
             // (if any) is intentionally not persisted — restore lands on the
@@ -493,8 +628,8 @@ impl Tab {
             }
             TabKind::PatchReview => (":patch_review".into(), "patch_review".into()),
             TabKind::IndexerDetail => (":indexer".into(), "indexer".into()),
-            TabKind::Sync => (":sync".into(), "sync".into()),
-            TabKind::Changes => (":changes".into(), "changes".into()),
+            // Singleton git diff-summary page. status: diff-summary-panel
+            TabKind::GitDiff => (":git_diff".into(), "git_diff".into()),
             // Variants intentionally skipped: HomeDetail, non-Vault Editor
             // buffers, Editor tabs with diff active, QueueDetail,
             // Properties, Agent, ClusterReview, ClusterGraph.
@@ -521,4 +656,50 @@ impl Tab {
 
 fn path_basename(rel: &str) -> String {
     rel.rsplit('/').next().unwrap_or(rel).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GraphFocus, Tab, TabId, TabKind};
+
+    /// The focused graph tab's persist key round-trips its focus target
+    /// (path + depth); the unfocused singleton keeps the historical `:graph`
+    /// key; malformed keys parse to `None`. status: graph-tab-focus
+    #[test]
+    fn graph_focus_persist_key_round_trips() {
+        let focus = GraphFocus { path: "notes/a board.md".to_string(), depth: 2 };
+        let tab = Tab::new(
+            TabId(1),
+            TabKind::Graph { focus: Some(focus.clone()), scope_query: None },
+            true,
+        );
+        let (key, kind) = tab.persist_key().expect("focused graph tab persists");
+        assert_eq!(kind, "graph");
+        assert_eq!(key, "graph:2:notes/a board.md");
+        assert_eq!(GraphFocus::from_persist_key(&key), Some(focus));
+
+        let plain = Tab::new(TabId(2), TabKind::Graph { focus: None, scope_query: None }, true);
+        assert_eq!(plain.persist_key(), Some((":graph".to_string(), "graph".to_string())));
+
+        // A query-scoped tab persists through the `graphq:` key — scope
+        // outranks focus in the key; the landing restores via the view-state
+        // record. status: graph-scoped-query
+        let scoped = Tab::new(
+            TabId(3),
+            TabKind::Graph {
+                focus: Some(GraphFocus { path: "n.md".to_string(), depth: 1 }),
+                scope_query: Some("queries/rust.md".to_string()),
+            },
+            true,
+        );
+        assert_eq!(
+            scoped.persist_key(),
+            Some(("graphq:queries/rust.md".to_string(), "graph".to_string()))
+        );
+
+        assert_eq!(GraphFocus::from_persist_key("graph:nope"), None);
+        assert_eq!(GraphFocus::from_persist_key("graph:x:notes/a.md"), None);
+        assert_eq!(GraphFocus::from_persist_key("graph:2:"), None);
+        assert_eq!(GraphFocus::from_persist_key(":graph"), None);
+    }
 }

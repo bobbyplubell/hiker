@@ -35,9 +35,13 @@ where
     pub embedder_cell: Arc<RwLock<Option<Arc<dyn Embedder>>>>,
     pub self_tx: super::IndexJobTx,
     pub watcher_cell: Arc<OnceCell<Arc<crate::watcher::Watcher>>>,
-    pub oplog_cell: Arc<OnceCell<Arc<crate::oplog::OpLog>>>,
+    pub layered_cell: Arc<OnceCell<Arc<crate::editing::LayeredDoc>>>,
     /// status: inbox-rules
     pub inbox_cell: Arc<OnceCell<Arc<crate::inbox::Rules>>>,
+    /// status: kind-lenient-validation
+    pub kinds_cell: Arc<OnceCell<Arc<crate::kinds::Registry>>>,
+    /// status: rule-triggers
+    pub rules_cell: Arc<OnceCell<Arc<crate::rules::Engine>>>,
     pub tasks: Option<super::EmbedderLoadTaskPlumbing>,
 }
 
@@ -58,8 +62,10 @@ pub(super) async fn run(self) {
         embedder_cell,
         self_tx,
         watcher_cell,
-        oplog_cell,
+        layered_cell,
         inbox_cell,
+        kinds_cell,
+        rules_cell,
         tasks,
     } = self;
     let tasks_queue: Option<Arc<crate::tasks::queue::Queue>> = tasks.as_ref().map(|p| p.queue.clone());
@@ -77,8 +83,10 @@ pub(super) async fn run(self) {
         embedder_cell: &embedder_cell,
         self_tx: &self_tx,
         watcher_cell: &watcher_cell,
-        oplog_cell: &oplog_cell,
+        layered_cell: &layered_cell,
         inbox_cell: &inbox_cell,
+        kinds_cell: &kinds_cell,
+        rules_cell: &rules_cell,
         tasks_queue: tasks_queue.as_ref(),
     };
 
@@ -90,6 +98,7 @@ pub(super) async fn run(self) {
         }
     };
     state.publish_embedder_ready(&mut store, &embedder);
+    state.prune_ignored_tracked_docs(&mut store);
 
     while let Some(job) = rx.recv().await {
         // Called right after `recv().await` returns: the just-pulled job
@@ -125,9 +134,13 @@ struct LoopState<'a> {
     embedder_cell: &'a Arc<RwLock<Option<Arc<dyn Embedder>>>>,
     self_tx: &'a super::IndexJobTx,
     watcher_cell: &'a Arc<OnceCell<Arc<crate::watcher::Watcher>>>,
-    oplog_cell: &'a Arc<OnceCell<Arc<crate::oplog::OpLog>>>,
+    layered_cell: &'a Arc<OnceCell<Arc<crate::editing::LayeredDoc>>>,
     /// status: inbox-rules
     inbox_cell: &'a Arc<OnceCell<Arc<crate::inbox::Rules>>>,
+    /// status: kind-lenient-validation
+    kinds_cell: &'a Arc<OnceCell<Arc<crate::kinds::Registry>>>,
+    /// status: rule-triggers
+    rules_cell: &'a Arc<OnceCell<Arc<crate::rules::Engine>>>,
     tasks_queue: Option<&'a Arc<crate::tasks::queue::Queue>>,
 }
 
@@ -219,7 +232,9 @@ impl<'a> LoopState<'a> {
                     let _ = reply.send(Err(crate::errors::HikerError::Io("embedder unavailable".into())));
                     None
                 }
-                IndexJob::FullScan { .. } | IndexJob::TouchAccess { .. } => None,
+                IndexJob::FullScan { .. }
+                | IndexJob::TouchAccess { .. }
+                | IndexJob::RulesDateSweep => None,
             };
             if path.is_some() {
                 let _ = self.progress.send(ProgressEvent::Error {
@@ -228,6 +243,84 @@ impl<'a> LoopState<'a> {
                 });
             }
         }
+    }
+
+    /// One-time startup pass: untrack docs whose path is now excluded by the
+    /// composed ignore matcher but were seeded into the layered doc + search index
+    /// before the ignore rule existed (or before the ingest seams were
+    /// unified onto the matcher) — e.g. a nested repo's test-fixture `.txt`
+    /// captured before a `.hikerignore` excluded them. For each tracked
+    /// layered doc whose file STILL EXISTS on disk yet is now ignored, drop the
+    /// layered doc (`forget_document` — not a tombstone-to-trash; the file was
+    /// never meant to be tracked, and is left untouched on disk) and remove
+    /// its search-index rows. A gone-from-disk ignored path is NOT forgotten
+    /// here — that's a real delete, handled by reconcile / the watcher with
+    /// the trash safety net. No-op without an attached layered doc (CLI / tests).
+    ///
+    /// status: op-log-doc-id-bootstrap
+    fn prune_ignored_tracked_docs(&self, store: &mut Store) {
+        let Some(log) = self.layered_cell.get() else { return };
+        // Tracked docs are the vault's indexable files the layered doc has a document
+        // for. The `.ops`-scan enumeration is gone (the engine is retired), so
+        // walk the vault and keep paths the layered doc tracks (a `.md` on disk under
+        // path-identity = a tracked doc). A still-on-disk file that is now
+        // ignored is what this prunes; a gone file is a real delete handled
+        // elsewhere.
+        let candidates = match self.vault.walk_indexable_files("") {
+            Ok(rels) => rels,
+            Err(e) => {
+                tracing::warn!(error = %e, "prune-ignored: vault walk failed");
+                return;
+            }
+        };
+        let doc_ids: Vec<String> = candidates
+            .into_iter()
+            .filter(|rel| matches!(log.doc_id_for_path(rel), Ok(Some(_))))
+            .collect();
+        let mut pruned = 0usize;
+        for doc_id in &doc_ids {
+            if self.untrack_if_ignored(log, store, doc_id) {
+                pruned += 1;
+            }
+        }
+        if pruned > 0 {
+            tracing::info!(pruned, "prune-ignored: untracked now-ignored docs seeded before the ignore rule");
+        }
+    }
+
+    /// Untrack `doc_id` iff its file still exists but is now ignored: drop the
+    /// layered doc (`forget_document`) and its search-index rows. Returns
+    /// whether it was untracked. A forget failure aborts before the store
+    /// delete so the two never disagree.
+    fn untrack_if_ignored(
+        &self,
+        log: &crate::editing::LayeredDoc,
+        store: &mut Store,
+        doc_id: &str,
+    ) -> bool {
+        let Some(rel) = self.prunable_ignored_path(log, doc_id) else {
+            return false;
+        };
+        if let Err(e) = log.forget_document(doc_id) {
+            tracing::warn!(path = %rel, error = %e, "prune-ignored: forget_document failed");
+            return false;
+        }
+        if let Err(e) = store.delete_note_by_path(&rel) {
+            tracing::warn!(path = %rel, error = %e, "prune-ignored: store delete failed");
+        }
+        true
+    }
+
+    /// The vault-relative path to untrack for `doc_id`, or `None` to keep it:
+    /// a tracked doc whose file STILL EXISTS but is now excluded by the
+    /// composed ignore matcher. A gone-from-disk ignored path returns `None`
+    /// (a genuine delete — reconcile tombstones it to trash with the
+    /// recoverability the prune deliberately does not provide).
+    fn prunable_ignored_path(&self, log: &crate::editing::LayeredDoc, doc_id: &str) -> Option<String> {
+        let rel = log.path_for_doc(doc_id).ok().flatten()?;
+        let ignored = crate::ignore::is_ignored_in(self.vault_root, &rel, false);
+        let exists = self.vault_root.join(&rel).exists();
+        (ignored && exists).then_some(rel)
     }
 
     /// Reseat chunk_vecs to the loaded embedder's dim, publish the shared
@@ -303,8 +396,10 @@ impl<'a> LoopState<'a> {
                     pending: self.pending,
                     self_tx: self.self_tx,
                     watcher_cell: self.watcher_cell,
-                    oplog_cell: self.oplog_cell,
+                    layered_cell: self.layered_cell,
                     inbox_cell: self.inbox_cell,
+                    kinds_cell: self.kinds_cell,
+                    rules_cell: self.rules_cell,
                 };
                 handle_simple_job(&ctx, store, other).await;
             }
@@ -368,13 +463,14 @@ impl<'a> LoopState<'a> {
                 pending: self.pending,
                 self_tx: self.self_tx,
                 watcher_cell: self.watcher_cell,
-                oplog_cell: self.oplog_cell,
+                layered_cell: self.layered_cell,
                 inbox_cell: self.inbox_cell,
+                kinds_cell: self.kinds_cell,
+                rules_cell: self.rules_cell,
             };
             handle_simple_job(&ctx, store, j).await;
             super::update_total_notes(self.status, store);
         }
     }
 }
-
 

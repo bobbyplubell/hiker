@@ -540,8 +540,8 @@ fn render_actions_menu(&mut self, ui: &mut egui::Ui) {
             open_singleton_tab(state, TabKind::Settings);
             ui.close();
         }
-        if tab_menu_row(ui, &TabKind::Graph, 0) {
-            open_singleton_tab(state, TabKind::Graph);
+        if tab_menu_row(ui, &TabKind::Graph { focus: None, scope_query: None }, 0) {
+            open_singleton_tab(state, TabKind::Graph { focus: None, scope_query: None });
             ui.close();
         }
         // status: board-index-page
@@ -549,16 +549,18 @@ fn render_actions_menu(&mut self, ui: &mut egui::Ui) {
             open_singleton_tab(state, TabKind::BoardsIndex);
             ui.close();
         }
+        // status: rule-firings-panel
+        if tab_menu_row(ui, &TabKind::Rules, 0) {
+            open_singleton_tab(state, TabKind::Rules);
+            ui.close();
+        }
         if tab_menu_row(ui, &TabKind::PatchReview, pending_count) {
             open_singleton_tab(state, TabKind::PatchReview);
             ui.close();
         }
-        if tab_menu_row(ui, &TabKind::Changes, 0) {
-            open_singleton_tab(state, TabKind::Changes);
-            ui.close();
-        }
-        if tab_menu_row(ui, &TabKind::Sync, 0) {
-            open_singleton_tab(state, TabKind::Sync);
+        // status: diff-summary-panel
+        if tab_menu_row(ui, &TabKind::GitDiff, 0) {
+            open_singleton_tab(state, TabKind::GitDiff);
             ui.close();
         }
         ui.separator();

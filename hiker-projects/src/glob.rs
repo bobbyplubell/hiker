@@ -1,4 +1,4 @@
-//! A tiny path-glob matcher for [`crate::Scope`] — enough for `src/**`, `target/**`,
+//! A tiny path-glob matcher for [`crate::repo::Scope`] — enough for `src/**`, `target/**`,
 //! `services/a/**`, `**/*.rs`. Avoids pulling a full glob crate for this one bounded need.
 //!
 //! Semantics (path separator = `/`):
@@ -7,7 +7,7 @@
 //! - everything else is a literal.
 
 /// Match `pattern` against `path` (both `/`-separated, no leading `/`).
-pub fn glob_match(pattern: &str, path: &str) -> bool {
+pub fn matches(pattern: &str, path: &str) -> bool {
     let pat: Vec<&str> = pattern.split('/').collect();
     let path: Vec<&str> = path.split('/').collect();
     match_segments(&pat, &path)
@@ -64,28 +64,28 @@ fn match_segment(pat: &str, seg: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::glob_match;
+    use super::matches;
 
     #[test]
     fn double_star_crosses_segments() {
-        assert!(glob_match("src/**", "src/a/b.rs"));
-        assert!(glob_match("src/**", "src/main.rs"));
-        assert!(glob_match("src/**", "src")); // zero trailing segments
-        assert!(!glob_match("src/**", "tests/a.rs"));
+        assert!(matches("src/**", "src/a/b.rs"));
+        assert!(matches("src/**", "src/main.rs"));
+        assert!(matches("src/**", "src")); // zero trailing segments
+        assert!(!matches("src/**", "tests/a.rs"));
     }
 
     #[test]
     fn single_star_within_segment() {
-        assert!(glob_match("*.rs", "main.rs"));
-        assert!(!glob_match("*.rs", "main.py"));
-        assert!(glob_match("**/*.rs", "a/b/c.rs"));
-        assert!(glob_match("services/*/src/**", "services/api/src/lib.rs"));
-        assert!(!glob_match("services/*/src/**", "services/api/extra/src/lib.rs"));
+        assert!(matches("*.rs", "main.rs"));
+        assert!(!matches("*.rs", "main.py"));
+        assert!(matches("**/*.rs", "a/b/c.rs"));
+        assert!(matches("services/*/src/**", "services/api/src/lib.rs"));
+        assert!(!matches("services/*/src/**", "services/api/extra/src/lib.rs"));
     }
 
     #[test]
     fn literal_match() {
-        assert!(glob_match("Cargo.toml", "Cargo.toml"));
-        assert!(!glob_match("Cargo.toml", "Cargo.lock"));
+        assert!(matches("Cargo.toml", "Cargo.toml"));
+        assert!(!matches("Cargo.toml", "Cargo.lock"));
     }
 }

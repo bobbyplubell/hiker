@@ -66,10 +66,6 @@ pub struct PromptDefault {
 /// lands; the loader writes them on first launch.
 pub const fn bundled_defaults() -> &'static [PromptDefault] {
     &[
-        PromptDefault {
-            name: "chat_system",
-            default_body: CHAT_SYSTEM_DEFAULT,
-        },
         // status: note-mutation-reformat-as-markdown
         PromptDefault {
             name: "note_mutation_reformat_as_markdown",
@@ -87,8 +83,6 @@ pub const fn bundled_defaults() -> &'static [PromptDefault] {
 /// in the source tree per `llm.md`'s convention; `include_str!` bakes
 /// the file into the binary so first-run materialization can write it
 /// to the user-scope path without depending on the build output dir.
-const CHAT_SYSTEM_DEFAULT: &str =
-    include_str!("../prompts/chat_system.md");
 const NOTE_MUTATION_REFORMAT_AS_MARKDOWN_DEFAULT: &str =
     include_str!("../prompts/note_mutation_reformat_as_markdown.md");
 const CLUSTER_SUMMARIZE_DEFAULT: &str =

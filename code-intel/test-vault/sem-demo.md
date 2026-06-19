@@ -3,10 +3,10 @@ hiker:
   kind: project
 sources:
   - kind: repo
-    root: /home/bobby/projects/sem
+    root: .
     repo_id: sem
     backend: scip
-    index: /home/bobby/projects/sem/references/hiker/code-intel/fixtures/sem.scip
+    index: sem.scip
 ---
 
 # sem — large-graph demo
@@ -16,5 +16,7 @@ this project exercises the **scoped default**: the graph caps at the top ~400
 highest-degree nodes (the panel footer says "top N of M by degree") so a large repo
 stays legible instead of hairballing. Toggle Calls / Implements edges from the eye menu.
 
-(Entity previews read from the repo's working tree; the topology renders from the
-index alone, so the graph still draws even if some source files have moved.)
+The `index:` is a **vault-relative** path to the in-vault `sem.scip` (CODE-IN-VAULT
+trust invariant: hiker only reads inside the vault). `root: .` points at the vault
+dir; the topology renders from the index alone, so the graph draws even though the
+sem working tree isn't in the vault — source previews degrade (graph-only).

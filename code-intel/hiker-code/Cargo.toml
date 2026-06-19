@@ -6,5 +6,14 @@ publish = false
 
 [dependencies]
 spec-engine = { path = "../spec-engine" }
+# Thin git verb surface (log / diff_paths) for the churn-vs-drift report; lives at the hiker
+# repo root, reached across the workspace boundary like code-cli's hiker-projects dep.
+hiker-git = { path = "../../hiker-git" }
 scip = "0.6"              # SCIP-consumer adapter: reads .scip protobuf indexes
 protobuf = "=3.7.2"       # matches scip's pinned rust-protobuf (for Message::parse_from_bytes)
+tree-sitter = "0.25"      # AST-normalized Code-level fingerprint (spec-ast-fingerprint)
+tree-sitter-rust = "0.24" # Rust grammar for the AST fingerprint (matches main workspace pin)
+tree-sitter-python = "0.23" # Python grammar — fingerprints dispatch per file extension
+
+[dev-dependencies]
+tempfile = "3" # churn-window tests build real temp git repos (parallel hiker-git's own tests)

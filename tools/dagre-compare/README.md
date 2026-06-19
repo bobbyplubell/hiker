@@ -90,9 +90,21 @@ the load-bearing verdict; edge-routing vertex counts are allowed to differ
   CUSTOMER/ORDER ER diagram). Fixed in `graph/src/layered/order/mod.rs`; the
   `chain`/`diamond`/`crossing`/`lr-flow`/`er-orders` fixtures now match dagre.js
   to 0.00px.
-- **Cluster/subgraph vertical spacing (OPEN).** The `clusters` fixture matches
-  dagre on x-position, ordering, and cluster width, but dagre spaces ranks
-  inside/around clusters ~2× further apart (taller graph). Localized to the
-  cluster border-segment / nesting path (intermediate border ranks appear to
-  collapse). Does not affect non-subgraph diagrams. Run
-  `tools/dagre-compare/run.sh clusters` to reproduce.
+- **Cluster/subgraph vertical spacing (FIXED).** The port compacted empty
+  border ranks around clusters; real dagre does not. dagre's
+  `removeEmptyRanks` computes `offset = Math.min(...ranks)` over ALL nodes,
+  and compound containers never get a rank — `Math.min(undefined, …)` is
+  `NaN`, so for any graph with subgraphs the whole pass is a silent NO-OP
+  (same in dagre-d3-es, mermaid's bundled copy). The port had "fixed" the
+  undefined handling and so removed ranks dagre keeps, halving cluster
+  spacing and kinking cluster-crossing edge routes. Now mirrored in
+  `graph/src/layered/util.rs::remove_empty_ranks` (bail out when any node
+  lacks a rank); the `clusters` and `arch` fixtures match dagre.js to 0.00px.
+  (`oracle/debug-ranks.js` was added to pin this: per-pass rank dumps from the
+  real dagre inside the container.)
+- **Beyond-dagre transpose is opt-in.** `LayeredEngine { transpose: true }`
+  runs a graphviz-style adjacent-pair transpose after ordering (removes
+  leftover crossings dagre's sweeps can't, e.g. two sibling edges whose dummy
+  chains settle against their destinations' order — the mermaid renderers
+  enable it for legibility). It is OFF by default and `dagre-compare emit`
+  pins it off, so this harness always exercises the dagre-faithful path.

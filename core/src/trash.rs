@@ -45,12 +45,12 @@ pub struct Entry {
     /// removed from the index. None for files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub members: Option<Vec<String>>,
-    /// The op-log `doc_id` this entry's note was tracked under, when known.
-    /// A tracked note's `.ops` history is retained keyed by `doc_id` rather than
+    /// The layered-doc `doc_id` this entry's note was tracked under, when known.
+    /// A tracked note's layered doc is retained keyed by `doc_id` rather than
     /// purged on delete (per `op-log.md`'s "Offline delete and rename"), so
-    /// restore can rebind `path → doc_id` to recover full history instead of
+    /// restore can rebind `path → doc_id` to recover the original identity instead of
     /// minting a fresh document. `None` for a hand-dropped file or a note that
-    /// was never seeded into the op-log (its restore takes the fresh-import
+    /// was never seeded into the layered doc (its restore takes the fresh-import
     /// path). Folder entries leave this `None` — their members are rebound
     /// individually by path on re-ingest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -73,9 +73,9 @@ pub struct ListItem {
     /// file" (the UI infers from `kind`) or "we can't tell" (orphan folder).
     pub member_count: Option<usize>,
     pub orphaned: bool,
-    /// The op-log `doc_id` recorded for this entry, when known. Carried so a
-    /// history-preserving restore can rebind `path → doc_id`. `None` for files
-    /// never seeded into the op-log, folder entries, and orphans.
+    /// The layered-doc `doc_id` recorded for this entry, when known. Carried so an
+    /// identity-preserving restore can rebind `path → doc_id`. `None` for files
+    /// never seeded into the layered doc, folder entries, and orphans.
     pub doc_id: Option<String>,
 }
 
@@ -167,7 +167,9 @@ impl Trash {
             .unwrap_or_else(|| rel.to_string());
         let trashed_name = pick_unique_name(&self.dir, &timestamp_prefix(now), &basename)?;
         let dest = self.dir.join(&trashed_name);
-        fs::write(&dest, content.as_bytes())?;
+        // Atomic: this is the only surviving copy of the deleted content, so
+        // a crash mid-write must not be able to truncate it.
+        crate::vault::write_atomic(&dest, content.as_bytes())?;
         Ok(Entry {
             id: crate::store::dto::new_id(),
             original_path: rel.to_string(),

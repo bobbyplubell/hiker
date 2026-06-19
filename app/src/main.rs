@@ -12,9 +12,9 @@ mod buffer;
 mod buffer_view;
 mod bootstrap;
 mod canvas_activity;
+mod code_sources;
 mod projects_activity;
 mod charts;
-mod chat;
 mod clusters;
 mod command_center;
 mod completion_sources;
@@ -35,8 +35,8 @@ mod related;
 mod search;
 mod side_panel_persist;
 mod sidebar;
+mod source_control;
 mod state;
-mod sync_service;
 mod tab;
 mod titlebar;
 mod toolbar;
@@ -90,22 +90,14 @@ fn main() -> eframe::Result<()> {
         .block_on(async { bootstrap::open_vault(vault_path).await })
         .expect("open vault");
 
-    // Custom-titlebar pref now lives on `Config::ui` (vault-scoped) and
-    // round-trips through the standard settings persistence path. The
-    // legacy `<vault>/.hiker/ui.json` sidecar is still consulted as a
-    // one-shot migration so users who toggled it before this change
-    // don't lose the bit.
+    // Custom-titlebar pref lives on `Config::ui` (vault-scoped) and
+    // round-trips through the standard settings persistence path.
     let custom_titlebar = state
         .vault_session
         .config
         .read()
         .map(|c| c.ui.custom_titlebar)
-        .unwrap_or(true)
-        || std::fs::read(state.vault_session.vault_root.join(".hiker/ui.json"))
-            .ok()
-            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-            .and_then(|v| v.get("custom_titlebar").and_then(serde_json::Value::as_bool))
-            .unwrap_or(false);
+        .unwrap_or(true);
     state.ui.custom_titlebar = custom_titlebar;
     // Reader-mode chrome preferences. [view-reader-hide-top-bar,
     // view-reader-hide-tabs, view-reader-hide-toolbar]
@@ -130,8 +122,16 @@ fn main() -> eframe::Result<()> {
         // Bench knob: HIKER_NO_VSYNC=1 uncaps the frame rate so a profiling run
         // measures the real CPU+GPU frame cost instead of the vsync wait.
         vsync: std::env::var_os("HIKER_NO_VSYNC").is_none(),
+        // wgpu backend: identical output to glow today, but the prerequisite for a
+        // custom instanced paint path that bypasses epaint's CPU tessellation for
+        // large graphs. HIKER_RENDERER=glow forces the legacy backend.
+        renderer: match std::env::var("HIKER_RENDERER").as_deref() {
+            Ok("glow") => eframe::Renderer::Glow,
+            _ => eframe::Renderer::Wgpu,
+        },
         ..Default::default()
     };
+    let use_wgpu = matches!(native_options.renderer, eframe::Renderer::Wgpu);
 
     let app_runtime = std::sync::Arc::new(runtime);
 
@@ -144,6 +144,22 @@ fn main() -> eframe::Result<()> {
         // against the freshly-created egui context, then hand back the App.
         Box::new(move |cc| {
             hiker_theme::Theme.install(&cc.egui_ctx);
+            // Enable the custom instanced GPU paint path under the wgpu backend
+            // (HIKER_RENDERER=glow stays on the legacy Painter path; the in-app
+            // "GPU instancing" toggle and HIKER_GPU=0 also disable it). Its
+            // viewport-relative transform handles offset panes + HiDPI. Register the
+            // live surface format so the pipelines build against it.
+            let gpu_off = matches!(std::env::var("HIKER_GPU").as_deref(), Ok("0"));
+            if use_wgpu && !gpu_off {
+                hiker_graph_view::graph_view::set_gpu_paint(true);
+                if let Some(rs) = cc.wgpu_render_state.as_ref() {
+                    let fmt = rs.target_format;
+                    hiker_graph_view::graph_view::gpu::register_target_format(
+                        &mut rs.renderer.write().callback_resources,
+                        fmt,
+                    );
+                }
+            }
             state.install_user_fonts(&cc.egui_ctx);
             // Seed the per-frame `refresh_user_fonts` fingerprint so it
             // doesn't redundantly re-install on the first paint. Live-flip
@@ -274,7 +290,7 @@ impl eframe::App for HikerApp {
                         crate::tab::TabKind::ZimView { .. } => "zim",
                         crate::tab::TabKind::Editor { .. } => "editor",
                         crate::tab::TabKind::Canvas { .. } => "canvas",
-                        crate::tab::TabKind::Graph => "graph",
+                        crate::tab::TabKind::Graph { .. } => "graph",
                         _ => "",
                     };
                     (k.eq_ignore_ascii_case(&want)).then_some(t.id)
@@ -334,9 +350,6 @@ impl eframe::App for HikerApp {
             self.state.drain_fs_events();
             self.state.drain_indexer_events();
             self.state.drain_sync_events();
-            self.state.drain_fork_diff_results();
-            self.state.reconcile_sync();
-            self.state.notify_sync_attention();
             self.state.drain_mutation_events();
         }
 
@@ -570,6 +583,41 @@ fn drain_fs_events(&mut self) {
         return;
     }
 
+    // Live-refresh the composed ignore matcher when a vault-root
+    // `.hikerignore` / `.gitignore` is created / edited / removed. The
+    // matcher is cached per-vault in a process-global registry built at
+    // `Config::load`; without this hook an ignore-file edit wouldn't take
+    // effect until the next vault open. Rebuild from the current config's
+    // `ignored_paths` (so config-layer patterns survive) and kick a
+    // non-forced rescan so newly-included files get indexed. (Newly-excluded
+    // already-tracked docs are pruned by the startup untrack pass.)
+    let ignore_file_changed = events.iter().any(|ev| {
+        let touches = |p: &str| p == ".hikerignore" || p == ".gitignore";
+        match ev {
+            FileEvent::Created { path }
+            | FileEvent::Modified { path }
+            | FileEvent::Deleted { path } => touches(path),
+            FileEvent::Renamed { from, to } => touches(from) || touches(to),
+            FileEvent::Overflow => false,
+        }
+    });
+    if ignore_file_changed {
+        let ignored_paths = state
+            .vault_session
+            .config
+            .read()
+            .map(|c| c.indexing.ignored_paths.clone())
+            .unwrap_or_default();
+        hiker_core::ignore::register(&state.vault_session.vault_root, &ignored_paths);
+        let idx = state.vault_session.services.indexer.clone();
+        tokio::runtime::Handle::current().spawn(async move {
+            if let Err(err) = idx.full_scan(false).await {
+                tracing::warn!(error = %err, "ignore-file change: rescan submit failed");
+            }
+        });
+        tracing::info!("ignore file changed; rebuilt matcher and requested rescan");
+    }
+
     for ev in &events {
         match ev {
             FileEvent::Created { path } | FileEvent::Modified { path } => {
@@ -617,33 +665,31 @@ fn refresh_skipped_paths(&mut self) {
     state.ui_cache.skipped_paths = snap;
 }
 
-/// Refresh the per-frame snapshot of the vault's pending agent ops from the
-/// op log. Render-loop callers (toolbar badge, status-bar pending count, the
+/// Copy the latest pending-proposals snapshot out of the pollster's `watch`
+/// channel. Render-loop callers (toolbar badge, status-bar pending count, the
 /// Patch-review tab badge, and the chat-card live-op-id set) read
-/// `ui_cache.pending_snapshot` instead of each firing their own op-log walk.
-/// The pending count is `op_writes::list_pending_proposals(...).len()`. A
-/// failed walk leaves the prior snapshot in place so a transient I/O hiccup
-/// doesn't blink the badge off.
+/// `ui_cache.pending_snapshot`. The layered-doc walk itself runs on the background
+/// pollster (`bootstrap`'s `snapshot_poller`, ~1s) — the walk takes the
+/// layered doc's inner mutex, which the indexer's rule pass and accept paths hold
+/// across file I/O, so taking it per paint frame could stall the frame. The
+/// pollster skips the send on a failed walk, so the prior snapshot stays in
+/// place and a transient I/O hiccup doesn't blink the badge off.
 fn refresh_pending_proposals(&mut self) {
     let state = self;
-    let log = state.vault_session.services.oplog.clone();
-    if let Ok(props) = hiker_core::ops::op_writes::list_pending_proposals(log.as_ref()) {
-        state.ui_cache.pending_snapshot = props;
-    }
+    let snap = state.vault_session.events.pending_proposals_rx.borrow().clone();
+    state.ui_cache.pending_snapshot = snap;
 }
 
-/// Refresh the per-frame snapshot of pending whole-file (`write_note`-shaped)
-/// proposals from the op log. The buffer review surface (version dropdown,
-/// pending-rewrite banner, agent-diff toggle) reads
-/// `ui_cache.whole_file_proposals` instead of each firing its own op-log walk.
-/// A failed walk leaves the prior snapshot in place rather than clearing it,
-/// so a transient I/O hiccup doesn't blink the review affordances off.
+/// Copy the latest whole-file (`write_note`-shaped) proposals snapshot out of
+/// the pollster's `watch` channel. The buffer review surface (version
+/// dropdown, pending-rewrite banner, agent-diff toggle) reads
+/// `ui_cache.whole_file_proposals`. Same posture as
+/// `refresh_pending_proposals`: the layered-doc walk runs on the background
+/// pollster, never on the UI thread.
 fn refresh_whole_file_proposals(&mut self) {
     let state = self;
-    let log = state.vault_session.services.oplog.clone();
-    if let Ok(props) = hiker_core::ops::op_writes::list_whole_file_proposals(log.as_ref()) {
-        state.ui_cache.whole_file_proposals = props;
-    }
+    let snap = state.vault_session.events.whole_file_proposals_rx.borrow().clone();
+    state.ui_cache.whole_file_proposals = snap;
 }
 
 /// Republish the per-frame snapshot of UI-context state for the MCP read
@@ -861,8 +907,8 @@ fn drain_indexer_events(&mut self) {
     }
 }
 
-/// Pull queued sync-progress lines into the bounded ring buffer used by the
-/// Sync tab. Mirrors `drain_indexer_events`.
+/// Pull queued git-transport progress lines into the bounded ring buffer.
+/// Mirrors `drain_indexer_events`.
 fn drain_sync_events(&mut self) {
     let state = self;
     let drained: Vec<String> = {
@@ -888,172 +934,6 @@ fn drain_sync_events(&mut self) {
         > crate::state::SYNC_EVENTS_MAX
     {
         state.vault_session.events.sync_events.pop_front();
-    }
-}
-
-/// Drain on-demand fork-diff fetch results into the Sync page's "view diff"
-/// cache (`panels.sync.fork_diffs`), keyed by the forked doc's path. Mirrors
-/// `drain_sync_events`: a spawned `fetch_fork_diff` task feeds the channel,
-/// this folds each `(path, Ok(text) | Err(msg))` into `Ready` / `Error` so the
-/// render path reads the cache, never the node. [sync-fork-diff]
-fn drain_fork_diff_results(&mut self) {
-    let state = self;
-    let drained: Vec<crate::sync_service::ForkDiffResult> = {
-        let mut rx = state
-            .vault_session
-            .events
-            .fork_diff_rx
-            .lock()
-            .unwrap();
-        let mut out = Vec::new();
-        while let Ok(item) = rx.try_recv() {
-            out.push(item);
-        }
-        out
-    };
-    for (path, result) in drained {
-        let entry = match result {
-            Ok(text) => crate::panels::sync::ForkDiffState::Ready(text),
-            Err(msg) => crate::panels::sync::ForkDiffState::Error(msg),
-        };
-        state.panels.sync.fork_diffs.insert(path, entry);
-    }
-}
-
-/// Reconcile the live sync engine with `[sync].enabled` every frame — both
-/// directions are live, no vault reopen. Turning the toggle ON builds + spawns
-/// the engine immediately; turning it OFF cancels its responder loop, which
-/// drops the swarm (closing the TCP listener and stopping mDNS). Cheap in
-/// steady state (a config read + an `Option` check); it only does work on a
-/// transition. Runs inside the frame's tokio runtime guard so the engine's
-/// `tokio::spawn` has a reactor. The Settings toggle swaps the in-memory
-/// config, so flipping `[sync]` there trips this on the next frame.
-/// [sync-disable-kill-switch]
-fn reconcile_sync(&mut self) {
-    let state = self;
-    let enabled = state
-        .vault_session
-        .config
-        .read()
-        .map(|c| c.sync.enabled)
-        .unwrap_or(false);
-    let running = state.vault_session.services.sync.is_some();
-    match (enabled, running) {
-        // Live disable: stop the running engine now.
-        (false, true) => {
-            if let Some(svc) = state.vault_session.services.sync.take() {
-                svc.shutdown();
-                state.push_toast(
-                    "Sync disabled — engine stopped",
-                    crate::state::ToastLevel::Info,
-                );
-            }
-        }
-        // Live enable: build + spawn without a reopen. A fresh progress channel
-        // is swapped in — the boot-time one is closed when sync started disabled
-        // — so the Sync page's log reads the live sender.
-        (true, false) => {
-            let section = match state.vault_session.config.read() {
-                Ok(c) => c.sync.clone(),
-                Err(_) => return,
-            };
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-            let (fork_tx, fork_rx) =
-                tokio::sync::mpsc::unbounded_channel::<crate::sync_service::ForkDiffResult>();
-            let oplog = state.vault_session.services.oplog.clone();
-            let vault_root = state.vault_session.vault_root.clone();
-            let cancel = state.vault_session.cancel.clone();
-            let spawner = crate::bootstrap::Spawner { cancel };
-            if let Some(svc) =
-                spawner.spawn_sync_service(&vault_root, oplog, &section, tx, fork_tx)
-            {
-                state.vault_session.events.sync_events_rx = std::sync::Mutex::new(rx);
-                state.vault_session.events.fork_diff_rx = std::sync::Mutex::new(fork_rx);
-                state.vault_session.services.sync = Some(svc);
-                state.push_toast("Sync enabled", crate::state::ToastLevel::Info);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Proactively surface sync attention beyond the Sync page: fire a toast the
-/// FIRST time a doc newly blocks, a per-doc/per-peer error newly appears, or a
-/// content-key change is newly held. Diffs the live engine snapshot against
-/// `sync_attention_seen` so a steady-state round (the same items still
-/// present) is silent — only a NEW item speaks, never every no-op round. The
-/// Sync page + tab badge carry the standing state; this is the one-shot nudge
-/// so the user knows without opening Sync. Cheap (a std-mutex snapshot read +
-/// set diffs); no node lock. status: sync-attention-badge
-fn notify_sync_attention(&mut self) {
-    let state = self;
-    let Some(service) = state.vault_session.services.sync.clone() else {
-        // Sync off / torn down: forget what we'd seen so a re-enable starts
-        // clean (and an old block doesn't re-toast on reconnect).
-        state.sync_attention_seen = crate::state::SyncAttentionSeen::default();
-        return;
-    };
-    let snap = service.state_snapshot();
-    let seen = &mut state.sync_attention_seen;
-
-    // Newly blocked docs (forks) — point the user at the Sync page to resolve.
-    let mut new_blocks = Vec::new();
-    for doc in &snap.blocked {
-        if seen.blocked_paths.insert(doc.path.clone()) {
-            new_blocks.push(doc.path.clone());
-        }
-    }
-    // Drop entries that resolved so a future re-fork on the same path re-toasts.
-    let live_blocked: std::collections::HashSet<String> =
-        snap.blocked.iter().map(|d| d.path.clone()).collect();
-    seen.blocked_paths.retain(|p| live_blocked.contains(p));
-
-    // Newly errored items (per-doc/per-peer skips from the last round).
-    let report_errored = snap
-        .last_report
-        .as_ref()
-        .map(|r| r.errored.clone())
-        .unwrap_or_default();
-    let mut new_errors = Vec::new();
-    for pair in &report_errored {
-        if seen.errored.insert(pair.clone()) {
-            new_errors.push(pair.clone());
-        }
-    }
-    let live_errored: std::collections::HashSet<(String, String)> =
-        report_errored.iter().cloned().collect();
-    seen.errored.retain(|e| live_errored.contains(e));
-
-    // A newly held content-key change (established key differs from a peer's).
-    let new_key_change = match (&snap.pending_content_key_change, &seen.pending_key_peer) {
-        (Some(peer), prev) if prev.as_deref() != Some(peer.as_str()) => Some(peer.clone()),
-        _ => None,
-    };
-    seen.pending_key_peer = snap.pending_content_key_change.clone();
-
-    // Fire at most one toast per kind per frame; the standing state lives on the
-    // Sync page + tab badge.
-    if !new_blocks.is_empty() {
-        let msg = if new_blocks.len() == 1 {
-            format!("Sync conflict: \"{}\" forked — open Sync to resolve", new_blocks[0])
-        } else {
-            format!("{} sync conflicts — open Sync to resolve", new_blocks.len())
-        };
-        state.push_toast(msg, crate::state::ToastLevel::Warn);
-    }
-    if !new_errors.is_empty() {
-        let msg = if new_errors.len() == 1 {
-            format!("Sync skipped an item: {} — {}", new_errors[0].0, new_errors[0].1)
-        } else {
-            format!("Sync skipped {} items — see Sync page", new_errors.len())
-        };
-        state.push_toast(msg, crate::state::ToastLevel::Error);
-    }
-    if let Some(peer) = new_key_change {
-        state.push_toast(
-            format!("Sync: peer {peer} uses a different content key — open Sync to confirm"),
-            crate::state::ToastLevel::Warn,
-        );
     }
 }
 
@@ -1185,6 +1065,16 @@ fn persist_tab_state(&mut self, autosave: &std::sync::Arc<hiker_core::autosave::
     for (id, path) in open_canvas_tabs {
         crate::panels::canvas::capture_view(state, id, &path);
     }
+    // Snapshot the live vault graph + every loaded code-graph view into the
+    // session maps, so the persisted `graph_views`/`code_graph_views` below cover
+    // what's warm now. Both panels persist their engine state across a tab close
+    // (they live on `panels`, not per-tab), so capture by panel presence rather
+    // than open-tab walk. status: graph-view-state-persist
+    crate::panels::graph::capture_graph_view(state);
+    let code_graph_keys: Vec<String> = state.panels.code_graph.keys().cloned().collect();
+    for key in code_graph_keys {
+        crate::panels::code_graph::capture_code_graph_view(state, &key);
+    }
     let mut open_paths = Vec::new();
     let mut open_tab_kinds = std::collections::HashMap::new();
     for tab in &state.session.tabs {
@@ -1225,6 +1115,9 @@ fn persist_tab_state(&mut self, autosave: &std::sync::Arc<hiker_core::autosave::
         open_tab_kinds,
         // status: canvas-view-state-persist
         canvas_views: state.session.canvas_views.clone(),
+        // status: graph-view-state-persist
+        graph_views: state.session.graph_views.clone(),
+        code_graph_views: state.session.code_graph_views.clone(),
     };
     if let Err(err) = autosave.save_tab_state(snapshot) {
         tracing::warn!(error = %err, "tab-state snapshot failed");

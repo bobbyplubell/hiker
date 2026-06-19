@@ -22,7 +22,8 @@
 //! A card is **Active** (live-render this frame, refresh its cache) when any of:
 //! its content signature changed; its on-screen size or per-card zoom/scroll
 //! changed (a cached render is position-translatable but not scale-invariant, so
-//! a size change invalidates); the theme (dark/light) changed; or the pointer is
+//! a size change invalidates); the theme (dark/light) changed; the DPI
+//! (pixels-per-point) changed; or the pointer is
 //! over it with scroll/zoom input this frame (it is being scrolled). A pure pan
 //! (the card's `min` moved but its `size`, view, and signature are unchanged)
 //! keeps the card **Idle** — the win this module exists for.
@@ -53,6 +54,10 @@ struct CachedCard {
     signature: Option<u64>,
     /// Dark mode at capture; a theme flip re-renders (colors differ).
     dark: bool,
+    /// Pixels-per-point at capture; a DPI change re-renders (the captured galley
+    /// shapes are baked against the font atlas at that scale, so a blit at a new
+    /// DPI would be stale).
+    dpr: f32,
     /// The frame counter at last touch, for eviction of off-screen cards.
     last_used: u64,
 }
@@ -140,6 +145,7 @@ impl CardCache {
             && c.view == req.view
             && c.signature == req.signature
             && c.dark == req.dark
+            && c.dpr.to_bits() == req.dpr.to_bits()
     }
 
     /// Re-emit a cached card's shapes translated from its captured position to
@@ -178,6 +184,7 @@ impl CardCache {
                 view: req.view,
                 signature: req.signature,
                 dark: req.dark,
+                dpr: req.dpr,
                 last_used: self.frame,
             },
         );
@@ -203,6 +210,8 @@ pub struct CardRequest<'a> {
     pub signature: Option<u64>,
     /// Dark mode this frame.
     pub dark: bool,
+    /// Pixels-per-point this frame; a change invalidates every cached card.
+    pub dpr: f32,
     /// True when the card is being scrolled/zoomed this frame (pointer over it
     /// with wheel/zoom input) — forces a live render.
     pub interacting: bool,
@@ -248,12 +257,12 @@ mod tests {
     fn seed(cache: &mut CardCache, id: &str, rect: Rect, view: CardView, sig: Option<u64>, dark: bool) {
         cache.cards.insert(
             id.to_owned(),
-            CachedCard { shapes: Vec::new(), rect, view, signature: sig, dark, last_used: cache.frame },
+            CachedCard { shapes: Vec::new(), rect, view, signature: sig, dark, dpr: 1.0, last_used: cache.frame },
         );
     }
 
     fn req<'a>(id: &'a str, rect: Rect, view: CardView, sig: Option<u64>, dark: bool, interacting: bool) -> CardRequest<'a> {
-        CardRequest { id, rect, view, signature: sig, dark, interacting }
+        CardRequest { id, rect, view, signature: sig, dark, dpr: 1.0, interacting }
     }
 
     const R: Rect = Rect { min: pos2(10.0, 20.0), max: pos2(110.0, 220.0) };
@@ -314,6 +323,18 @@ mod tests {
         let mut cache = CardCache::default();
         seed(&mut cache, "a", R, VIEW, Some(1), false);
         assert!(!cache.reusable(&req("a", R, VIEW, Some(1), true, false)));
+    }
+
+    #[test]
+    fn dpi_change_invalidates() {
+        // A live pixels-per-point change (e.g. moving the window to a monitor at a
+        // different scale) must re-render: the cached galley shapes were baked
+        // against the font atlas at the old DPI.
+        let mut cache = CardCache::default();
+        seed(&mut cache, "a", R, VIEW, Some(1), false);
+        let mut hidpi = req("a", R, VIEW, Some(1), false, false);
+        hidpi.dpr = 2.0;
+        assert!(!cache.reusable(&hidpi));
     }
 
     #[test]

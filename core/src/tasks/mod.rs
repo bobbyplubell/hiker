@@ -5,9 +5,9 @@
 //!
 //! - **Direct-LLM worker** — in-process tokio task drains `Direct`-shape
 //!   tasks via `core::llm::chat`. Toggled by `[tasks] direct_worker.enabled`.
-//! - **MCP clients** — external rmcp callers (Claude Code, Codex, …) and
-//!   the basic chat agent (when `[tasks] expose_to_chat_agent = true`)
-//!   reach the queue's checkout/submit primitives via `task_*` MCP tools.
+//! - **MCP clients** — external rmcp callers (Claude Code, Codex, …)
+//!   reach the queue's checkout/submit primitives via `task_*` MCP tools,
+//!   advertised whenever the MCP server runs (`[mcp] enabled`).
 //!
 //! The queue is in-memory only in v1 (`task-queue-in-memory-only`) — no
 //! persistence across app restarts. Producers awaiting a handle get

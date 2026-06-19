@@ -6,7 +6,7 @@
 //! `trees-md-store` / `cluster-tree-visible-note`), discovered by the
 //! `hiker.kind: cluster-tree` frontmatter query. The full structure lives in
 //! the `hiker` frontmatter; edits load the tree, mutate it in memory, and
-//! rewrite only the frontmatter fence through the op-log working layer — each
+//! rewrite only the frontmatter fence through the layered-doc working layer — each
 //! edit lands as a `SetFrontmatter` op. Mirrors the module-discipline pattern
 //! of `core::trails`: all frontmatter (de)serialization stays behind this
 //! boundary, callers consume plain Rust types only. No SQLite, no
@@ -19,7 +19,7 @@
 //!   neutral output) into `NodeInsert`/`NodeKind` rows + the `persist` /
 //!   `rebuild_and_persist` wrappers — the one-way `trees → cluster` seam
 //! - `store`         — frontmatter load/serialize, the in-memory `TreeDoc`,
-//!   op-log writes, and the basic CRUD
+//!   layered-doc writes, and the basic CRUD
 //! - `history`       — in-memory session undo/redo log + `record_*` helpers
 //! - `ops::edit`     — `rename` / `set_summary` / `set_policy` /
 //!   `auto_set_name_summary`
@@ -48,7 +48,7 @@ pub mod types;
 #[cfg(test)]
 mod tests {
     use super::types::{Db, NodeInsert, NodeKind, NodePolicy, TreeInsert};
-    use crate::oplog::OpLog;
+    use crate::editing::LayeredDoc;
     use crate::vault::Vault;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -139,7 +139,7 @@ mod tests {
 
         let (_d, trees) = open_tmp();
         // Single atomic write (the confirm path): tree + nodes together, no
-        // empty-nodes intermediate and no empty→full op-log diff.
+        // empty-nodes intermediate and no empty→full layered-doc diff.
         let tree_id = trees
             .insert_tree_with_nodes(
                 TreeInsert {
@@ -166,8 +166,8 @@ mod tests {
     fn open_tmp() -> (TempDir, Db) {
         let dir = TempDir::new().unwrap();
         let vault = Arc::new(Vault::open(dir.path()).unwrap());
-        let oplog = Arc::new(OpLog::open(dir.path()).unwrap());
-        let trees = Db::new(oplog, vault).unwrap();
+        let layered = Arc::new(LayeredDoc::open(dir.path()).unwrap());
+        let trees = Db::new(layered, vault).unwrap();
         (dir, trees)
     }
 
@@ -252,7 +252,7 @@ mod tests {
     }
 
     // Regression: deleting a tree then creating one at the same path must work.
-    // `delete_tree` tombstones the op-log doc but keeps the `path → doc_id`
+    // `delete_tree` tombstones the layered doc but keeps the `path → doc_id`
     // mapping, so the recreate resolves the tombstoned doc — the content write
     // has to resurrect it or the `.md` is never written and `load` fails.
     #[test]
@@ -299,7 +299,7 @@ mod tests {
     // Regression: confirming a clustering run persists a tree, then the
     // cluster sidebar re-lists it. With a realistic node count the two-step
     // `insert_tree` (empty `nodes: []`) → `insert_nodes` (populated block)
-    // save exercised an op-log diff that produced overlapping spans and
+    // save exercised a layered-doc diff that produced overlapping spans and
     // corrupted the frontmatter (`nodes:` lost its trailing newline), so the
     // reload failed with `TreeNotFound` — surfaced as a "tree could not be
     // found" toast right after Confirm. See `crate::merge::multi_span_delta`.

@@ -12,7 +12,7 @@ use tokio::sync::broadcast;
 use crate::config::sections::TrailsConfig;
 use crate::embed::{Embedder, Error as EmbedError};
 use crate::indexer::{self, ProgressEvent};
-use crate::oplog::OpLog;
+use crate::editing::LayeredDoc;
 use crate::store::Store;
 use crate::trails::ops::{append_waypoint, create_trail, AppendWaypointArgs};
 use crate::vault::Vault;
@@ -57,11 +57,11 @@ async fn rename_trail_doc_moves_companion_folder_and_rewrites_refs() {
     let vault = Vault::open(td.path()).unwrap();
     let watcher = Watcher::start(td.path()).unwrap();
     let store = Store::open(td.path()).unwrap();
-    let oplog = Arc::new(OpLog::open(td.path()).unwrap());
+    let layered = Arc::new(LayeredDoc::open(td.path()).unwrap());
     let idx = indexer::start(vault.clone(), store, || {
         Ok(Arc::new(ZeroEmbedder) as Arc<dyn Embedder>)
     });
-    idx.attach_oplog(oplog.clone());
+    idx.attach_layered(layered.clone());
     idx.attach_watcher(Arc::new(Watcher::start(td.path()).unwrap()));
     let mut prog = idx.subscribe_progress();
 
@@ -77,7 +77,7 @@ async fn rename_trail_doc_moves_companion_folder_and_rewrites_refs() {
     let created = create_trail(
         &watcher,
         &idx.job_sender(),
-        &oplog,
+        &layered,
         &vault,
         &cfg,
         "my-trail",
@@ -89,7 +89,7 @@ async fn rename_trail_doc_moves_companion_folder_and_rewrites_refs() {
     let appended = append_waypoint(AppendWaypointArgs {
         watcher: &watcher,
         jobs: &idx.job_sender(),
-        log: &oplog,
+        log: &layered,
         vault: &vault,
         trail_doc_rel: "trails/my-trail.md",
         source_rel: "research/raptor.md",

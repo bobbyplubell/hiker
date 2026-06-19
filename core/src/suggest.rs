@@ -19,14 +19,14 @@ use serde::{Deserialize, Serialize};
 use crate::errors::HikerError;
 use crate::frontmatter;
 use crate::ops::op_writes;
-use crate::oplog::{OpLog, StageOutcome};
+use crate::editing::{LayeredDoc, StageOutcome};
 use crate::store::Store;
 use crate::trees::types::{EditableNode, NodeKind, NodePolicy, Db, Error as TreesError};
 use crate::vault::Vault;
 
 /// Stable string the cluster-editor / triage surfaces use for the move
 /// action label. Centralized here now that `core::staging` (which formerly
-/// owned `ACTION_MOVE_NOTE`) is retired; the op-log `Rename` op-kind is the
+/// owned `ACTION_MOVE_NOTE`) is retired; the layered doc's `Rename` op-kind is the
 /// underlying mechanism but the action label persists for the activity feed.
 pub const ACTION_MOVE_NOTE: &str = "move_note";
 
@@ -42,11 +42,11 @@ pub const ACTION_APPLY_TAG: &str = "apply_tag";
 /// `[suggestions]` config section is wired.
 pub const DEFAULT_TAG_FIELD: &str = "hiker.suggested_tags";
 
-/// `surface` value stamped on every op-log op produced by the
+/// `surface` value stamped on every layered-doc op produced by the
 /// cluster-editor Apply path. The triage surface uses `"triage"`.
 pub const SURFACE_CLUSTER_EDITOR: &str = "cluster-editor";
 
-/// `surface` value stamped on every op-log op produced by the saved-
+/// `surface` value stamped on every layered-doc op produced by the saved-
 /// tree triage classifier. Per `docs/suggestions.md` §"Saved-tree triage".
 ///
 /// status: triage-staging-proposals
@@ -57,7 +57,7 @@ pub const SURFACE_TRIAGE: &str = "triage";
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct ApplyOutcome {
     pub tree_id: String,
-    /// Op-log pending op ids produced (one or more per `Tag` / `Move` leaf).
+    /// Layered-doc pending op ids produced (one or more per `Tag` / `Move` leaf).
     pub staged_ids: Vec<String>,
     /// Leaves with `Move` policy that produced a row.
     pub moves: u32,
@@ -73,7 +73,7 @@ pub struct ApplyOutcome {
 }
 
 /// Walk the tree, resolve each leaf's effective policy (walk-up rule),
-/// and stage one op-log pending op per `Tag` / `Move` leaf. `Move` leaves
+/// and stage one layered-doc pending op per `Tag` / `Move` leaf. `Move` leaves
 /// stage one pending `Rename` per note as a cross-document reorg batch
 /// (`op-log-reorg-batch`, author `auto:cluster`); `Tag` leaves stage one
 /// pending `SetFrontmatter`-shaped content op per note. Frozen + unpolicied
@@ -99,7 +99,7 @@ pub fn apply_tree(
     tree_id: &str,
     vault: &Vault,
     store: &Store,
-    log: &OpLog,
+    log: &LayeredDoc,
     history: Option<&RejectionHistory>,
 ) -> Result<ApplyOutcome, HikerError> {
     // Path-as-identity: each leaf carries its source note's rel-path
@@ -125,7 +125,7 @@ pub fn apply_tree(
             continue;
         };
         // Path-as-identity: the leaf carries the source note's rel-path
-        // directly (no op-log doc-id round-trip).
+        // directly (no layered-doc doc-id round-trip).
         let rel = match &node.note_path {
             Some(p) => p.clone(),
             None => {
@@ -176,7 +176,7 @@ pub fn apply_tree(
                 }
                 // Pre-compute the new file content with the tag merged into
                 // the configured `tag_field`, then stage it as a pending
-                // content op. The op-log diffs against current accepted, so a
+                // content op. The layered doc diffs against current accepted, so a
                 // no-op merge is dropped here before staging.
                 let disk_text = vault
                     .read_file(&rel)
@@ -418,7 +418,7 @@ fn now_ms() -> i64 {
 // status: op-log-reorg-batch
 //
 // One-shot batch from the multi-select toolbar: caller passes a set of
-// leaf node IDs + the target folder (or tag slug); we stage op-log pending
+// leaf node IDs + the target folder (or tag slug); we stage layered-doc pending
 // ops sharing one cross-document `batch_id`, authored `auto:cluster`. Moves
 // produce one pending `Rename` per leaf (the reorg-batch shape per
 // `op-log.md`'s "Multi-file reorganization"); tags produce one pending
@@ -449,7 +449,7 @@ pub struct StageTagArgs<'a> {
 }
 
 /// Stage a multi-select move as a reorg batch of pending `Rename` ops on the
-/// op log (`op-log-reorg-batch`). Resolves each selected leaf's note path,
+/// layered doc (`op-log-reorg-batch`). Resolves each selected leaf's note path,
 /// computes its destination under `target_folder`, and stages one pending
 /// `Rename` per moved note sharing a cross-document `batch_id` authored
 /// `auto:cluster`. Returns the [`StageOutcome`] (batch id + op ids); the
@@ -462,7 +462,7 @@ pub fn stage_moves(
     args: &StageMoveArgs<'_>,
     store: &Store,
     vault: &Vault,
-    log: &OpLog,
+    log: &LayeredDoc,
 ) -> Result<StageOutcome, HikerError> {
     // Path-as-identity: leaves carry their source note's rel-path
     // (`note_path`) directly. `store` is kept on the signature for callers.
@@ -495,11 +495,11 @@ pub fn stage_moves(
 }
 
 /// Stage a multi-select tag as a batch of pending `SetFrontmatter`-shaped
-/// content edits on the op log. For each selected leaf, re-emits the note's
+/// content edits on the layered doc. For each selected leaf, re-emits the note's
 /// frontmatter with `tag_slug` merged into the configured tag field and
 /// stages the new content as one pending op authored `auto:cluster`. Each
 /// note's edit gets its own batch id (tags target distinct documents and the
-/// op-log content-stage seam is per-document); the returned ids are the
+/// layered-doc content-stage seam is per-document); the returned ids are the
 /// staged op ids for the UI summary.
 ///
 /// status: cluster-editor-multi-select-stage-tag
@@ -508,7 +508,7 @@ pub fn stage_tags(
     args: &StageTagArgs<'_>,
     vault: &Vault,
     store: &Store,
-    log: &OpLog,
+    log: &LayeredDoc,
 ) -> Result<Vec<String>, HikerError> {
     // Path-as-identity: see `apply_tree`. `store` is kept on the signature.
     let _ = store;
@@ -553,7 +553,7 @@ pub fn stage_tags(
 // status: triage-author-class
 //
 // Greedy beam-K descent over a saved Evergreen tree. Cheap, no LLM, no
-// re-cluster. Produces zero or one op-log op per call (per the resolved
+// re-cluster. Produces zero or one layered-doc op per call (per the resolved
 // matched-node policy) — pending when review is required, applied directly
 // when not. The on-save / scheduled / modified pathways all funnel here;
 // the producer (`cluster-editor-triage-on-save`) owns the trigger.
@@ -614,7 +614,7 @@ pub struct TriageOutcome {
     pub source_path: String,
     /// `None` when no policy resolved (or the match dropped — outside
     /// scope, no centroid, etc.). Set to the first staged op id when a
-    /// pending op (or auto-accepted op) was emitted to the op log.
+    /// pending op (or auto-accepted op) was emitted to the layered doc.
     pub staged_id: Option<String>,
     /// The matched leaf node id (when descent succeeded).
     pub matched_node_id: Option<String>,
@@ -635,7 +635,7 @@ pub struct TriageOutcome {
 ///   handler reads these from `core::store`);
 /// - the saved tree id (the worker is dispatched against one tree at a
 ///   time);
-/// - per-tree handles to `Db` and the op log;
+/// - per-tree handles to `Db` and the layered doc;
 /// - the resolved `TriageOpts`.
 pub struct TriageInput<'a> {
     pub tree_id: &'a str,
@@ -677,7 +677,7 @@ pub fn triage_match(
     trees: &Db,
     vault: &Vault,
     store: &Store,
-    log: &OpLog,
+    log: &LayeredDoc,
     input: &TriageInput<'_>,
 ) -> Result<TriageOutcome, HikerError> {
     let mut outcome = TriageOutcome {
@@ -895,7 +895,7 @@ pub struct TriageBatch<'a> {
     pub trees: &'a Db,
     pub vault: &'a Vault,
     pub store: &'a Store,
-    pub log: &'a OpLog,
+    pub log: &'a LayeredDoc,
     pub note_id: &'a str,
     pub source_path: &'a str,
     pub embedding: &'a [f32],
@@ -924,8 +924,8 @@ pub fn triage_all_saved_trees(
         // Honor each tree's source-types filter at on-save time: a tree
         // built only over .md files shouldn't classify a .txt note. The
         // filter lives on `cluster_trees.scope` as part of the BuildScope
-        // shape (empty filter = match every indexable extension, which
-        // matches legacy behavior). A scope_json that fails to parse is
+        // shape (empty filter = match every indexable extension, the
+        // default). A scope_json that fails to parse is
         // skipped — the tree is in a corrupt state and we don't want
         // triage to silently fall back to "match everything."
         if let Ok(scope) =
@@ -961,7 +961,7 @@ mod tests {
 
     fn mk_tree(td: &TempDir) -> (Db, String) {
         let trees = Db::new(
-            std::sync::Arc::new(crate::oplog::OpLog::open(td.path()).unwrap()),
+            std::sync::Arc::new(crate::editing::LayeredDoc::open(td.path()).unwrap()),
             std::sync::Arc::new(crate::vault::Vault::open(td.path()).unwrap()),
         )
         .unwrap();
@@ -1081,19 +1081,19 @@ mod tests {
         assert_ne!(a, c);
     }
 
-    /// Open an op log on the tempdir, creating the `.hiker` dir first.
-    fn open_log(td: &TempDir) -> OpLog {
+    /// Open a layered doc on the tempdir, creating the `.hiker` dir first.
+    fn open_log(td: &TempDir) -> LayeredDoc {
         std::fs::create_dir_all(td.path().join(".hiker")).unwrap();
-        OpLog::open(td.path()).unwrap()
+        LayeredDoc::open(td.path()).unwrap()
     }
 
     // status: cluster-editor-apply-action
     // status: suggestions-apply-cmd
     //
     // End-to-end smoke for `apply_tree`: build a tree in tempfile-backed
-    // `Db` / `Store` / `Vault` / `OpLog`, attach a `Tag` policy on one
+    // `Db` / `Store` / `Vault` / `LayeredDoc`, attach a `Tag` policy on one
     // cluster + a `Move` policy on another, run `apply_tree`, and verify
-    // both stage as op-log pending ops with the right surface / action.
+    // both stage as layered-doc pending ops with the right surface / action.
     // Asserts the tree's `state` is *not* advanced by the core mechanic —
     // state flip to `applied` is the UI's responsibility once every emitted
     // op resolves.
@@ -1116,7 +1116,7 @@ mod tests {
 
         // Path-as-identity: leaves carry the source note's rel-path directly,
         // which `apply_tree` reads as the vault path. Bootstrap seeds the
-        // op-log so the staging path the suggestions write through resolves;
+        // layered doc so the staging path the suggestions write through resolves;
         // the note's path is its identity (`store-path-is-identity`).
         let _ = crate::ops::op_writes::bootstrap(&vault, &log).unwrap_or(0);
         assert!(log.doc_id_for_path("a.md").unwrap().is_some());
@@ -1206,7 +1206,7 @@ mod tests {
         // The tag op is the non-rename op; it targets the original path
         // (no move). Its op-kind is `write_note` here because the source
         // note had no frontmatter fence to land "inside" — the merge
-        // prepends a fresh one, so the op-log labels it a body replace.
+        // prepends a fresh one, so the layered doc labels it a body replace.
         let tag_row = rows
             .iter()
             .find(|r| r.action != "rename")
