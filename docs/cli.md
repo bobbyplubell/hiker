@@ -1,34 +1,44 @@
 # CLI
 
+A thin command-line surface over the vault's core operations — shell-scriptable verbs that share the same `core::` ops the UI calls, so the CLI and the app can never drift on semantics. Each command is a primitive: it runs one operation against an indexed vault and prints a result, leaving orchestration to the caller's shell.
 
-## Registry imports (from status.md)
+## Note operations
 
-Entries imported from the retired status registry that had no anchor in this doc —
-re-home them into the relevant sections as the doc evolves.
+- **Move a note** — `hiker mv <from> <to>` shares the [[spec:move-note-core-cmd]] op with the file-tree drag-and-drop, so a CLI move rewrites referrers, updates the index, and op-logs the rename identically to a UI move. [cli-mv]
+  status:: planned
+- **Remove a note** — `hiker rm <path>` shares the [[spec:delete-note-core-cmd]] op: a soft delete into the trash (recoverable), not a permanent unlink. `--yes` bypasses the interactive confirmation for scripted use. [cli-rm]
+  status:: planned
 
-- **cli-mv** — shares [[spec:move-note-core-cmd]] with tree DnD [cli-mv]
+## Trash
+
+- **List the trash** — `hiker trash list` enumerates the trash manifest: each soft-deleted entry's id, original path, and deletion time. [cli-trash-list]
   status:: planned
-- **cli-rm** — shares [[spec:delete-note-core-cmd]]; soft delete; `--yes` bypasses confirm [cli-rm]
+- **Restore from trash** — `hiker trash restore <id|path>` restores a soft-deleted note by its manifest id or by its original path. [cli-trash-restore]
   status:: planned
-- **cli-trash-list** — enumerate trash manifest [cli-trash-list]
+- **Empty the trash** — `hiker trash empty` permanently deletes every trash entry — the one CLI verb that unlinks for real (the trash is the soft-delete buffer that `cli-rm` writes into). [cli-trash-empty]
   status:: planned
-- **cli-trash-restore** — restore by id or original path [cli-trash-restore]
+
+## Reindex
+
+- **Reindex** — `hiker reindex` runs the `index.md` ingest pipeline over the vault (the operational counterpart to the in-app Reindex verbs). [cli-reindex]
   status:: planned
-- **cli-trash-empty** — permanent delete of all trash entries [cli-trash-empty]
+- **Reindex (rebuild)** — `hiker reindex --rebuild` drops and recreates the schema before reindexing, covering the destructive-rebuild case that the in-app verb defers to a future settings UI (`settings.md`, `index.md`). [cli-reindex-rebuild]
   status:: planned
-- **cli-reindex** — spec'd in index.md ingest pipeline [cli-reindex]
+
+## Query and stats
+
+- **Query** — `hiker query` is a thin primitive that runs a single search / related query against the indexed vault and prints the results. It exists so the external eval tool ([[spec:eval-synth-tool]]) has something concrete to score against until MCP is real. [cli-query]
   status:: planned
-- **cli-reindex-rebuild** — drop + recreate schema [cli-reindex-rebuild]
+- **Stats** — `hiker stats` prints sanity dashboards over the index (the corpus / health numbers `qa.md` describes). [cli-stats]
   status:: planned
-- **cli-query** — thin CLI primitive that runs a single search/related query and prints results; consumed by the external eval tool until MCP is real [cli-query]
+
+## Trails
+
+- **List trails** — `hiker trail list` enumerates the vault's trails, sharing `core::trails::list_trails` with [[spec:mcp-tool-trails-list]]. [cli-trail-list]
   status:: planned
-- **cli-stats** — sanity dashboards (qa.md) [cli-stats]
+- **Show a trail** — `hiker trail show <id>` prints a trail's body plus its ordered waypoint list, sharing `core::trails::get_trail` with [[spec:mcp-tool-trail-get]]. [cli-trail-show]
   status:: planned
-- **cli-trail-list** — enumerate trails; shares `core::trails::list_trails` with [[spec:mcp-tool-trails-list]] [cli-trail-list]
+- **Activate a trail** — `hiker trail activate <id>` sets the active trail for the vault from a shell-script-driven workflow — the same op the sidebar's trail dropdown calls. [cli-trail-activate]
   status:: planned
-- **cli-trail-show** — print a trail's body + ordered waypoint list; shares `core::trails::get_trail` with [[spec:mcp-tool-trail-get]] [cli-trail-show]
-  status:: planned
-- **cli-trail-activate** — set the active trail for the vault from a shell-script-driven workflow; same op the sidebar dropdown calls [cli-trail-activate]
-  status:: planned
-- **cli-trail-new** — create a new trail at the configured `[trails] new_trail_dir`; shares the `core::trails::create_trail` op [cli-trail-new]
+- **New trail** — `hiker trail new <name>` creates a new trail at the configured `[trails] new_trail_dir`, sharing the `core::trails::create_trail` op. [cli-trail-new]
   status:: planned

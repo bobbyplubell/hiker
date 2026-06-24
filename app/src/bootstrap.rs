@@ -734,9 +734,22 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
     // copy so the channel closes cleanly if no engine holds a sender.
     drop(sync_tx);
 
+    // A DEDICATED read connection for the UI thread, isolated from the shared
+    // `read_store` that the background snapshot poller (every ~3s,
+    // `list_skipped_paths`) and the MCP server (per tool call) both lock. In WAL
+    // mode independent reader connections never block one another, so a slow
+    // poller / MCP query can no longer stall a navigation-time UI query —
+    // `appears_in` re-scans on every note switch, and backlinks / completion /
+    // code-sources all lock this synchronously, which was the source of the
+    // random navigation hangs. The original `read_store` stays alive via the
+    // clones the poller + MCP already hold.
+    let ui_read_store = Arc::new(Mutex::new(
+        Store::open(&root).with_context(|| "open ui read store")?,
+    ));
+
     // Assemble the compartments.
     let services = Services {
-        read_store,
+        read_store: ui_read_store,
         layered,
         trees,
         autosave,
@@ -795,6 +808,7 @@ pub async fn open_vault(root: PathBuf) -> Result<AppState> {
         source_control_state: crate::source_control::State::default(),
         canvases_activity_state: crate::canvas_activity::State,
         projects_activity_state: crate::projects_activity::State,
+        specs_state: crate::spec_panel::State::default(),
         code_sources: crate::code_sources::Registry::default(),
         // Per-vault activity registry: built-ins (Clusters in v1) plus
         // (Phase 3) plugin-derived activities. `feature-registry`.
@@ -899,53 +913,7 @@ impl AppState {
     let mut active_id: Option<crate::tab::TabId> = None;
     let mut preview_id: Option<crate::tab::TabId> = None;
     for path in ts.open_paths {
-        let singleton_kind: Option<TabKind> = match path.as_str() {
-            ":home" => Some(TabKind::Home),
-            ":queue" => Some(TabKind::Queue),
-            ":settings" => Some(TabKind::Settings),
-            ":graph" => Some(TabKind::Graph { focus: None, scope_query: None }),
-            // status: graph-tab-focus
-            // Focused graph tab: the persist key is `graph:<depth>:<path>`.
-            // The landing state itself restores via the persisted view state
-            // (`graph-view-state-persist`); this re-creates the tab kind.
-            p if p.starts_with("graphq:") => Some(TabKind::Graph {
-                focus: None,
-                scope_query: Some(p["graphq:".len()..].to_string()),
-            }),
-            p if p.starts_with("graph:") => crate::tab::GraphFocus::from_persist_key(p)
-                .map(|f| TabKind::Graph { focus: Some(f), scope_query: None }),
-            // status: board-view
-            // Per-doc board tab: the persist key is `board:<doc-path>`.
-            p if p.starts_with("board:") => {
-                Some(TabKind::Board { path: p["board:".len()..].to_string() })
-            }
-            // status: canvas-tab
-            // Per-doc canvas tab: the persist key is `canvas:<doc-path>`.
-            p if p.starts_with("canvas:") => {
-                Some(TabKind::Canvas { path: p["canvas:".len()..].to_string() })
-            }
-            // status: chart-csv-tab
-            // Per-CSV chart-builder tab: the persist key is `chart:<csv-path>`.
-            // (Note-block builders are ephemeral and never persisted.)
-            p if p.starts_with("chart:") => Some(TabKind::ChartBuilder {
-                source: crate::tab::ChartSource::Csv { path: p["chart:".len()..].to_string() },
-            }),
-            // status: zim-view
-            // Per-archive ZIM viewer tab: persist key is `zim:<archive-path>`;
-            // restore lands on the archive's main page (`article: None`).
-            p if p.starts_with("zim:") => Some(TabKind::ZimView {
-                zim_path: p["zim:".len()..].to_string(),
-                article: None,
-            }),
-            ":patch_review" => Some(TabKind::PatchReview),
-            // status: board-index-page
-            ":boards_index" => Some(TabKind::BoardsIndex),
-            ":rules" => Some(TabKind::Rules),
-            ":indexer" => Some(TabKind::IndexerDetail),
-            // status: diff-summary-panel
-            ":git_diff" => Some(TabKind::GitDiff),
-            _ => None,
-        };
+        let singleton_kind: Option<TabKind> = restore_kind(path.as_str());
         let kind = if let Some(k) = singleton_kind {
             k
         } else {
@@ -1000,6 +968,94 @@ impl AppState {
     if let Some(active) = active_real_path {
         crate::state::nav_push(state, &active);
     }
+    }
+}
+
+/// Resolve a single persist key back into a [`TabKind`], or `None` when the key
+/// is an unrecognized/non-singleton form (the loop then treats it as a plain
+/// vault buffer path). Factored out of `restore_tab_state` so the `container:`
+/// branch can recurse into each child key. status: container-tab
+fn restore_kind(key: &str) -> Option<crate::tab::TabKind> {
+    use crate::tab::{ContainerSecondary, TabKind};
+    match key {
+        ":home" => Some(TabKind::Home),
+        ":queue" => Some(TabKind::Queue),
+        ":settings" => Some(TabKind::Settings),
+        ":graph" => Some(TabKind::Graph { focus: None, scope_query: None }),
+        // status: graph-tab-focus
+        // Focused graph tab: the persist key is `graph:<depth>:<path>`.
+        // The landing state itself restores via the persisted view state
+        // (`graph-view-state-persist`); this re-creates the tab kind.
+        p if p.starts_with("graphq:") => Some(TabKind::Graph {
+            focus: None,
+            scope_query: Some(p["graphq:".len()..].to_string()),
+        }),
+        p if p.starts_with("graph:") => crate::tab::GraphFocus::from_persist_key(p)
+            .map(|f| TabKind::Graph { focus: Some(f), scope_query: None }),
+        // status: board-view
+        // Per-doc board tab: the persist key is `board:<doc-path>`.
+        p if p.starts_with("board:") => {
+            Some(TabKind::Board { path: p["board:".len()..].to_string() })
+        }
+        // status: canvas-tab
+        // Per-doc canvas tab: the persist key is `canvas:<doc-path>`.
+        p if p.starts_with("canvas:") => {
+            Some(TabKind::Canvas { path: p["canvas:".len()..].to_string() })
+        }
+        // status: container-tab, code-graph-view-source
+        // Per-source standalone single-lens tab: `code_graph_lens:<source-key>`.
+        p if p.starts_with("code_graph_lens:") => {
+            crate::tab::CodeSource::from_key(&p["code_graph_lens:".len()..])
+                .map(|source| TabKind::CodeGraphLens { source })
+        }
+        // The OLD two-lens `code_graph:<source-key>` key (pre-container) resolves to the current
+        // open shape: a two-lens `Container` (primary lens + same-source peer corner-minimap). Not
+        // migration code — just the restore branch mapping an existing key onto the current tab
+        // shape. New containers persist via the `container:` arm. status: container-tab
+        p if p.starts_with("code_graph:") => crate::tab::CodeSource::from_key(&p["code_graph:".len()..])
+            .map(|source| crate::panels::code_graph::code_container(&source)),
+        // status: chart-csv-tab
+        // Per-CSV chart-builder tab: the persist key is `chart:<csv-path>`.
+        // (Note-block builders are ephemeral and never persisted.)
+        p if p.starts_with("chart:") => Some(TabKind::ChartBuilder {
+            source: crate::tab::ChartSource::Csv { path: p["chart:".len()..].to_string() },
+        }),
+        // status: zim-view
+        // Per-archive ZIM viewer tab: persist key is `zim:<archive-path>`;
+        // restore lands on the archive's main page (`article: None`).
+        p if p.starts_with("zim:") => Some(TabKind::ZimView {
+            zim_path: p["zim:".len()..].to_string(),
+            article: None,
+        }),
+        // status: container-tab
+        // Two-view container: `container:<primaryKey>|<secondaryKey>|<swapped>`.
+        // Each child key resolves recursively through `restore_kind`; a child
+        // that fails to resolve makes the whole container fail (the tab then
+        // falls back to a vault buffer, matching the no-migration reset
+        // posture). `@selfoverview` → `ContainerSecondary::SelfOverview`. (Note:
+        // child keys here are non-container forms — Phase A does not persist
+        // nested containers, so a plain `|` split is unambiguous.)
+        p if p.starts_with("container:") => {
+            let mut parts = p["container:".len()..].splitn(3, '|');
+            let prim_key = parts.next()?;
+            let sec_key = parts.next()?;
+            let swapped = parts.next()?.parse::<bool>().ok()?;
+            let primary = Box::new(restore_kind(prim_key)?);
+            let secondary = if sec_key == "@selfoverview" {
+                ContainerSecondary::SelfOverview
+            } else {
+                ContainerSecondary::Peer(Box::new(restore_kind(sec_key)?))
+            };
+            Some(TabKind::Container { primary, secondary, swapped })
+        }
+        ":patch_review" => Some(TabKind::PatchReview),
+        // status: board-index-page
+        ":boards_index" => Some(TabKind::BoardsIndex),
+        ":rules" => Some(TabKind::Rules),
+        ":indexer" => Some(TabKind::IndexerDetail),
+        // status: diff-summary-panel
+        ":git_diff" => Some(TabKind::GitDiff),
+        _ => None,
     }
 }
 

@@ -460,10 +460,7 @@ fn navigate_to(state: &mut AppState, target: &NavTarget) {
             // (selection + scope) on its view. `nav.locked` (set by `nav_go`)
             // keeps the panel from re-recording this restore.
             let _tab = crate::panels::code_graph::open(state, source.clone());
-            let key = source.key();
-            if let Some(view) = state.panels.code_graph.get_mut(&key) {
-                crate::panels::code_graph::apply_nav_target(view, selected.clone(), *scope);
-            }
+            crate::panels::code_graph::apply_nav_target(state, source, selected.clone(), *scope);
         }
         NavTarget::VaultGraphNode { focus, scope } => {
             // Open/focus the singleton Graph tab, then restore the focus

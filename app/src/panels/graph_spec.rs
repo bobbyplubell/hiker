@@ -148,7 +148,7 @@ pub(crate) fn jump_to_spec(app: &mut AppState, slug: &str) {
     };
     let source = crate::tab::CodeSource::Project(note);
     crate::panels::code_graph::open(app, source.clone());
-    crate::panels::code_graph::light_spec(app, &source.key(), slug);
+    crate::panels::code_graph::select_spec(app, &source.key(), slug);
 }
 
 #[cfg(test)]

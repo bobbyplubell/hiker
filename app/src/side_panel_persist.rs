@@ -168,17 +168,29 @@ pub fn restore(app: &mut AppState, vault_root: &Path) {
     if saved.version != VERSION {
         return;
     }
-    restore_stack(
-        &mut app.workbench.primary_panels,
-        &saved.placements,
-        Location::LeftBar,
-        saved.left_focused.clone(),
-    );
+    // Drop any persisted section / focus whose activity no longer exists (renamed, removed, or — like
+    // `specs` — folded into another activity). Otherwise a stale section renders as
+    // "(panel '…' has no view)". Self-heals on the next autosave. status: spec-activity-panel
+    let placements: Vec<PlacementEntry> = saved
+        .placements
+        .iter()
+        .filter(|p| app.activities.by_id(crate::activity::split_view_id(&p.view_id).0).is_some())
+        .cloned()
+        .collect();
+    let left_focused = saved
+        .left_focused
+        .clone()
+        .filter(|f| app.activities.by_id(crate::activity::split_view_id(f).0).is_some());
+    let right_focused = saved
+        .right_focused
+        .clone()
+        .filter(|f| app.activities.by_id(crate::activity::split_view_id(f).0).is_some());
+    restore_stack(&mut app.workbench.primary_panels, &placements, Location::LeftBar, left_focused);
     restore_stack(
         &mut app.workbench.secondary_panels,
-        &saved.placements,
+        &placements,
         Location::RightBar,
-        saved.right_focused.clone(),
+        right_focused,
     );
     app.workbench.primary_side_bar.visible = saved.left_visible;
     app.workbench.secondary_side_bar.visible = saved.right_visible;

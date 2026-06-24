@@ -26,10 +26,11 @@ note:: `core/src/trees/ops/split.rs::Trees::split_cluster` is the orchestration 
 
 Algorithm choice drives the partition (§"Algorithm choices"): Leiden default, HDBSCAN / Hybrid / GMM-stub selectable. Split is flat by default, recursion opt-in. Each level operates on actual note embeddings within the parent's member set, not geometric centroids (§"Note embeddings input"), so re-clustering already-distinct centroids never arises.
 
-Recursion is **two bools** on `Params`: `disable_recursion` and `recurse`. The default is a single flat partition; `recurse` opts into descending every branch until a stop condition trips (per-branch member count below `leaf_min_size` default 5, or cohesion radius below `leaf_cohesion_threshold` default 0.15). The build recipe defaults to flat; the user opts into recursion in the review tab or deepens by hand. [cluster-op-split, cluster-recursion-modes]
+Recursion is **two bools** on `Params`: `disable_recursion` and `recurse`. The default is a single flat partition; `recurse` opts into descending every branch until a stop condition trips (per-branch member count below `leaf_min_size` default 5, or cohesion radius below `leaf_cohesion_threshold` default 0.15). The build recipe defaults to flat; the user opts into recursion in the review tab or deepens by hand. [cluster-op-split]
 implements:: [[code:hiker/cluster/build/impl#[`SplitBranchCtx<'a>`]recursive_split_branch]], [[code:hiker/cluster/build/impl#[`SplitBranchCtx<'b>`]open_branch]], [[code:hiker/cluster/build/impl#[`BranchFrame<'a, 'b>`]try_stop]], [[code:hiker/cluster/build/impl#[`BranchFrame<'a, 'b>`]sub_split]], [[code:hiker/trees/ops/split/impl#[Db]split_cluster_recursive]]
 
-PLANNED (`bug-clustering-params-spec-drift`): a `RecursionMode::{Flat, Manual, Auto}` enum replacing the two bools, plus a build-time `max_depth` becoming a tunable `Params` field.
+PLANNED (`bug-clustering-params-spec-drift`): Split takes a `recursion` mode — Flat (default, a single top-level partition), Manual (row-menu Split, one level), or Auto (recurse every branch until `max_depth` / `leaf_min_size` / `leaf_cohesion_threshold` trips). The `RecursionMode::{Flat, Manual, Auto}` enum replaces the two bools (the old `disable_recursion` folds into Flat), and the build-time `max_depth` becomes a tunable `Params` field. [cluster-recursion-modes]
+status:: planned
 
 The `split` op's reverse edit snapshots the prior subtree for undo per [[spec:cluster-editor-undo-redo]].
 
@@ -135,6 +136,12 @@ status:: done
 touches:: [[code:hiker/clusters/panel]]
 note:: `core/src/cluster.rs::LeidenParams { k_nearest: u32, edge_weight_floor: f32, iterations: u32, min_cluster_size: u32, resolution: f32, top_level_resolution: f32 }` carried on `ClusterParams.leiden` (with `#[serde(default)]` and `default_leiden_resolution() -> 1.0` / `default_leiden_top_resolution() -> 1.0` so old persisted method JSON deserializes cleanly). Defaults: `k_nearest=15`, `edge_weight_floor=0.0`, `iterations=100`, `min_cluster_size=2`, `resolution=1.0`, `top_level_resolution=1.0`. UI surfaces the original five in the cluster review tab's Advanced disclosure when `algorithm == leiden` (`app/src/clusters/panel/mod.rs`); the "Resolution (γ)" slider sets **both** `resolution` and `top_level_resolution` (so the slider drives the decisive top-level cut, not only sub-splits). `top_level_resolution` is consumed by the build recipe's first Split call against the virtual root ([[spec:cluster-build-recipe]]) and by `Trees::split_cluster`'s virtual-root invocation ([[spec:cluster-op-split]]) — recursive sub-splits and real-node user-driven splits revert to `resolution`. γ is the Reichardt-Bornholdt configuration parameter; γ > 1 finer, γ < 1 coarser. The earlier `0.3` top-level default collapsed dense kNN graphs to a single community (`Q_single = m·(1−2γ) > 0` for γ < 0.5) and aborted with `VaultTooSmall`; the `1.0` default plus the recipe's resolution-escalation retry (`partition_top_level_escalating`) fixes it
 
+The review tab's Advanced disclosure toggles its content by the selected method and algorithm. Cluster: an algorithm select (`hdbscan` / `leiden` / `hybrid` / `gmm`); HDBSCAN/Hybrid/GMM show `min_cluster_size` + `min_samples` (blank for auto); Leiden swaps those for `k_nearest` / `edge_weight_floor` / `resolution` (γ) / `iterations` / `min_cluster_size`. Common across algorithms: `summary_confidence_threshold` and the `disable_recursion` checkbox. FromFolders: `outlier_threshold` (only when Include outliers is on, with an explanatory note otherwise). `summarize` is intentionally not exposed — the structural pass forces `none`, the Confirm-and-name path forces `llm`. [cluster-review-tab-advanced-disclosure]
+status:: done
+
+The `disable_recursion` toggle is `ClusterParams.disable_recursion: bool` (default `false`, `#[serde(default)]`) on `core/src/cluster.rs`; `build_cluster_tree` short-circuits the recursive merge loop right after level 0 when set. Its UI checkbox lives in `app/src/panels/cluster_review/mod.rs` under the common-tunables block, and the flag is persisted explicitly in `cluster_trees.method` JSON so the saved tree's intent is recoverable. [cluster-review-tab-disable-recursion]
+status:: done
+
 PLANNED (`bug-clustering-params-spec-drift`): a `representation` param (centroid / summary / lexical, §"Representation"); a `max_depth` recursion cap promoted from a build-time const (`build/mod.rs`) to a `Params` field; the `RecursionMode` enum and `SummarizeMode::Extractive` (above).
 
 
@@ -149,8 +156,16 @@ The structural pass runs on a background task so the UI thread stays responsive.
 - `Cancelled` — terminal: the producer signalled cancel and the pass aborted cleanly.
 - `Failed { error }` — terminal: the pass errored out (partition refused, embeddings missing, etc.).
 
-The stream is owned by `core::cluster` and consumed through a channel-shaped interface. Cancellation is cooperative: the producer signals via a shared atomic, the pass checks at level boundaries and a periodic per-node interval, drops in-flight results, and emits `Cancelled`. [cluster-build-async-pass, cluster-build-progress-stream]
+These `Phase` / `BuildEvent` enums are emitted by the async structural pass and consumed by the cluster review tab ([[spec:cluster-review-tab-live-cluster-reveal]]); they are not part of the public crate API for non-UI callers. [cluster-build-progress-stream]
+status:: done
+implements:: [[code:hiker/cluster/build/impl#[`BranchFrame<'a, 'b>`]emit_leaf]], [[code:hiker/cluster/build/impl#[`BranchFrame<'a, 'b>`]finalize_branch]], [[code:hiker/cluster/Id]], [[code:hiker/cluster/Phase]], [[code:hiker/cluster/BuildEvent]]
+verifies:: [[code:hiker/cluster/tests/structural_streaming_fixture_notes]]
+
+The stream is owned by `core::cluster` and consumed through a channel-shaped interface. `core::cluster::build_tree_structural_streaming` (`core/src/cluster/build/stream.rs`) runs the structural pass on a tokio task and emits the stream; the blocking `build_tree_structural` stays as a convenience wrapper for tests and non-UI callers. Cancellation is cooperative: the producer signals via a shared atomic, the pass checks at level boundaries and a periodic per-node interval, drops in-flight results, and emits `Cancelled`. [cluster-build-async-pass]
+status:: done
 implements:: [[code:hiker/cluster/build/stream/impl#[StreamCtx]is_cancelled]], [[code:hiker/cluster/build/stream/impl#[StreamCtx]check_cancel]], [[code:hiker/cluster/build/stream/impl#[StreamCtx]check_cancel_periodic]], [[code:hiker/cluster/build/stream/impl#[StreamCtx]emit]], [[code:hiker/cluster/build/stream/impl#[StreamCtx]emit_phase]], [[code:hiker/cluster/build/stream/impl#[StreamCtx]emit_counters]], [[code:hiker/cluster/build/stream/impl#[StreamCtx]emit_partition_phase_if_new]], [[code:hiker/cluster/build/stream/impl#[StreamCtx]emit_cluster]]
+implements:: [[code:hiker/cluster/BuildError#Cancelled]], [[code:hiker/cluster/BuildEvent]]
+verifies:: [[code:hiker/cluster/tests/structural_streaming_fixture_notes]]
 
 The LLM summarization pass (Summarize op) is async via the task queue ([[spec:cluster-op-summarize-sweep]]) and not part of this stream — structural and naming are separate operations with separate progress surfaces.
 
@@ -272,12 +287,17 @@ note:: Pluggable `Representation` (Centroid default / Summary-embedding / Lexica
 | **Summary embedding** | embedding of the unit's name/summary text | Semantic by *what it's about*. Needs naming first → natural for Roll-up (clusters are named), a costly opt-in for Split (notes aren't) |
 | **Lexical** | TF-IDF / sparse term vector over the unit's text (document-frequency from the lexical/FTS index) | Literal — groups by shared terms. Reproducible, most explainable, model-free |
 
-Summary-embedding is available only when the units are named. Default is Centroid for both directions; the user overrides per action, with the tree's last choice inherited (mixing within a tree is allowed but costs legibility). Lexical + the planned `SummarizeMode::Extractive` gives a complete model-free path. Signal *fusion* (a weighted blend of lexical + embedding + link-graph + tags) slots into this same param when it lands. [cluster-representation, cluster-representation-fusion]
+Summary-embedding is available only when the units are named. Default is Centroid for both directions; the user overrides per action, with the tree's last choice inherited (mixing within a tree is allowed but costs legibility). Lexical + the planned `SummarizeMode::Extractive` gives a complete model-free path.
+
+Signal *fusion* — a deferred composite representation blending lexical + embedding + link-graph + tags with weights (the "Connections" / hybrid lenses) — slots into this same `representation` param when it lands. [cluster-representation-fusion]
+status:: planned
 
 
 ## Build scope
 
-`core::cluster::build_tree(scope, method, params)` takes a `BuildScope` (which notes), a `BuildMethod` (how the tree is built), and method-specific params. The cluster editor's "Suggest reorganization" picks all three; saved Evergreen trees record them so triage knows what the tree classifies and how to rebuild. [cluster-build-scope, cluster-build-method]
+`core::cluster::build_tree(scope, method, params)` takes a `BuildScope` (which notes), a `BuildMethod` (how the tree is built), and method-specific params. The cluster editor's "Suggest reorganization" picks all three; saved Evergreen trees record them so triage knows what the tree classifies and how to rebuild. The `BuildScope` enum (`Vault` / `Folder { rel }` / `Notes { ids }`) is serialized as JSON onto `cluster_trees.scope`; the producer resolves it into `Vec<NoteInput>` before calling `build_tree`, and the scope itself rides through as part of `BuildResult` so triage knows which notes the saved tree classifies. [cluster-build-scope]
+status:: done
+touches:: [[code:hiker/cluster]]
 
 ```rust
 enum BuildScope {
@@ -306,7 +326,9 @@ Saved triage trees persist their scope; the triage classifier ([[spec:cluster-pl
 
 ## Build method
 
-`BuildMethod` selects how the tree is constructed from the resolved note set. Two methods, each with its own parameter shape:
+`BuildMethod` selects how the tree is constructed from the resolved note set — the `BuildMethod` enum (`Cluster { params: ClusterParams }` / `FromFolders { params: FolderDeriveParams }`), persisted as JSON on `cluster_trees.method`. `build_tree` dispatches to `build_cluster_tree` vs `build_from_folders` based on the variant; the output shape is identical (`BuiltClusterTree`). Two methods, each with its own parameter shape: [cluster-build-method]
+status:: done
+touches:: [[code:hiker/cluster]]
 
 ```rust
 enum BuildMethod {
@@ -321,7 +343,9 @@ struct FolderDeriveParams {
 }
 ```
 
-`Cluster`'s `Params` is the field set enumerated in §"Build recipe" (algorithm, the recursion bools + leaf stop conditions, HDBSCAN/Leiden tunables, `summary_confidence_threshold`, `include_outliers`); naming is applied by the Name step's `SummarizeMode`, not by `Params`. [cluster-build-method, cluster-build-params]
+`Cluster`'s `Params` is the field set enumerated in §"Build recipe" — `core/src/cluster.rs::ClusterParams` (algorithm, min_cluster_size, min_samples, summary_confidence_threshold, include_outliers, summarize, **leiden**, **disable_recursion**, **recurse**, **leaf_min_size** default 5, **leaf_cohesion_threshold** default 0.15) and `FolderDeriveParams` (summarize, include_outliers, outlier_threshold); both serde + `Default`. The build recipe ([[spec:cluster-build-recipe]]) terminates recursion per-branch via `leaf_min_size` / `leaf_cohesion_threshold`. Persisted inside the `BuildMethod` JSON on the `cluster_trees` row. Naming is applied by the Name step's `SummarizeMode`, not by `Params`. [cluster-build-params]
+status:: done
+touches:: [[code:hiker/cluster]]
 
 ### `Cluster` method
 
@@ -423,6 +447,12 @@ Cost: `O(K · branching · depth)` cosines, ≈ a few hundred dot products on a 
 
 `hiker mv` and drag-and-drop-move are *not* this. Manual user moves don't re-classify against the tree; they're authoritative. The classifier fires only on new-note-on-save and the modified-rerun pathways.
 
+The triage producer wrapping this descent is `core/src/suggest.rs::triage_match` — it loads `cluster_nodes` rows, builds a `LoadedTreeView` (the on-disk version of `TreeView`), runs `cluster::place_beam_descent`, walks the matched leaf up via `resolve_effective_policy`, and stages one pending edit per Move/Tag match. `triage_all_saved_trees` iterates every tree where `state == "saved-as-triage"`. [triage-classifier-engine]
+status:: done
+implements:: [[code:hiker/suggest/triage_match]]
+verifies:: [[code:hiker/suggest/tests]]
+touches:: [[code:hiker/suggest]]
+
 
 ## Per-note placement (online, cheap)
 
@@ -438,7 +468,16 @@ The build recipe is the **batch / seed** path (offline, on `hiker reconcile`, ex
 
 ## Summarization
 
-The LLM naming path (`SummarizeMode::Llm`, the current default) takes cluster member titles + per-note summaries (or per-cluster summaries at higher levels) and produces a short summary (1–3 sentences) + a proposed name (3–6 words) via the prompt below. The PLANNED deterministic path (`SummarizeMode::Extractive`, [[spec:cluster-name-deterministic]], `bug-clustering-params-spec-drift`) would derive the name from top TF-IDF / KeyBERT-style terms with the most-central note's title as fallback. [cluster-summarize-llm, cluster-name-from-summary, cluster-name-deterministic]
+The LLM naming path (`SummarizeMode::Llm`, the current default) takes cluster member titles + per-note summaries (or per-cluster summaries at higher levels) and produces a short summary + a proposed name via the prompt below. `core/src/cluster.rs::LlmSummarizer` wraps `core::llm::LlmClient` + the `cluster_summarize` bundled prompt (`core/prompts/cluster_summarize.md`, registered in `core::prompts`). `Summarizer::summarize` renders member titles + summaries into the prompt, spins a per-call current-thread tokio runtime to bridge sync→async, calls `chat`, and parses the model's JSON `{name, summary, confidence}` reply. Wired into `cluster_tree_create` / `cluster_tree_rebuild` / `cluster_op_recluster_subtree` via `build_cluster_summarizer` (errors if `[llm].enabled = false` — there is no non-LLM fallback). The Queue carrier (`RaptorSummarize`) stays as the fan-out pathway for batched sample-merge; the in-process direct path here is the simpler shape used during interactive builds. [cluster-summarize-llm]
+status:: done
+implements:: [[code:hiker/cluster/LlmSummarizer]], [[code:hiker/prompts/bundled_defaults]]
+touches:: [[code:hiker/cluster]]
+
+Concretely, the LLM proposes a 3–6 word name + a 1–3 sentence summary + a confidence score. [cluster-name-from-summary]
+status:: planned
+
+The PLANNED deterministic path is `SummarizeMode::Extractive` ([[spec:cluster-name-deterministic]], `bug-clustering-params-spec-drift`): top TF-IDF / KeyBERT-style terms over a cluster's members (document-frequency from the lexical/FTS index) + the most-central note's title as fallback, plus a short extractive summary. An `ExtractiveSummarizer` impl behind the `Summarizer` trait alongside `LlmSummarizer`; with a deterministic representation, the whole build + naming loop runs `[llm]`-disabled. [cluster-name-deterministic]
+status:: planned
 
 Prompt shape (sketch):
 
@@ -532,47 +571,3 @@ Summarization is its own module (`core::summarize`) since it has independent fai
 - Durable cluster identity carried by the *build pass*. Each build run produces a fresh tree with ephemeral per-run ids; the durable identity lives in the tree document (its outline position-and-name), owned by `cluster-editor.md`, not in the build output.
 - Cross-vault clustering. One tree per vault.
 - Trail discovery from clusters. Trails are user-authored only by design (see `design.md`); the clustering pipeline never proposes them.
-
-## Registry imports (from status.md)
-
-Entries imported from the retired status registry that had no anchor in this doc —
-re-home them into the relevant sections as the doc evolves.
-
-- **cluster-summarize-llm** — `core/src/cluster.rs::LlmSummarizer` wraps `core::llm::LlmClient` + the `cluster_summarize` bundled prompt (`core/prompts/cluster_summarize.md`, registered in `core::prompts`). `Summarizer::summarize` renders member titles + summaries into the prompt, spins a per-call current-thread tokio runtime to bridge sync→async, calls `chat`, and parses the model's JSON `{name, summary, confidence}` reply. Wired into `cluster_tree_create` / `cluster_tree_rebuild` / `cluster_op_recluster_subtree` via `build_cluster_summarizer` (errors if `[llm].enabled = false` — there is no non-LLM fallback). The Queue carrier (`RaptorSummarize`) stays as the fan-out pathway for batched sample-merge; the in-process direct path here is the simpler shape used during interactive builds [cluster-summarize-llm]
-  status:: done
-  implements:: [[code:hiker/cluster/LlmSummarizer]], [[code:hiker/prompts/bundled_defaults]]
-  touches:: [[code:hiker/cluster]]
-- **cluster-name-from-summary** — LLM proposes 3–6 word name + 1–3 sentence summary + confidence [cluster-name-from-summary]
-  status:: planned
-- **cluster-build-scope** — `core/src/cluster.rs::BuildScope` enum (`Vault` / `Folder { rel }` / `Notes { ids }`), serialized as JSON onto `cluster_trees.scope`. The producer resolves it into `Vec<NoteInput>` before calling `build_tree`; the scope itself rides through as part of `BuildResult` so triage knows which notes the saved tree classifies [cluster-build-scope]
-  status:: done
-  touches:: [[code:hiker/cluster]]
-- **cluster-build-method** — `core/src/cluster.rs::BuildMethod` enum (`Cluster { params: ClusterParams }` / `FromFolders { params: FolderDeriveParams }`); persisted as JSON on `cluster_trees.method`. `build_tree` dispatches to `build_cluster_tree` vs `build_from_folders` based on the variant; the output shape is identical (`BuiltClusterTree`) [cluster-build-method]
-  status:: done
-  touches:: [[code:hiker/cluster]]
-- **cluster-build-params** — `core/src/cluster.rs::ClusterParams` (algorithm, min_cluster_size, min_samples, summary_confidence_threshold, include_outliers, summarize, **leiden**, **disable_recursion**, **recurse**, **leaf_min_size** default 5, **leaf_cohesion_threshold** default 0.15) and `FolderDeriveParams` (summarize, include_outliers, outlier_threshold); both serde + `Default`. The build recipe ([[spec:cluster-build-recipe]]) terminates recursion per-branch via `leaf_min_size` / `leaf_cohesion_threshold`. Persisted inside the `BuildMethod` JSON on the `cluster_trees` row [cluster-build-params]
-  status:: done
-  touches:: [[code:hiker/cluster]]
-- **cluster-review-tab-advanced-disclosure** — the advanced disclosure in `app/src/panels/cluster_review/mod.rs` toggles content based on the selected method and algorithm. Cluster: algorithm select (`hdbscan` / `leiden` / `hybrid` / `gmm`); HDBSCAN/Hybrid/GMM show `min_cluster_size` + `min_samples` (blank for auto); Leiden swaps those for `k_nearest` / `edge_weight_floor` / `resolution` (γ) / `iterations` / `min_cluster_size`. Common across algorithms: `summary_confidence_threshold` and the `disable_recursion` checkbox ([[spec:cluster-review-tab-disable-recursion]]). FromFolders: `outlier_threshold` (only when Include outliers is on, with an explanatory note otherwise). `summarize` is intentionally not exposed — the structural pass forces `none`, the Confirm-and-name path forces `llm` [cluster-review-tab-advanced-disclosure]
-  status:: done
-- **cluster-review-tab-disable-recursion** — `ClusterParams.disable_recursion: bool` (default `false`, `#[serde(default)]`) on `core/src/cluster.rs`; `build_cluster_tree` short-circuits the recursive merge loop right after level 0 when set. UI checkbox in `app/src/panels/cluster_review/mod.rs` under the common-tunables block. Persisted explicitly in `cluster_trees.method` JSON so the saved tree's intent is recoverable [cluster-review-tab-disable-recursion]
-  status:: done
-- **cluster-build-async-pass** — `core::cluster::build_tree_structural_streaming` (`core/src/cluster/build/stream.rs`) runs the structural pass on a tokio task and emits the `BuildEvent` stream defined by [[spec:cluster-build-progress-stream]]. Cooperative cancellation via a shared atomic checked at level boundaries inside the partition loop. The blocking `build_tree_structural` stays as a convenience wrapper for tests and non-UI callers. Consumed by [[spec:cluster-review-tab-live-cluster-reveal]] (done) via the pane's `run_structural_streaming` [cluster-build-async-pass]
-  status:: done
-  implements:: [[code:hiker/cluster/BuildError#Cancelled]], [[code:hiker/cluster/BuildEvent]]
-  verifies:: [[code:hiker/cluster/tests/structural_streaming_fixture_notes]]
-- **cluster-build-progress-stream** — `Phase` / `BuildEvent` enums in `core/src/cluster/mod.rs:689,710` emitted by the async structural pass: `Phase { phase }` (`LoadingEmbeddings` / `PartitioningLevel(u32)` / `Finalizing`), `Counters { items_processed, clusters_found, outliers }`, `ClusterDiscovered { node, parent }`, `Done { tree }`, `Cancelled`, `Failed { error }`. Consumed by the cluster review tab ([[spec:cluster-review-tab-live-cluster-reveal]], done); not part of the public crate API for non-UI callers [cluster-build-progress-stream]
-  status:: done
-  implements:: [[code:hiker/cluster/build/impl#[`BranchFrame<'a, 'b>`]emit_leaf]], [[code:hiker/cluster/build/impl#[`BranchFrame<'a, 'b>`]finalize_branch]], [[code:hiker/cluster/Id]], [[code:hiker/cluster/Phase]], [[code:hiker/cluster/BuildEvent]]
-  verifies:: [[code:hiker/cluster/tests/structural_streaming_fixture_notes]]
-- **cluster-recursion-modes** — Split takes a `recursion` mode: Flat (default — single top-level partition), Manual (row-menu Split, one level), or Auto (recurse every branch until `max_depth` / `leaf_min_size` / `leaf_cohesion_threshold` trips). Flat-default replaces recursion-by-default; the old `disable_recursion` boolean folds into Flat [cluster-recursion-modes]
-  status:: planned
-- **cluster-representation-fusion** — Deferred composite representation blending lexical + embedding + link-graph + tags with weights (the "Connections"/hybrid lenses); slots into the `representation` parameter when it lands [cluster-representation-fusion]
-  status:: planned
-- **cluster-name-deterministic** — `SummarizeMode::Extractive` (the default): top TF-IDF / KeyBERT-style terms over a cluster's members (document-frequency from the lexical/FTS index) + most-central note's title fallback, short extractive summary. `ExtractiveSummarizer` impl behind the `Summarizer` trait alongside `LlmSummarizer`. With a deterministic representation, the whole build + naming loop runs `[llm]`-disabled [cluster-name-deterministic]
-  status:: planned
-- **triage-classifier-engine** — `core/src/suggest.rs::triage_match` — loads `cluster_nodes` rows, builds a `LoadedTreeView` (the on-disk version of `TreeView`), runs `cluster::place_beam_descent`, walks the matched leaf up via `resolve_effective_policy`, and stages one pending edit per Move/Tag match. `triage_all_saved_trees` iterates every tree where `state == "saved-as-triage"`. Tests: `suggest::tests::triage_emits_move_row_with_triage_surface`, `triage_drops_match_outside_scope`, `triage_agent_author_forces_pending` [triage-classifier-engine]
-  status:: done
-  implements:: [[code:hiker/suggest/triage_match]]
-  verifies:: [[code:hiker/suggest/tests]]
-  touches:: [[code:hiker/suggest]]

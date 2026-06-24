@@ -172,7 +172,7 @@ pub enum TabKind {
     /// Vault-wide graph view. Singleton (one global tab, like Home/Queue),
     /// but the kind carries an optional **focus target** — open "focused"
     /// lands the panel in `focus.path`'s depth-bounded neighbourhood instead
-    /// of the full-vault overview (mirroring how `CodeGraph` carries its
+    /// of the full-vault overview (mirroring how `CodeGraphLens` carries its
     /// view-source) — and an optional **query scope** (`graph-scoped-query`):
     /// the query-doc whose matches bound the node universe ("graph of this
     /// smart folder"). Scope and focus are orthogonal and compose — the
@@ -224,11 +224,15 @@ pub enum TabKind {
     /// Cluster tree visualised as a radial dendrogram. Payload is the
     /// `tree_id` to render.
     ClusterGraph { tree_id: String },
-    /// Code graph: a code source rendered as a precise entity graph through the shared graph engine.
-    /// The source is either a project note (`hiker.kind: project`, binds a repo descriptor) or a
-    /// `.scip` index opened directly from the file tree (no project note). Per-source (like Board),
-    /// not a singleton. See `docs/hiker-code.md` `code-graph-view-source`.
-    CodeGraph { source: CodeSource },
+    /// A single code-graph LENS (one filtered view + one layout) over a shared
+    /// per-source doc — a code source rendered as a precise entity graph through the shared graph
+    /// engine. The source is either a project note (`hiker.kind: project`, binds a repo descriptor)
+    /// or a `.scip` index opened directly from the file tree (no project note). Renders standalone
+    /// (no minimap); also the child kind the code-graph `Container` composes two of (primary pane +
+    /// peer corner-minimap). Per-source state on the doc/lens maps in `AppState::panels`. Per-source
+    /// (like Board), not a singleton. See `docs/hiker-code.md` `code-graph-view-source`.
+    /// status: container-tab, code-graph-view-source
+    CodeGraphLens { source: CodeSource },
     /// Project-config form: author/edit a project note via UI (sources → save). `source_note` is
     /// `Some(path)` when editing an existing project note, `None` for a new one. Per-form state on
     /// `AppState::panels.project_config`, keyed by tab id.
@@ -246,6 +250,38 @@ pub enum TabKind {
     /// splices the regenerated block back). See `panels::charts_tab`.
     /// status: chart-csv-tab, chart-open-in-builder
     ChartBuilder { source: ChartSource },
+    /// Two-view container: composes a `primary` child view with a `secondary`
+    /// (a swappable `Peer` or a non-swappable `SelfOverview`). The secondary is
+    /// drawn as a corner inset; clicking it (peer only) flips `swapped`, which
+    /// exchanges which child is visible as the primary. `label`/`icon`/
+    /// `buffer_path` delegate to the *visible* primary child (honoring
+    /// `swapped`). status: container-tab
+    Container {
+        primary: Box<TabKind>,
+        secondary: ContainerSecondary,
+        swapped: bool,
+    },
+}
+
+impl TabKind {
+    /// The kind currently shown as the large/primary pane, honoring `swapped`.
+    /// For a non-container kind this is `self`. status: container-tab
+    pub fn visible_primary(&self) -> &TabKind {
+        match self {
+            TabKind::Container { primary, secondary, swapped } => {
+                if *swapped {
+                    match secondary {
+                        ContainerSecondary::Peer(peer) => peer,
+                        // SelfOverview never swaps, so the primary stays visible.
+                        ContainerSecondary::SelfOverview => primary,
+                    }
+                } else {
+                    primary
+                }
+            }
+            other => other,
+        }
+    }
 }
 
 /// Display scope for the code-graph view: the whole graph (`Overview`) or the 1–3-hop
@@ -290,7 +326,51 @@ impl GraphFocus {
     }
 }
 
-/// What a [`TabKind::CodeGraph`] tab is viewing. status: code-graph-view-source
+/// Which slot a [`TabKind::Container`] child occupies. A discriminator threaded
+/// through the render path so two children living under ONE container `TabId`
+/// derive distinct, swap-stable per-child state keys (see [`child_state_key`]).
+/// status: container-tab
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChildSlot {
+    Primary,
+    Secondary,
+}
+
+/// The secondary child of a [`TabKind::Container`]. Either a `Peer` (its own
+/// view/engine — swappable with the primary) or a `SelfOverview` (an overview
+/// of the primary; not swappable, carries no inner kind). status: container-tab
+#[derive(Debug, Clone)]
+pub enum ContainerSecondary {
+    /// A peer view rendered as the corner inset. Swap-enabled (primary↔secondary).
+    Peer(Box<TabKind>),
+    /// An overview of the PRIMARY (shared coords + viewport indicator). Not
+    /// swappable. Has no inner kind — encoded in persistence as `@selfoverview`.
+    SelfOverview,
+}
+
+/// Stable per-child state key for a [`TabKind::Container`] child.
+///
+/// Rule: a source-keyed child kind (one whose panel state is keyed by an
+/// intrinsic source — currently [`TabKind::CodeGraphLens`]) keys on that source, so
+/// it can warm-reuse the same doc whether it sits in a container slot or in a
+/// standalone tab. Every other (`TabId`-keyed) kind keys on the
+/// `(tab_id, slot)` pair, so the two children under one container `TabId` never
+/// collide AND never follow each other on swap (the slot, not the visible
+/// position, is the identity). status: container-tab
+pub fn child_state_key(tab_id: TabId, slot: ChildSlot, kind: &TabKind) -> String {
+    match kind {
+        TabKind::CodeGraphLens { source } => format!("source:{}", source.key()),
+        _ => {
+            let slot = match slot {
+                ChildSlot::Primary => "primary",
+                ChildSlot::Secondary => "secondary",
+            };
+            format!("child:{}:{slot}", tab_id.0)
+        }
+    }
+}
+
+/// What a [`TabKind::CodeGraphLens`] tab is viewing. status: code-graph-view-source
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodeSource {
     /// A project note (`hiker.kind: project`); its `repo` source descriptor is bound to a SCIP
@@ -313,6 +393,14 @@ impl CodeSource {
         match self {
             CodeSource::Project(p) => format!("project:{p}"),
             CodeSource::Index(p) => format!("index:{p}"),
+        }
+    }
+    /// Parse a [`key`](Self::key) back into a source — the inverse, for restoring persisted tabs.
+    pub fn from_key(key: &str) -> Option<Self> {
+        if let Some(p) = key.strip_prefix("project:") {
+            Some(Self::Project(p.to_string()))
+        } else {
+            key.strip_prefix("index:").map(|p| Self::Index(p.to_string()))
         }
     }
 }
@@ -485,7 +573,7 @@ impl TabKind {
             TabKind::GitDiff => "Git diff".to_string(),
             TabKind::ClusterReview { .. } => "Cluster review".to_string(),
             TabKind::ClusterGraph { .. } => "Cluster graph".to_string(),
-            TabKind::CodeGraph { source } => {
+            TabKind::CodeGraphLens { source } => {
                 format!("Code graph · {}", path_basename(source.path()))
             }
             TabKind::ProjectConfig { source_note } => match source_note {
@@ -496,6 +584,9 @@ impl TabKind {
                 format!("ZIM · {}", path_basename(zim_path))
             }
             TabKind::ChartBuilder { source } => format!("Chart · {}", path_basename(source.host_path())),
+            // Delegate to the visible primary child (honoring swap).
+            // status: container-tab
+            TabKind::Container { .. } => self.visible_primary().label(),
         }
     }
 
@@ -534,7 +625,7 @@ impl TabKind {
             TabKind::GitDiff => icons::ICONS.image(crate::icons::Icon::Diff),
             TabKind::ClusterReview { .. } => icons::ICONS.image(crate::icons::Icon::Graph),
             TabKind::ClusterGraph { .. } => icons::ICONS.image(crate::icons::Icon::Graph),
-            TabKind::CodeGraph { .. } => icons::ICONS.image(crate::icons::Icon::Graph),
+            TabKind::CodeGraphLens { .. } => icons::ICONS.image(crate::icons::Icon::Graph),
             TabKind::ProjectConfig { .. } => icons::ICONS.image(crate::icons::Icon::Wrench),
             // Offline encyclopedia archive — the compass "go read out
             // there, but cached" reads closest in the icon set.
@@ -542,6 +633,9 @@ impl TabKind {
             // A chart of plotted data reads closest to the spatial-graph glyph
             // in the icon set (same choice as Canvas).
             TabKind::ChartBuilder { .. } => icons::ICONS.image(crate::icons::Icon::Graph),
+            // Delegate to the visible primary child (honoring swap).
+            // status: container-tab
+            TabKind::Container { .. } => self.visible_primary().icon(),
         }
     }
 }
@@ -575,7 +669,17 @@ impl Tab {
     /// group's active-tab `persist_key`, re-resolving to a `GroupId` after the
     /// workbench layout restores. status: tab-linking
     pub fn persist_key(&self) -> Option<(String, String)> {
-        Some(match &self.kind {
+        self.kind.persist_key()
+    }
+}
+
+impl TabKind {
+    /// Workspace-restore key for this kind (the kind half of
+    /// [`Tab::persist_key`], split out so a [`TabKind::Container`] child can
+    /// derive its own key for the recursive `container:` composite).
+    /// `None` if the kind needs payload data we don't persist. status: container-tab
+    pub fn persist_key(&self) -> Option<(String, String)> {
+        Some(match self {
             TabKind::Editor { buffer: BufferSource::Vault { path }, diff: None } => {
                 (path.clone(), "buffer".into())
             }
@@ -608,6 +712,13 @@ impl Tab {
             // disambiguates from a plain buffer tab on the same path).
             // status: canvas-tab
             TabKind::Canvas { path } => (format!("canvas:{path}"), "canvas".into()),
+            // A standalone single-lens tab persists per-source under its own prefix
+            // so restore reopens it as a lens. The default open path is a two-lens
+            // `Container` (persisted via the `container:` arm composing two
+            // `code_graph_lens:` child keys). status: container-tab, code-graph-view-source
+            TabKind::CodeGraphLens { source } => {
+                (format!("code_graph_lens:{}", source.key()), "code_graph_lens".into())
+            }
             // Singleton Boards index page. status: board-index-page
             TabKind::BoardsIndex => (":boards_index".into(), "boards_index".into()),
             // Singleton Rules panel. status: rule-firings-panel
@@ -630,6 +741,19 @@ impl Tab {
             TabKind::IndexerDetail => (":indexer".into(), "indexer".into()),
             // Singleton git diff-summary page. status: diff-summary-panel
             TabKind::GitDiff => (":git_diff".into(), "git_diff".into()),
+            // A container persists as `container:<primaryKey>|<secondaryKey>|<swapped>`,
+            // where each child's key is its own `persist_key`. A child whose kind
+            // doesn't persist makes the WHOLE container non-persistable (return
+            // None). `SelfOverview` has no inner kind, so it encodes as the
+            // literal sentinel `@selfoverview`. status: container-tab
+            TabKind::Container { primary, secondary, swapped } => {
+                let prim = primary.persist_key()?.0;
+                let sec = match secondary {
+                    ContainerSecondary::Peer(peer) => peer.persist_key()?.0,
+                    ContainerSecondary::SelfOverview => "@selfoverview".to_string(),
+                };
+                (format!("container:{prim}|{sec}|{swapped}"), "container".into())
+            }
             // Variants intentionally skipped: HomeDetail, non-Vault Editor
             // buffers, Editor tabs with diff active, QueueDetail,
             // Properties, Agent, ClusterReview, ClusterGraph.
@@ -640,7 +764,7 @@ impl Tab {
     /// Buffer path the tab is about, if any. Used for dirty-marker
     /// lookups and version-dropdown population.
     pub fn buffer_path(&self) -> Option<&str> {
-        match &self.kind {
+        match self {
             TabKind::Editor { buffer, .. } => Some(buffer.path()),
             TabKind::Properties { path } => Some(path.as_str()),
             // A canvas tab is about its `.canvas` vault path, so tab-switch nav
@@ -649,8 +773,18 @@ impl Tab {
             // A chart-builder tab is about its host vault path (the CSV, or the
             // note an inline block lives in). status: chart-csv-tab
             TabKind::ChartBuilder { source } => Some(source.host_path()),
+            // Delegate to the visible primary child (honoring swap).
+            // status: container-tab
+            TabKind::Container { .. } => self.visible_primary().buffer_path(),
             _ => None,
         }
+    }
+}
+
+impl Tab {
+    /// Buffer path the tab is about, if any (delegates to the kind).
+    pub fn buffer_path(&self) -> Option<&str> {
+        self.kind.buffer_path()
     }
 }
 
@@ -701,5 +835,86 @@ mod tests {
         assert_eq!(GraphFocus::from_persist_key("graph:x:notes/a.md"), None);
         assert_eq!(GraphFocus::from_persist_key("graph:2:"), None);
         assert_eq!(GraphFocus::from_persist_key(":graph"), None);
+    }
+
+    use super::{child_state_key, ChildSlot, ContainerSecondary};
+
+    /// A container's persist key composes each child's own key with the swapped
+    /// flag; a `SelfOverview` secondary encodes as the `@selfoverview` sentinel;
+    /// a child whose kind doesn't persist makes the whole container non-
+    /// persistable. status: container-tab
+    #[test]
+    fn container_persist_key_composes_children() {
+        // Peer of two persistable kinds: `container:<prim>|<sec>|<swapped>`.
+        let peer = Tab::new(
+            TabId(7),
+            TabKind::Container {
+                primary: Box::new(TabKind::Graph { focus: None, scope_query: None }),
+                secondary: ContainerSecondary::Peer(Box::new(TabKind::Home)),
+                swapped: false,
+            },
+            true,
+        );
+        assert_eq!(
+            peer.persist_key(),
+            Some(("container::graph|:home|false".to_string(), "container".to_string()))
+        );
+
+        // SelfOverview secondary → `@selfoverview` sentinel; swapped flag round-trips.
+        let overview = Tab::new(
+            TabId(8),
+            TabKind::Container {
+                primary: Box::new(TabKind::Canvas { path: "a.canvas".to_string() }),
+                secondary: ContainerSecondary::SelfOverview,
+                swapped: true,
+            },
+            true,
+        );
+        assert_eq!(
+            overview.persist_key(),
+            Some((
+                "container:canvas:a.canvas|@selfoverview|true".to_string(),
+                "container".to_string()
+            ))
+        );
+
+        // A non-persistable primary (Properties) makes the whole container fail.
+        let unpersistable = Tab::new(
+            TabId(9),
+            TabKind::Container {
+                primary: Box::new(TabKind::Properties { path: "p.md".to_string() }),
+                secondary: ContainerSecondary::SelfOverview,
+                swapped: false,
+            },
+            true,
+        );
+        assert_eq!(unpersistable.persist_key(), None);
+    }
+
+    /// The two children of one container `TabId` get distinct keys (no
+    /// collision) and the key is tied to the SLOT, not the visible position —
+    /// so a swap doesn't make a child follow the other's state. A source-keyed
+    /// kind (CodeGraphLens) keys on its source regardless of slot/tab. status: container-tab
+    #[test]
+    fn child_state_key_avoids_collision_and_is_swap_stable() {
+        let tab = TabId(42);
+        let prim = TabKind::Home;
+        let sec = TabKind::Queue;
+
+        let kp = child_state_key(tab, ChildSlot::Primary, &prim);
+        let ks = child_state_key(tab, ChildSlot::Secondary, &sec);
+        assert_ne!(kp, ks, "two children under one TabId must not collide");
+
+        // Swap-stability: the key depends on the slot, not the kind that
+        // happens to be visible there, so it stays put across a swap.
+        assert_eq!(kp, child_state_key(tab, ChildSlot::Primary, &sec));
+        assert_eq!(ks, child_state_key(tab, ChildSlot::Secondary, &prim));
+
+        // Source-keyed CodeGraphLens: keyed by source, independent of tab/slot.
+        let cg = TabKind::CodeGraphLens { source: super::CodeSource::Index("x.scip".into()) };
+        let a = child_state_key(TabId(1), ChildSlot::Primary, &cg);
+        let b = child_state_key(TabId(2), ChildSlot::Secondary, &cg);
+        assert_eq!(a, b, "source-keyed child warm-reuses across tab/slot");
+        assert!(a.contains("index:x.scip"));
     }
 }

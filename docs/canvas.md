@@ -7,15 +7,15 @@ The headline decisions (each detailed in its owning section below):
 - **Four layers, mirroring the editor stack**, all under one `hiker-canvas/` directory so the family can be lifted into a standalone repo: `hiker-canvas` (egui-agnostic document core), `canvas-view-core` (egui-free view+interaction), `canvas-view` (thin egui shell + the `NodeContentRenderer` seam), and the `app` canvas panel (tab/nav, op-log binding, injected content engines). [canvas-crate-split]
 status:: done
 note:: Four layers, mirroring the editor (`editor-core`/`editor-view`/`editor-egui`) rather than the thinner `graph-widgets`. `hiker-canvas` is the egui-free document core (serde model, geometry, `EditOp`s). `canvas-view-core` is the **egui-free** view+interaction layer (camera, edge routing, handle geometry, hit-testing, gesture→`EditOp` decisions, selection, undo) — depends only on `emath` + `hiker-canvas`, unit-tested without a UI. `canvas-view` is the thin egui shell (painter, `CanvasView` widget + `show` loop, pointer plumbing, the `NodeContentRenderer` content seam) and the only crate that depends on `egui`. All three live under one `hiker-canvas/` directory so the family can be extracted as a standalone repo; the content engines (editor-egui / htmlview) stay in the app behind the seam, so no widget crate gains an inter-hiker dep · evidence: `hiker-canvas/core` (crate `hiker-canvas`), `hiker-canvas/view-core` (crate `canvas-view-core`), `hiker-canvas/view` (crate `canvas-view`), `app/src/panels/canvas/` (glue)
-- **A `.canvas` file is a first-class op-log document** — the same dirty/save model as a note, under a new `canvas` kind; the canonical JSON *is* the document text edited as `working`, no structural CRDT of nodes (§"Op-log binding"). [canvas-doc-kind, canvas-oplog-binding]
-- **Edits localize through canonical JSON serialization** so a single node move is a minimal localized text diff, making concurrent disjoint-node edits merge and same-node edits surface as a conflict hunk (§"Op-log binding", §"Conflict merge"). [canvas-canonical-json, canvas-conflict-merge]
-- **Full interactive editor in v1** — select (single/multi/marquee), move, resize, create every node type, draw and re-anchor edges, edit text, pan/zoom; in-session undo/redo, Save commits `working`. [canvas-edit-ops, canvas-selection, canvas-undo-redo]
-- **Inserting vault content is the primary workflow** — a file node holds a *pointer* (vault path), never a copy, rendering a live view (§"Interaction"). [canvas-insert-from-vault, canvas-add-to-canvas-verb, canvas-node-create]
+- **A `.canvas` file is a first-class op-log document** — the same dirty/save model as a note, under a new `canvas` kind; the canonical JSON *is* the document text edited as `working`, no structural CRDT of nodes (§"Op-log binding").
+- **Edits localize through canonical JSON serialization** so a single node move is a minimal localized text diff, making concurrent disjoint-node edits merge and same-node edits surface as a conflict hunk (§"Op-log binding", §"Conflict merge").
+- **Full interactive editor in v1** — select (single/multi/marquee), move, resize, create every node type, draw and re-anchor edges, edit text, pan/zoom; in-session undo/redo, Save commits `working`.
+- **Inserting vault content is the primary workflow** — a file node holds a *pointer* (vault path), never a copy, rendering a live view (§"Interaction").
 - **Node contents reuse the existing engines** through the `NodeContentRenderer` seam, so the widget crates never learn markdown/image/HTML (§"Node content engines"). [canvas-node-content-trait]
 status:: done
 touches:: [[code:hiker/content]]
 note:: `NodeContentRenderer` seam + `DebugContentRenderer`; adapter stays content-engine-free
-- **Select / Hand tools with universal pan shortcuts**, and **group containers are first-class, manipulable nodes** (§"Interaction"). [canvas-tool-mode, canvas-group-grab, canvas-group-resize, canvas-group-draw]
+- **Select / Hand tools with universal pan shortcuts**, and **group containers are first-class, manipulable nodes** (§"Interaction").
 
 
 ## Format model
@@ -101,6 +101,11 @@ note:: dotted background scaled with zoom · evidence: `hiker-canvas/view/src/pa
 - **Viewport culling.** Only nodes and edges intersecting the visible viewport paint and hit-test, so a large canvas pays for what's on screen — the same viewport-scoping discipline the editor widgets use ([[spec:widget-render-viewport-scoped]]). [canvas-viewport-cull]
 status:: done
 note:: only nodes/edges intersecting the clip rect paint + hit-test. `node_card` also hands the content engine a child ui clipped to the *viewport* (not just the card's inner rect), and the engine intersects its own clip with it, so a card straddling the pane edge never paints its body over the header / tabs / neighbouring panels · evidence: `hiker-canvas/view/src/paint.rs`
+- **Corner overview minimap.** The canvas is modelled as a `Container { primary: Canvas, secondary: SelfOverview }` ([[spec:tab-kinds]] `container`): the overview is the `SelfOverview` secondary, rendered as a corner inset through the SAME engine borrowed-minimap chrome ([[spec:graph-minimap-chrome]]) the code-graph minimap uses. With no peer graph engine, the canvas supplies an engine from `Minimap::overview_engine` and SETS its `positions` to the card centres each frame (never force-laid-out); the minimap re-asserts the locked-Poincaré overview, the viewport-location indicator (`BrightenVisible` / `ShowViewport`), and the expand/collapse swap. Click-to-focus a card recentres the main view, and the secondary never becomes the primary (`SelfOverview` is not swappable). The overview is a clean disk of dots (labels off). [canvas-minimap]
+status:: done
+implements:: [[code:hiker/graph_view/minimap/impl#[Minimap]ui_for]], [[code:hiker/graph_view/minimap/impl#[Minimap]overview_engine]]
+touches:: [[code:hiker/panels/canvas]]
+note:: now shares the container/minimap seam: the canvas overview rides `Minimap::ui_for` over a host-owned `overview_engine` whose `positions` are the supplied card centres — the same chrome (corner placement, swap, indicator, focus-on-collapse) as the code-graph peer minimap. Behaviour preserved: supplied positions, viewport indicator, focus-on-click, never-becomes-primary. Code tags `canvas-minimap` / `container-tab` · evidence: `widgets/graph-view/src/graph_view/minimap.rs` (`overview_engine`, `ui_for`, `SelfOverview` host path)
 - **Level-of-detail placeholder.** Below a readable on-screen size a card skips the content engine and paints a cheap placeholder — a one-line title (file basename / first text line / link host) plus skeleton bars — keeping a zoomed-out many-document canvas smooth (geometric culling alone leaves every card "visible" at fit). A placeholder has no scrollable content, so a wheel over one passes through to camera zoom ([[spec:canvas-card-scroll]]). [canvas-lod-placeholder]
 status:: done
 note:: below ~150px on-screen a card skips the content engine and paints a cheap title + skeleton placeholder; collapsed zoom-to-fit on 121 nodes from 81ms to 0.04ms/frame (profiled via `tools/profile-canvas`). A wheel over a placeholder (no scrollable content) passes through to camera zoom via the shared `is_tiny` check, so a tiny card crossing the cursor mid-zoom-out doesn't stall the zoom · evidence: `hiker-canvas/view/src/paint.rs` (`is_tiny`/`lod_title`/`paint_lod_placeholder`, `node_card` branch), `hiker-canvas/view/src/widget.rs` (`handle_zoom` wheel routing)
@@ -123,8 +128,25 @@ note:: Select (default) / Hand toolbar toggle + `V`/`H` keys (guarded against ty
 status:: done
 touches:: [[code:hiker/widget/pointer]]
 note:: click / shift-click / marquee; multi-select group move+delete. Selecting a group folds its geometric members into the selection at select-time (they paint as selected), so the move-set is visible and decided once · evidence: `hiker-canvas/view-core/src/state.rs`, `src/widget/pointer.rs`, `interaction.rs` (`group_member_ids` fold)
-- **Move.** Drag a selection to reposition. A group node is grabbed by its **label/header strip** (a band along its top edge) rather than its interior, so a drag inside the frame still targets the framed children. Selecting a group folds in its geometric members (the nodes whose bounds sit inside the group's rect) at *select-time*, so the selection visibly shows everything that will move; the moved set is exactly that frozen selection and is never recomputed mid-drag, so dragging a group past another group never grabs the other's cards. [canvas-node-move, canvas-group-move, canvas-group-grab, canvas-selection]
-- **Resize.** Eight handles on a single selected node — including group nodes — rewrite `width`/`height` (and `x`/`y` for top/left handles). Resizing a group reframes the container only; its members keep their positions. [canvas-node-resize, canvas-group-resize]
+- **Move.** Drag a selection to reposition. [canvas-node-move]
+status:: done
+touches:: [[code:hiker/interaction]]
+  - **Group move.** Selecting a group folds in its geometric members (the nodes whose bounds sit inside the group's rect) at *select-time*, so the selection visibly shows everything that will move; the moved set is exactly that frozen selection and is never recomputed mid-drag, so dragging a group past another group never grabs the other's cards. [canvas-group-move]
+status:: done
+touches:: [[code:hiker/interaction]]
+note:: the move-set is exactly the selection (group members folded in at select-time, via [[spec:canvas-selection]]), frozen at drag-start and never recomputed mid-drag, so dragging a group past another never grabs the other's cards (tests: `group_member_ids_returns_contained_nodes_only`, `moving_a_frozen_set_does_not_touch_unselected_nodes`) · evidence: `hiker-canvas/view-core/src/interaction.rs` (`group_member_ids` at select-time, `move_selection` over the frozen set)
+  - **Group grab.** A group node is grabbed by its **label/header strip** (a band along its top edge) rather than its interior, so a drag inside the frame still targets the framed children; a press on the group's top header band targets the group (checked before the top-most hit-test in `resolve_target`), and the grab carries members via [[spec:canvas-group-move]]. [canvas-group-grab]
+status:: done
+touches:: [[code:hiker/interaction]]
+note:: evidence: `canvas-view-core/src/interaction.rs` (`group_header_hit`, `GROUP_HEADER_H`)
+- **Resize.** Eight handles on a single selected node rewrite `width`/`height` (and `x`/`y` for top/left handles). [canvas-node-resize]
+status:: done
+touches:: [[code:hiker/handles]]
+note:: eight handles rewrite width/height (+x/y for top/left; tests)
+  - **Group resize.** A singly-selected group — group exclusions removed — shows and resizes via the same eight handles, reframing only the container; its members keep their positions. [canvas-group-resize]
+status:: done
+touches:: [[code:hiker/interaction]]
+note:: removed the group exclusions; a singly-selected group shows + resizes via the eight handles, reframing only the container (members keep position; tests) · evidence: `canvas-view-core/src/interaction.rs` (`single_selected_handle`), `canvas-view/src/widget.rs` (`paint_overlays`)
 - **Hover affordance on handles.** When the pointer is in range of an interactive handle it gets a subtle hover indicator so the grab target is obvious before pressing: a resize handle and a connector handle grow slightly under the cursor, and a group's header grab-strip ([[spec:canvas-group-grab]]) highlights (a brighter band) on hover. Pure visual feedback driven by the same hit-tests the press path uses — no state change. [canvas-handle-hover]
 status:: done
 touches:: [[code:hiker/handles]]
@@ -134,7 +156,14 @@ status:: done
 implements:: [[code:hiker/panels/canvas/render/link_prompt_body]]
 touches:: [[code:hiker/widgets/split_button]]
 note:: toolbar create control is a `+` split-button ([[spec:split-add-button]]): primary `+` mints a new vault note ([[spec:canvas-new-note]]); caret dropdown offers Add text / Insert from vault… / Add link… / Add group. One-click drop at viewport center + auto-select; Text/Group immediate, Link via inline URL prompt; `insert_node_centered` is the primitive the vault-insert path reuses. Select/Hand toggle sits beside it; Fit moved to the View menu ([[spec:canvas-view-toggle]]) · evidence: `hiker-canvas/view/src/widget.rs` (`create_centered`/`insert_node_centered`/`consume_pending`), `app/src/panels/canvas/render.rs` (`create_toolbar`), `app/src/widgets/split_button.rs`
-  - **Insert from vault** opens an autocomplete picker (`autocomplete.md`) over vault notes + sources; choosing one drops a *file-node pointer* (vault path only, never content) rendering the referenced content. A right-click **Add to canvas** verb on a file-tree row or multi-selection does the same against a chosen target canvas ([[spec:board-add-card]] shape); file-tree drag is deferred ([[spec:canvas-dnd-add]]). [canvas-insert-from-vault, canvas-add-to-canvas-verb]
+  - **Insert from vault** opens an autocomplete picker (`autocomplete.md`) over vault notes + sources; choosing one drops a *file-node pointer* (vault path only, never content) rendering the referenced content. [canvas-insert-from-vault]
+status:: done
+touches:: [[code:hiker/panels/canvas]], [[code:hiker/panels/canvas/render]]
+note:: "Insert from vault" toolbar button → autocomplete picker ([[spec:autocomplete-picker-widget]] over `VaultSource` NotesAndSources) → drops a `File` pointer at center via `insert_node_centered`; stores the vault path, never the content · evidence: `app/src/panels/canvas/render.rs` (`insert_from_vault`/`file_node`), `app/src/panels/canvas/mod.rs` (`insert_picker: PickerState`)
+  - **Add to canvas** is a right-click verb on a file-tree row or multi-selection that does the same against a chosen target canvas ([[spec:board-add-card]] shape); file-tree drag is deferred ([[spec:canvas-dnd-add]]). [canvas-add-to-canvas-verb]
+status:: done
+implements:: [[code:hiker/files/sidebar/FileVerb#AddToCanvas#canvas_rel]], [[code:hiker/files/sidebar/canvas_glyph_marker]], [[code:hiker/panels/canvas/show]], [[code:hiker/panels/canvas/list_canvases]]
+note:: right-click a vault row → pick a target canvas → appends a `File` pointer via the op-log `user_save` path (works whether the canvas is open or not); mirrors [[spec:board-add-card]] (single-row, matching the board verb; bulk awaits [[spec:note-multi-select]]) · evidence: `app/src/files/sidebar.rs` (`FileVerb::AddToCanvas` + "Add to canvas…" submenu), `app/src/panels/canvas/mod.rs` (`add_file_node`/`list_canvases`)
   - **New note** mints a fresh vault note (shared `create_new_note` — suffix-counted `new-note-N.md`, indexed, no tab) and drops a `File` pointer ready to inline-edit. Three entry points: the `+` primary click, a right-click empty-canvas **New note** verb, and **Cmd/Ctrl+N** while a canvas tab is active (Cmd/Ctrl+N elsewhere opens a new note in a tab). [canvas-new-note]
 status:: done
 implements:: [[code:hiker/keybinds/impl#[AppState]handle_keybinds]], [[code:hiker/panels/canvas/add_file_node]], [[code:hiker/panels/canvas/render/render_overview]]
@@ -145,8 +174,25 @@ note:: right-click empty-canvas "New note" verb + Cmd/Ctrl+N (when a canvas tab 
 status:: done
 touches:: [[code:hiker/widget/pointer]]
 note:: "Add group" (toolbar + context menu) arms a one-shot draw; the next empty drag rubber-bands the rect (live preview in `paint_drag_overlay`) and creates the group on release (normalized, min-size clamped); a bare click drops a default-sized frame · evidence: `canvas-view/src/widget/pointer.rs` (`on_press`/`finish_group_draw`/`on_click`), `canvas-view-core/src/state.rs` (`add_group_op`/`normalize_draw_rect`, `Interaction::DrawGroup`)
-- **Edges.** Hovering (or selecting) a node reveals four connector handles — small circles floating just outside its edges, clear of the resize handles. Clicking one starts a click-to-connect gesture (a rubber band tracks the cursor); the next click on a node attaches the edge. Press-dragging a handle connects the same way in one gesture; dragging an existing edge endpoint re-anchors it to a different node/side; dropping on empty canvas cancels. Double-clicking an edge opens an inline label field at its midpoint. [canvas-edge-draw, canvas-edge-redirect, canvas-edge-label]
-- **Card content: scroll & zoom.** A card is a fixed window into its content, *decoupled from camera zoom* — the body renders at a per-card content zoom (font multiplier, default 100%) so text stays readable at any board zoom. The wheel over a card scrolls its content (clamped to content height); over empty canvas it zooms the camera. Scroll position is stable across content changes. Per-card zoom is adjusted from the card's right-click menu (Zoom in / out / Reset) or Ctrl/Cmd+wheel. [canvas-card-scroll, canvas-card-zoom]
+- **Edges.** Hovering (or selecting) a node reveals four connector handles — small circles floating just outside its edges, clear of the resize handles. Clicking one starts a click-to-connect gesture (a rubber band tracks the cursor); the next click on a node attaches the edge. Press-dragging a handle connects the same way in one gesture; dropping on empty canvas cancels. [canvas-edge-draw]
+status:: done
+touches:: [[code:hiker/interaction]], [[code:hiker/widget/pointer]]
+note:: hovered/selected nodes show four visible connector circles (offset just outside the card, clear of the resize handles). Clicking one starts a click-to-connect gesture (a rubber band follows the cursor); the next click on a node attaches the edge. Press-dragging a handle also connects (drag-to-connect), and drop-on-empty cancels (tests). Paint/hit positions are kept in sync by a shared `CONNECTOR_OFFSET` (regression test) · evidence: `hiker-canvas/view-core/src/interaction.rs`, `src/paint.rs` (`connector_handles`), `src/widget/pointer.rs`
+  - **Re-anchor.** Dragging an existing edge endpoint re-anchors it to a different node/side. [canvas-edge-redirect]
+status:: done
+touches:: [[code:hiker/interaction]]
+  - **Label.** Double-clicking an edge opens an inline label field at its midpoint. [canvas-edge-label]
+status:: done
+touches:: [[code:hiker/widget/pointer]]
+note:: double-click an edge → inline label `TextEdit` at the edge midpoint (foreground area above the interaction surface); Enter / click-outside commits a `SetEdgeLabel`, Esc cancels; the label paints at the spline midpoint ([[spec:canvas-edge-routing]]) · evidence: `hiker-canvas/core/src/ops.rs` (`EditOp::SetEdgeLabel`), `hiker-canvas/view/src/widget.rs` (`draw_label_editor`), `src/widget/pointer.rs`
+- **Card content: scroll.** A card is a fixed window into its content. The wheel over a card scrolls its content (clamped to content height); over empty canvas it zooms the camera. Scroll position is stable across content changes. [canvas-card-scroll]
+status:: done
+touches:: [[code:hiker/panels/canvas/content]]
+note:: Wheel while the pointer is over a card scrolls that card's content (the editor's native `scroll_y`, clamped to content height and echoed back as the effective offset); wheel over empty canvas zooms the camera. A card's scroll is stable across content changes — typing in a tab on the same note doesn't reset the card's scroll. Editor-backed cards (markdown / text / code) scroll; html/image embeds keep their own scroll (follow-up) · evidence: `hiker-canvas/view/src/widget.rs` (`handle_zoom`), `app/src/panels/canvas/content.rs` (editor `scroll_y`)
+  - **Card content: zoom.** The body renders at a per-card content zoom (font multiplier, default 100%), *decoupled from camera zoom* so text stays readable at any board zoom. Per-card zoom is adjusted from the card's right-click menu (Zoom in / out / Reset) or Ctrl/Cmd+wheel. [canvas-card-zoom]
+status:: done
+touches:: [[code:hiker/content]], [[code:hiker/panels/canvas/content]]
+note:: Per-card content zoom (font multiplier), **decoupled from camera zoom** so text stays readable at any board zoom — the card is a fixed window, not a thing that scales with the camera. Adjusted via the card's right-click **Zoom in / out / Reset** menu or Ctrl/Cmd+wheel over the card; default 1.0, clamped 0.3–4.0. Carried to the content engine as `content::CardView { zoom, scroll_y }` · evidence: `hiker-canvas/view/src/content.rs` (`CardView`), `hiker-canvas/view/src/widget.rs` (menu + wheel), `app/src/panels/canvas/content.rs` (`paint_editor` font)
 - **Inline editing.** Cards are editable in place (read-only by default). **Enter edit mode** via one seam (`try_enter_edit`, only on an editable full-detail card) by three gestures: **double-click**; **click an already-sole-selected node** (Finder-rename click-again, via the widget's `edit_requested`); or **Enter / F2 with a single editable node selected** (only when no field holds focus, so it can't steal Enter from the edge-label editor). The body becomes a focused editor capturing keyboard + pointer (an overlay tracking the node's screen rect on pan/zoom), opened at the current scroll position, with a **bright accent outline** marking the active editor. Exits on Esc, click outside, selecting another node, or scrolling off-screen. Two write paths by kind: [canvas-inline-edit]
 status:: done
 implements:: [[code:hiker/panels/canvas/edit/is_editable]], [[code:hiker/panels/canvas/edit/press_outside]], [[code:hiker/panels/canvas/content/Engine#live_text]], [[code:hiker/panels/canvas/render/resolve_edit_overlay]], [[code:hiker/panels/canvas/render/persist_canvas]], [[code:hiker/panels/canvas/render/handle_canvas_save]]
@@ -254,6 +300,11 @@ note:: `activity_bar_plan.md` Phase 3. Left-bar activity (canvas icon) whose sin
 A left-bar **Canvases** activity whose single view lists every `.canvas` document in the vault (vault-relative, sorted), each row a clickable title with a hover-expandable thumbnail preview ([[spec:preview-canvas-thumbnail]]). Clicking a row defers `panels::canvas::open` — the same opener the file tree uses — so the canvas appears in the existing `TabKind::Canvas` tab rather than a new tab kind. The listing is read fresh from disk each frame, so the activity is effectively stateless: a zero-field `State` marker keeps the registry's per-activity state seam uniform.
 touches:: [[code:hiker/canvas_activity/render_body]], [[code:hiker/canvas_activity/State]], [[code:hiker/canvas_activity/CanvasActivity]], [[code:hiker/canvas_activity/CanvasListView]], [[code:hiker/canvas_activity/impl#[CanvasActivity][`Activity<dyn AppCtx + 'static>`]id]], [[code:hiker/canvas_activity/impl#[CanvasActivity][`Activity<dyn AppCtx + 'static>`]label]], [[code:hiker/canvas_activity/impl#[CanvasActivity][`Activity<dyn AppCtx + 'static>`]icon]], [[code:hiker/canvas_activity/impl#[CanvasActivity][`Activity<dyn AppCtx + 'static>`]views]], [[code:hiker/canvas_activity/impl#[CanvasListView][`View<dyn AppCtx + 'static>`]id]], [[code:hiker/canvas_activity/impl#[CanvasListView][`View<dyn AppCtx + 'static>`]render]]
 
+A plain `+` button in the activity's side-bar header creates a new canvas: clicking it calls `AppState::new_canvas` ([[spec:canvas-create]]) — seeds an empty `.canvas` and opens it framed. It is a bare `Plus` `ImageButton`, NOT a [[spec:split-add-button]] dropdown. [canvas-activity-new-button]
+status:: done
+touches:: [[code:hiker/workbench_host]]
+note:: evidence: `app/src/workbench_host.rs` (`side_bar_action_buttons`, `"canvases"` branch)
+
 **Indexing.** A `.canvas` file is an op-log document (synced, versioned) but is **not** markdown-chunked — the indexer still ignores it for semantic/lexical search per `index.md`'s non-markdown tolerance. Making text-node contents searchable is deferred ([[spec:canvas-search-index]]).
 
 
@@ -268,10 +319,6 @@ note:: deferred: drop a file row / multi-selection onto the canvas to create poi
 - **Navigate to a node.** A `NavTarget` that focuses a specific node id (Back/Forward into a canvas location, deep-linking a node), extending `nav-stack` beyond file granularity. [canvas-node-nav-target]
 status:: planned
 note:: deferred: `NavTarget` focusing a specific node id (deep-link / Back-Forward into a node)
-- **Minimap / overview.** A corner minimap of the whole canvas for orientation on large boards, reusing the texture-backed minimap renderer. [canvas-minimap]
-status:: planned
-implements:: [[code:hiker/panels/canvas/render/canvas_body]]
-note:: deferred: corner minimap for large canvases, reusing the texture-backed minimap renderer
 - **Routed edges after auto-arrange.** Optional orthogonal edge routing, reusing the layered engine's poly-line routes ([[spec:graph-routed-edges]]) so an auto-arranged canvas can draw its connectors along the computed ranks rather than as direct curves. [canvas-routed-edges]
 status:: planned
 note:: deferred: optional orthogonal edge routing after auto-arrange, reusing the layered engine's poly-line routes ([[spec:graph-routed-edges]]) instead of direct curves
@@ -288,58 +335,3 @@ note:: deferred: MCP read + curate surface (`canvas_get`/`canvas_list` + write v
 - **Real-time multi-cursor presence.** There is no live shared-cursor session; concurrent editing across machines is whatever the user's file-sync or git does, not a real-time channel this doc owns.
 - **Live web rendering / external fetch.** A canvas never fetches and renders an external web page; link nodes are open-externally cards. Vault-internal `.html` is the only HTML a canvas renders, through `hiker-htmlview`.
 - **Frontmatter / note metadata on a canvas.** The `.canvas` file is pure JSON Canvas; hiker-namespaced metadata (tags, lifecycle) is not modeled on it in v1.
-
-## Registry imports (from status.md)
-
-Entries imported from the retired status registry that had no anchor in this doc —
-re-home them into the relevant sections as the doc evolves.
-
-- **canvas-node-move** — drag-move a selection [canvas-node-move]
-  status:: done
-  touches:: [[code:hiker/interaction]]
-- **canvas-group-move** — the move-set is exactly the selection (group members folded in at select-time, via [[spec:canvas-selection]]), frozen at drag-start and never recomputed mid-drag, so dragging a group past another never grabs the other's cards (tests: `group_member_ids_returns_contained_nodes_only`, `moving_a_frozen_set_does_not_touch_unselected_nodes`) [canvas-group-move]
-  status:: done
-  touches:: [[code:hiker/interaction]]
-  note:: evidence: `hiker-canvas/view-core/src/interaction.rs` (`group_member_ids` at select-time, `move_selection` over the frozen set)
-- **canvas-node-resize** — eight handles rewrite width/height (+x/y for top/left; tests) [canvas-node-resize]
-  status:: done
-  touches:: [[code:hiker/handles]]
-- **canvas-insert-from-vault** — "Insert from vault" toolbar button → autocomplete picker ([[spec:autocomplete-picker-widget]] over `VaultSource` NotesAndSources) → drops a `File` pointer at center via `insert_node_centered`; stores the vault path, never the content [canvas-insert-from-vault]
-  status:: done
-  touches:: [[code:hiker/panels/canvas]], [[code:hiker/panels/canvas/render]]
-  note:: evidence: `app/src/panels/canvas/render.rs` (`insert_from_vault`/`file_node`), `app/src/panels/canvas/mod.rs` (`insert_picker: PickerState`)
-- **canvas-add-to-canvas-verb** — right-click a vault row → pick a target canvas → appends a `File` pointer via the op-log `user_save` path (works whether the canvas is open or not); mirrors [[spec:board-add-card]] (single-row, matching the board verb; bulk awaits [[spec:note-multi-select]]) [canvas-add-to-canvas-verb]
-  status:: done
-  implements:: [[code:hiker/files/sidebar/FileVerb#AddToCanvas#canvas_rel]], [[code:hiker/files/sidebar/canvas_glyph_marker]], [[code:hiker/panels/canvas/show]], [[code:hiker/panels/canvas/list_canvases]]
-  note:: evidence: `app/src/files/sidebar.rs` (`FileVerb::AddToCanvas` + "Add to canvas…" submenu), `app/src/panels/canvas/mod.rs` (`add_file_node`/`list_canvases`)
-- **canvas-activity-new-button** — Plain `+` button (a `Plus` `ImageButton`, NOT a [[spec:split-add-button]] dropdown) in the Canvases activity side-bar header: clicking it calls `AppState::new_canvas` ([[spec:canvas-create]]) — seeds an empty `.canvas` and opens it framed [canvas-activity-new-button]
-  status:: done
-  touches:: [[code:hiker/workbench_host]]
-  note:: evidence: `app/src/workbench_host.rs` (`side_bar_action_buttons`, `"canvases"` branch)
-- **canvas-edge-draw** — hovered/selected nodes show four visible connector circles (offset just outside the card, clear of the resize handles). Clicking one starts a click-to-connect gesture (a rubber band follows the cursor); the next click on a node attaches the edge. Press-dragging a handle also connects (drag-to-connect), and drop-on-empty cancels (tests). Paint/hit positions are kept in sync by a shared `CONNECTOR_OFFSET` (regression test) [canvas-edge-draw]
-  status:: done
-  touches:: [[code:hiker/interaction]], [[code:hiker/widget/pointer]]
-  note:: evidence: `hiker-canvas/view-core/src/interaction.rs`, `src/paint.rs` (`connector_handles`), `src/widget/pointer.rs`
-- **canvas-edge-redirect** — drag an existing edge endpoint to re-anchor it [canvas-edge-redirect]
-  status:: done
-  touches:: [[code:hiker/interaction]]
-- **canvas-edge-label** — double-click an edge → inline label `TextEdit` at the edge midpoint (foreground area above the interaction surface); Enter / click-outside commits a `SetEdgeLabel`, Esc cancels; the label paints at the spline midpoint ([[spec:canvas-edge-routing]]) [canvas-edge-label]
-  status:: done
-  touches:: [[code:hiker/widget/pointer]]
-  note:: evidence: `hiker-canvas/core/src/ops.rs` (`EditOp::SetEdgeLabel`), `hiker-canvas/view/src/widget.rs` (`draw_label_editor`), `src/widget/pointer.rs`
-- **canvas-card-scroll** — Wheel while the pointer is over a card scrolls that card's content (the editor's native `scroll_y`, clamped to content height and echoed back as the effective offset); wheel over empty canvas zooms the camera. A card's scroll is stable across content changes — typing in a tab on the same note doesn't reset the card's scroll. Editor-backed cards (markdown / text / code) scroll; html/image embeds keep their own scroll (follow-up) [canvas-card-scroll]
-  status:: done
-  touches:: [[code:hiker/panels/canvas/content]]
-  note:: evidence: `hiker-canvas/view/src/widget.rs` (`handle_zoom`), `app/src/panels/canvas/content.rs` (editor `scroll_y`)
-- **canvas-card-zoom** — Per-card content zoom (font multiplier), **decoupled from camera zoom** so text stays readable at any board zoom — the card is a fixed window, not a thing that scales with the camera. Adjusted via the card's right-click **Zoom in / out / Reset** menu or Ctrl/Cmd+wheel over the card; default 1.0, clamped 0.3–4.0. Carried to the content engine as `content::CardView { zoom, scroll_y }` [canvas-card-zoom]
-  status:: done
-  touches:: [[code:hiker/content]], [[code:hiker/panels/canvas/content]]
-  note:: evidence: `hiker-canvas/view/src/content.rs` (`CardView`), `hiker-canvas/view/src/widget.rs` (menu + wheel), `app/src/panels/canvas/content.rs` (`paint_editor` font)
-- **canvas-group-grab** — a press on the group's top header band targets the group (checked before the top-most hit-test in `resolve_target`), so a body press still hits framed children; carries members via [[spec:canvas-group-move]] [canvas-group-grab]
-  status:: done
-  touches:: [[code:hiker/interaction]]
-  note:: evidence: `canvas-view-core/src/interaction.rs` (`group_header_hit`, `GROUP_HEADER_H`)
-- **canvas-group-resize** — removed the group exclusions; a singly-selected group shows + resizes via the eight handles, reframing only the container (members keep position; tests) [canvas-group-resize]
-  status:: done
-  touches:: [[code:hiker/interaction]]
-  note:: evidence: `canvas-view-core/src/interaction.rs` (`single_selected_handle`), `canvas-view/src/widget.rs` (`paint_overlays`)

@@ -77,6 +77,10 @@ note:: `app/src/activity/mod.rs` (`ActivityBarItem`, `#[allow(dead_code)]`) + `a
 status:: planned
 note:: `app/src/activity/mod.rs` (`PaletteCommand`, `#[allow(dead_code)]`). Data shape defined; `Activity::command_palette` default returns empty; palette consumer unfinished ([[spec:command-palette]] in `editor.md`)
 
+The trait carries the whole v1 surface set — sidebar / panel / hamburger / activity-bar / command-palette — additively: each surface is opt-out via a `None`-returning default, so an activity declares only the surfaces it uses. The set is convention, not enforced. [feature-surface-additive]
+status:: done
+note:: `app/src/activity/mod.rs` — trait carries the v1 surface set (sidebar / panel / hamburger / activity-bar / command-palette), each opt-out via `None`. Convention only
+
 The trait is object-safe over heterogeneous activities because `C` is erased to a trait object (`dyn AppCtx`) and no trait method is generic — per-activity state is reached through `C`'s own accessors (hiker's `SurfaceCtx`, below), not a generic on the trait.
 
 ## `AppCtx`, `SurfaceCtx`, and requirement traits
@@ -128,6 +132,23 @@ touches:: [[code:hiker/bootstrap]]
 note:: `ActivityRegistry<dyn AppCtx>` (the shell's `ActivityRegistry<C>`: `build`/`iter`/`by_id`/`invoke`) is built at `app/src/bootstrap.rs` and stashed on `AppState::activities`; the app's concrete twin is gone
 - **Lookup is `O(N)`** over a small N (~5–15) — no hashmap; callers walk the list.
 - **Lifetime is per-session** — vault swap rebuilds it; activities hold descriptors, not per-vault state.
+
+The shell surfaces consume the registry generically rather than hardcoding each activity:
+
+- **Sidebar mode switcher** resolves each migrated mode's icon/label from the registry; the body still renders via `panels_registry` while the `SidebarSurface` impls are stubs ([[spec:feature-surface-sidebar]]). [feature-consumer-sidebar]
+  status:: partial
+  touches:: [[code:hiker/workbench_host]]
+  note:: `app/src/workbench_host.rs:316` + `app/src/activity/mod.rs:103`. Sidebar mode switcher resolves icon/label from the registry for migrated ids; the body still renders via `panels_registry` (the `SidebarSurface` impls are stubs, per [[spec:feature-surface-sidebar]])
+- **Activity bar** builds its visible list by iterating the registry and filtering `Activity::on_activity_bar()` — no longer the hardcoded `HikerMode::all()`. [feature-consumer-activity-bar]
+  status:: partial
+  touches:: [[code:hiker/workbench_host]]
+  note:: `app/src/workbench_host.rs` (`activity_items`). Visible list is built by iterating the registry and filtering `Activity::on_activity_bar()` — no longer the hardcoded `HikerMode::all()`; each item's id/icon/label come straight from the registered `Activity`. The `ActivityBarItem` override is defined (`#[allow(dead_code)]`) but no activity implements it and `activity_items` does not yet consult it, so per-item overrides / badges are unfilled
+- **Toolbar hamburger** iterates the registry's `hamburger()` entries; it becomes functional once an activity implements `HamburgerEntry` (none do yet, per [[spec:feature-surface-hamburger]]). [feature-consumer-hamburger]
+  status:: partial
+  touches:: [[code:hiker/toolbar]]
+  note:: `app/src/toolbar.rs:574` iterates `registry … f.hamburger()`; functional once an activity implements `HamburgerEntry` (none do yet, per [[spec:feature-surface-hamburger]])
+- **Command palette** (Phase 2) pulls feature commands at palette-open time via `Activity::command_palette` ([[spec:command-palette]]). [feature-consumer-command-palette]
+  status:: planned
 
 ## Two-tier feature placement
 
@@ -182,6 +203,9 @@ note:: `egui-workbench/src/side_panel_stack.rs` — VSCode-style accordion. `Sid
 - **Collapse** is per-section via a twistie; headers are uniform (no per-section focus highlight, no `+`/`…` buttons — the right-click menu is the single entry point).
 - **Persistence is per-vault** — section set + collapse + per-mode weights + focus + visibility persist to `.hiker/side-panel.json` (`app/src/side_panel_persist.rs`), decoupled from the editor dock layout (`.hiker/layout.json`).
 - **No new trait surface** — an activity already declares `views()`; the stack renders one section per open view.
+- **One accordion, no inner collapsible** — a feature panel body renders its content directly under the accordion section header; the Related/Backlinks/Search panels no longer wrap their results in a second `collapsible_header` (that module is removed), and the `search.sections.*_expanded` settings are now inert. [feature-panel-single-accordion]
+  status:: done
+  note:: evidence: `app/src/panels/{related,backlinks,search}.rs`
 
 `SidePanelStack` lives in `egui_workbench` (pure UI-shell mechanics) so a second consumer gets the same accordion from one implementation.
 
@@ -218,7 +242,31 @@ Gated behind the substrate refactor landing first (`scratch/substrate_decision.m
 4. **Shell batteries** — filetree/find-replace/hex view land in `egui_workbench` as capability-trait-pure, feature-gated activities.
 5. **Crawler adopts the shell**, validating each shared seam.
 
-The per-feature `app/src/features/<x>/` regrouping ([[spec:feature-boards-migration]], [[spec:feature-search-migration]], [[spec:feature-related-migration]], [[spec:feature-backlinks-migration]], [[spec:feature-home-migration]], [[spec:feature-vault-graph-migration]], [[spec:feature-chat-migration]]) is a separate, deferred pass: each relocates a panel into its tier-2 home implementing `Activity<dyn AppCtx>` without changing the registry seam, so it rides after the registry-unify rather than within it.
+Two Phase-2 features already moved their state onto `AppState` and registered an `Activity`:
+
+- **Clusters** — state on `AppState::clusters_state`; the `Clusters` activity is registered and its activity-bar icon/label resolve from the registry. [feature-cluster-migration]
+  status:: partial
+  note:: `app/src/clusters/{mod,state,sidebar,panel}.rs` + `builtin_activities`. State on `AppState::clusters_state`; `Clusters` Feature registered; activity-bar icon/label resolve from the registry. **Gap:** `SidebarSurface` body is a stub — live rendering still routes through `panels_registry`; cluster-review tab still via `TabKind::ClusterReview`
+- **Trails** — a `Trails` activity with a real sidebar `View`, transient UI state on `AppState::trails_state`, and the trails read/mutated live through core ops (no parallel `.hiker/trails.json` model). [feature-trails-migration]
+  status:: done
+  note:: `app/src/trails/{mod,state,sidebar,bridge}.rs`. `Trails` Activity (`impl Activity` with a real sidebar `View` rendering `sidebar::TrailsCtx`) + `trails_state` (transient UI state only) on `AppState`. The parallel `.hiker/trails.json` model is gone (drafts removed 2026-06-05); the sidebar reads trails live via `core::trails::list`/`get_trail` and mutates via core ops through `bridge.rs` (`create_trail`/`append_waypoint`/`remove_waypoint`/`set_append_cursor`/`delete_trail`). Sidebar-only in v1 (no `panel.rs`)
+
+The remaining per-feature `app/src/features/<x>/` regrouping is a separate, deferred Phase-3 pass: each relocates a panel into its tier-2 home implementing `Activity<dyn AppCtx>` without changing the registry seam, so it rides after the registry-unify rather than within it.
+
+- **Boards** — full `app/src/boards/{state,panel,actions,mod}.rs` replacing the Phase-2 shim; `panels/board.rs` (1160 LOC) + `panels/boards_index.rs` (129 LOC) move; `boards: HashMap<TabId, Pane>` moves off `PanelStates`. [feature-boards-migration]
+  status:: planned
+- **Search** — `app/src/search/{state,panel,mod}.rs`; `panels/search.rs` (1005 LOC) moves; `search: State` moves off `PanelStates`. [feature-search-migration]
+  status:: planned
+- **Related** — `app/src/related/{state,panel,mod}.rs`; `panels/related.rs` (203 LOC) moves; `related: State` moves off `PanelStates`. [feature-related-migration]
+  status:: planned
+- **Backlinks** — `app/src/backlinks/{state,panel,mod}.rs`; `panels/backlinks.rs` (157 LOC) moves; `backlinks: State` moves off `PanelStates`. [feature-backlinks-migration]
+  status:: planned
+- **Home** — `app/src/home/{state,panel,mod}.rs`; `panels/home.rs` moves; the vault home `State` moves off `PanelStates`; activity-bar item registered. [feature-home-migration]
+  status:: planned
+- **Vault graph** — `app/src/vault_graph/{state,panel,mod}.rs`; `panels/graph.rs` moves; the `graph: Option<State>` moves off `PanelStates`. Named `vault_graph` to avoid collision with `clusters/panel/cluster_graph.rs`. [feature-vault-graph-migration]
+  status:: planned
+- **Chat** — `app/src/chat/` becomes a feature with both a sidebar surface (the docked chat region today on the right) and a panel surface (the agent tab), so chat can be placed anywhere via the registry, not just the right-docked region; the legacy `chat_dock: ChatDockState` field on `PanelStates` deletes as part of this slug. [feature-chat-migration]
+  status:: planned
 
 ## Constraints
 
@@ -244,43 +292,3 @@ The per-feature `app/src/features/<x>/` regrouping ([[spec:feature-boards-migrat
 
 - `docs/editor.md` — sidebar mode switcher ([[spec:sidebar-mode-switcher]]), activity bar (`activity-bar-*`), command palette ([[spec:command-palette]]), keybind registry ([[spec:keybind-registry]]). All are registry consumers.
 - `docs/cluster-editor.md` — the cluster editor surface in `app/src/features/clusters/`.
-
-## Registry imports (from status.md)
-
-Entries imported from the retired status registry that had no anchor in this doc —
-re-home them into the relevant sections as the doc evolves.
-
-- **feature-surface-additive** — `app/src/activity/mod.rs` — trait carries the v1 surface set (sidebar / panel / hamburger / activity-bar / command-palette), each opt-out via `None`. Convention only [feature-surface-additive]
-  status:: done
-- **feature-cluster-migration** — `app/src/clusters/{mod,state,sidebar,panel}.rs` + `builtin_activities`. State on `AppState::clusters_state`; `Clusters` Feature registered; activity-bar icon/label resolve from the registry. **Gap:** `SidebarSurface` body is a stub — live rendering still routes through `panels_registry`; cluster-review tab still via `TabKind::ClusterReview` [feature-cluster-migration]
-  status:: partial
-- **feature-trails-migration** — `app/src/trails/{mod,state,sidebar,bridge}.rs`. `Trails` Activity (`impl Activity` with a real sidebar `View` rendering `sidebar::TrailsCtx`) + `trails_state` (transient UI state only) on `AppState`. The parallel `.hiker/trails.json` model is gone (drafts removed 2026-06-05); the sidebar reads trails live via `core::trails::list`/`get_trail` and mutates via core ops through `bridge.rs` (`create_trail`/`append_waypoint`/`remove_waypoint`/`set_append_cursor`/`delete_trail`). Sidebar-only in v1 (no `panel.rs`) [feature-trails-migration]
-  status:: done
-- **feature-consumer-hamburger** — `app/src/toolbar.rs:574` iterates `registry … f.hamburger()`; functional once an activity implements `HamburgerEntry` (none do yet, per [[spec:feature-surface-hamburger]]) [feature-consumer-hamburger]
-  status:: partial
-  touches:: [[code:hiker/toolbar]]
-- **feature-consumer-activity-bar** — `app/src/workbench_host.rs` (`activity_items`). Visible list is built by iterating the registry and filtering `Activity::on_activity_bar()` — no longer the hardcoded `HikerMode::all()`; each item's id/icon/label come straight from the registered `Activity`. The `ActivityBarItem` override is defined (`#[allow(dead_code)]`) but no activity implements it and `activity_items` does not yet consult it, so per-item overrides / badges are unfilled [feature-consumer-activity-bar]
-  status:: partial
-  touches:: [[code:hiker/workbench_host]]
-- **feature-consumer-sidebar** — `app/src/workbench_host.rs:316` + `app/src/activity/mod.rs:103`. Sidebar mode switcher resolves icon/label from the registry for migrated ids; the body still renders via `panels_registry` (the `SidebarSurface` impls are stubs, per [[spec:feature-surface-sidebar]]) [feature-consumer-sidebar]
-  status:: partial
-  touches:: [[code:hiker/workbench_host]]
-- **feature-consumer-command-palette** — Phase 2: command palette ([[spec:command-palette]]) pulls feature commands at palette-open time via `Activity::command_palette` [feature-consumer-command-palette]
-  status:: planned
-- **feature-boards-migration** — Phase 3: full `app/src/boards/{state,panel,actions,mod}.rs` replacing the Phase 2 shim; `panels/board.rs` (1160 LOC) + `panels/boards_index.rs` (129 LOC) move; `boards: HashMap<TabId, Pane>` field moves off `PanelStates` [feature-boards-migration]
-  status:: planned
-- **feature-search-migration** — Phase 3: `app/src/search/{state,panel,mod}.rs`; `panels/search.rs` (1005 LOC) moves; `search: State` field moves off `PanelStates` [feature-search-migration]
-  status:: planned
-- **feature-related-migration** — Phase 3: `app/src/related/{state,panel,mod}.rs`; `panels/related.rs` (203 LOC) moves; `related: State` field moves off `PanelStates` [feature-related-migration]
-  status:: planned
-- **feature-backlinks-migration** — Phase 3: `app/src/backlinks/{state,panel,mod}.rs`; `panels/backlinks.rs` (157 LOC) moves; `backlinks: State` field moves off `PanelStates` [feature-backlinks-migration]
-  status:: planned
-- **feature-home-migration** — Phase 3: `app/src/home/{state,panel,mod}.rs`; `panels/home.rs` moves; the vault home `State` field moves off `PanelStates`; activity-bar item registered [feature-home-migration]
-  status:: planned
-- **feature-vault-graph-migration** — Phase 3: `app/src/vault_graph/{state,panel,mod}.rs`; `panels/graph.rs` moves; the `graph: Option<State>` field moves off `PanelStates`. Named `vault_graph` to avoid collision with `clusters/panel/cluster_graph.rs` [feature-vault-graph-migration]
-  status:: planned
-- **feature-chat-migration** — Phase 3: `app/src/chat/` becomes a feature with both a sidebar surface (the docked chat region today on the right) and a panel surface (the agent tab). User can then place chat anywhere via the registry, not just the right-docked region. The legacy `chat_dock: ChatDockState` field on `PanelStates` deletes as part of this slug [feature-chat-migration]
-  status:: planned
-- **feature-panel-single-accordion** — Feature panel bodies render their content directly under the workbench accordion's section header — no inner `collapsible_header`. The Related/Backlinks/Search panels no longer wrap their results in a second collapsible (the old `discovery_pane::collapsible_header` + its module are removed). The `search.sections.*_expanded` settings are now inert [feature-panel-single-accordion]
-  status:: done
-  note:: evidence: `app/src/panels/{related,backlinks,search}.rs`

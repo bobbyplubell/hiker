@@ -150,6 +150,7 @@ impl AppCtx for crate::state::AppState {
             "source-control" => &mut app.source_control_state,
             "canvases" => &mut app.canvases_activity_state,
             "projects" => &mut app.projects_activity_state,
+            "specs" => &mut app.specs_state,
             _ => {
                 tracing::warn!(
                     state_key,

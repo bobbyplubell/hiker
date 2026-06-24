@@ -65,6 +65,9 @@ v1 is permissive about what's already in the user's vault. No "init" step rewrit
 
 **Frontmatter is optional and never auto-injected.** Hiker reads `hiker:`-namespaced frontmatter if present (currently unused at v1; reserved for tags, ids, and lifecycle flags as they land), strips frontmatter before chunking either way, and tolerates its complete absence. The indexer never writes to a user's `.md` file as a side effect of opening, viewing, or indexing it. Identity is the vault path ([[spec:op-log-path-identity]]), so the index needs no id written into the file; the `hiker.id` field in frontmatter only starts being written if an explicit user action ever requires a stable in-file id — none of which exist in v1. This rule exists because users keep markdown in many tools simultaneously (vim, other markdown apps, git, mobile editors), and silently mutating their files would be a hard-to-undo trust violation.
 
+Note-id stamping is obsolete under path-as-identity: the `IdStampingMode` enum + `IndexingConfig.id_stamping` field + `ensure_note_id_stamped` helper + `IdStamper` + `frontmatter_hiker_id` were removed in slice 1. Notes carry no `hiker.id` frontmatter; trail-docs and board-docs likewise dropped their `hiker.id` (identity is the vault path per [[spec:op-log-path-identity]]). [note-id-stamping]
+status:: retired
+
 
 ## Chunking (v1)
 
@@ -95,7 +98,16 @@ note:: breadcrumb stored, not yet used in ranking
 
 ## Embedder
 
-`fastembed-rs` v5 with one of three selectable models, picked via `[indexing].model` in settings: [embedder-fastembed-v5, embedder-model-selectable]
+`fastembed-rs` v5 is the embedder backend. v5 deprecates `InitOptions` in favor of `TextInitOptions`; `OutputKey` is read off the model registry automatically by `TextEmbedding::try_new` (Gemma's `Some(OutputKey::ByName("sentence_embedding"))` is baked into fastembed's `MODEL_MAP`, so no explicit per-model branch needed). [embedder-fastembed-v5]
+status:: done
+touches:: [[code:hiker/embed]]
+note:: evidence: `Cargo.toml` (workspace dep `fastembed = "5"`); `core/src/embed.rs` (`TextInitOptions` constructor, `TextEmbedding` wrapped in `Mutex` because v5's `embed` takes `&mut self`)
+
+One of three selectable models is picked via `[indexing].model` in settings — the three v1 models map to `BGESmallENV15` / `BGEM3` / `EmbeddingGemma300M`; the settings-UI dropdown landed under [[spec:settings-embedder-model-change-warning]]. [embedder-model-selectable]
+status:: done
+implements:: [[code:hiker/config/patch/ValueType#EmbedderModel]], [[code:hiker/config/patch/ELIGIBLE_VAULT]], [[code:hiker/config/patch/ELIGIBLE_USER]]
+touches:: [[code:hiker/embed]], [[code:hiker/panels/settings]]
+note:: evidence: `core/src/embed.rs` (`KNOWN_MODELS`, `resolve_model`, `FastembedEmbedder::load_id`); `core/src/config.rs` (`ValueType::EmbedderModel`, `[indexing].model` in `ELIGIBLE_VAULT` + `ELIGIBLE_USER`, strict-load validator delegates to `is_known_model`); `app/src/panels/settings/mod.rs` (embedder-model `enum_combo()`)
 
 | `model` id | fastembed variant | Dim | Ctx | Notes |
 | --- | --- | --- | --- | --- |
@@ -103,7 +115,18 @@ note:: breadcrumb stored, not yet used in ranking
 | `bge-m3` | `EmbeddingModel::BGEM3` | 1024 | 8192 | Multilingual (100+ languages), long context, ~1.2GB |
 | `embedding-gemma-300m` | `EmbeddingModel::EmbeddingGemma300M` | 768 | 2048 | Google's 300M-param embedder; ONNX from `onnx-community/embeddinggemma-300m-ONNX` |
 
-`bge-small-en-v1.5` stays the default — smallest, fastest, no download surprise on first run. The other two are opt-in for users who want multilingual, longer chunks, or a quality bump. Stored as the model id verbatim in `notes.embedder_version`. [embedder-version-tag, embedder-version-per-model]
+`bge-small-en-v1.5` (384 dims) stays the default — smallest, fastest, no download surprise on first run, the default model variant under [[spec:embedder-model-selectable]]. [embedder-fastembed-bge-small]
+status:: done
+touches:: [[code:hiker/embed]]
+
+The other two are opt-in for users who want multilingual, longer chunks, or a quality bump. The chosen model id is stored verbatim in `notes.embedder_version`. [embedder-version-tag]
+status:: done
+touches:: [[code:hiker/embed]]
+
+Switching `[indexing].model` flips the loader's model id, which becomes the `notes.embedder_version` stamp on the next ingest — the existing [[spec:embedder-version-tag]] re-embed trigger picks every row up automatically. [embedder-version-per-model]
+status:: done
+touches:: [[code:hiker/embed]]
+note:: evidence: `core/src/embed.rs` (`FastembedEmbedder::version()` returns `&self.model_id` verbatim, set from the loader's `model_id` arg)
 
 Bumping `[indexing].model` triggers full re-embed naturally — the `embedder_version` column on every existing row goes stale, and the indexer re-embeds. No migration code needed for the embedding bytes themselves. Dim changes additionally require a schema rebuild — see "Dim-from-model and schema rebuild" below.
 
@@ -207,11 +230,17 @@ read file → compute blake3 hash → if hash matches notes.content_hash AND
                                                COMMIT
          → emit indexer-progress events
 ```
-[ingest-tx-upsert, ingest-progress-events, cluster-note-embeddings]
-implements:: [[code:hiker/indexer/jobs/impl#[`JobCtx<'a>`]handle_upsert]], [[code:hiker/indexer/jobs/handle_inline_upsert]], [[code:hiker/indexer/ProgressEvent]], [[code:hiker/store/chunks/impl#[Store]upsert_note]], [[code:hiker/store/chunks/impl#[Store]collect_weighted_chunk_embeddings]], [[code:hiker/store/vec/byte_weighted_mean_pool]]
+The chunks and their vec rows are written atomically in a single `BEGIN TX … COMMIT`. [ingest-tx-upsert]
+status:: done
+implements:: [[code:hiker/indexer/jobs/impl#[`JobCtx<'a>`]handle_upsert]], [[code:hiker/indexer/jobs/handle_inline_upsert]], [[code:hiker/store/chunks/impl#[Store]upsert_note]]
 verifies:: [[code:hiker/indexer/tests/indexer_indexes_a_markdown_file]], [[code:hiker/indexer/tests/unchanged_file_is_skipped_on_second_index]]
 
-The note-level pool is computed and persisted in the same transaction as the chunks, so every successful upsert leaves the cached pool in sync with the chunk set the cluster pipeline consumes. Notes with no chunks leave `note_embedding` NULL.
+Each upsert emits indexer-progress events as it runs. [ingest-progress-events]
+status:: done
+implements:: [[code:hiker/indexer/ProgressEvent]]
+
+The note-level byte-weighted mean-pool of the new chunk embeddings is computed and persisted in the same transaction as the chunks, so every successful upsert leaves the cached pool in sync with the chunk set the cluster pipeline consumes. Notes with no chunks leave `note_embedding` NULL. [cluster-note-embeddings]
+implements:: [[code:hiker/store/chunks/impl#[Store]collect_weighted_chunk_embeddings]], [[code:hiker/store/vec/byte_weighted_mean_pool]]
 
 Deletes: cascade via the FK on `chunks`; vec rows cleaned up explicitly (vec0 has no FK enforcement). [ingest-delete-cascade]
 status:: done
@@ -241,6 +270,11 @@ implements:: [[code:hiker/store/configure_connection]], [[code:hiker/store/impl#
 `start` spawns the single long-lived tokio task that owns the writer `Store`, the loaded `Arc<dyn Embedder>`, and the `IndexJob` mpsc inbox; callers hold a `Handle` for job submission and status/progress subscriptions. The task first drives the (slow, fallible) embedder load on `spawn_blocking`, then loops on `rx.recv()` and dispatches each `IndexJob` serially through the job handlers. A model-load failure makes the task drain remaining jobs as errors instead of processing them.
 implements:: [[code:hiker/indexer/start]], [[code:hiker/indexer/scheduler/impl#[`IndexerLoop<F>`]run]], [[code:hiker/indexer/IndexJob]], [[code:hiker/indexer/Handle]]
 
+The op-log seeds documents (by path) on first open, *before* the indexer starts; the indexer's `JobCtx` reads the seeded substrate so every ingest resolves by path. [op-log-bootstraps-first]
+status:: done
+touches:: [[code:hiker/bootstrap]]
+note:: evidence: `app/src/bootstrap.rs::open_and_seed_oplog` (called before `start_indexer`); `core/src/indexer/jobs.rs` (`UpsertCtx.oplog_cell` read in every upsert path)
+
 
 ## Related-notes query (v1)
 
@@ -252,13 +286,27 @@ Algorithm:
 2. Fetch all of this note's chunk embeddings.
 3. For each one, KNN search the `chunk_vecs` table for top 20 nearest *excluding* chunks belonging to the same note.
 4. Group hits by their `note_path`; score each candidate note as `max(similarity)` across its hit chunks.
-5. Return top 10 notes by score, with: title (filename stem until frontmatter parsing lands), path, score, best-matching chunk's `heading_path` and a short snippet. [related-notes-query, related-notes-snippet]
+5. Return top 10 notes by score, with: title (filename stem until frontmatter parsing lands), path, score. The per-chunk KNN, exclude-source filter, and group-by-note aggregation are the query proper. [related-notes-query]
+status:: done
+implements:: [[code:hiker/store/search/impl#[Store]related_notes]], [[code:hiker/store/search/impl#[Store]knn_chunks]]
+
+Each returned note also carries the best-matching chunk's `heading_path` and a short snippet. [related-notes-snippet]
+status:: done
 
 No reranking, no rank fusion, no entity boosting — good enough to validate the pipeline; the full query pipeline (`design.md` query-pipeline section) arrives in v2 alongside lexical search.
 
 The full algorithm lives behind a single `Store::related_notes(source_path, top_k) -> Vec<RelatedHit>` method — keeping the per-chunk KNN loop, exclude-source-note filter, and group-by-note aggregation inside the store module preserves the SQL-stays-in-one-place discipline. Callers (host command handlers, MCP later) hand it a note path and receive note-shaped hits.
 
 Latency budget: the panel updates on file-open and on save (debounced 500ms). Brute-force KNN over a 100k-chunk vault should be <100ms; if it isn't, that's the signal to add an ANN index, not before.
+
+### Appears-in
+
+The "Appears in" view lists the canvases (File node), boards (note card), trails (waypoint), and cluster-trees (leaf) that reference the active note, grouped by type, each row click-to-open via `open_file`. Cached by active path (re-scans on note switch), the backlinks posture. Boards + trails use indexed derived tables; canvases + trees are on-demand scans — the trees derived-table optimization stays the planned [[spec:tree-leaves-derived-table]]. **Clicking a canvas row snaps the view to the referencing file-node** (selected, centered): `canvas::open_focused` sets a one-shot `Pane::focus_note_pending`, consumed by `render.rs::apply_pending_focus` (reuses `CanvasView::focus_node`, the `apply_follow` machinery) and takes precedence over the initial fit. Snap-to-node for cluster-trees / the vault graph is deferred — neither view has a programmatic center-on-node API yet. Test: `canvases_referencing_returns_only_canvases_with_a_matching_file_node`. [canvas-appears-in]
+status:: done
+implements:: [[code:hiker/trees/types/TreeContainingHit]], [[code:hiker/trees/store/impl#[Db]trees_containing_note]], [[code:hiker/panels/canvas/Pane#focus_note_pending]], [[code:hiker/panels/canvas/render/persist_text_edit]]
+verifies:: [[code:hiker/canvas/tests/canvases_referencing_returns_only_canvases_with_a_matching_file_node]]
+touches:: [[code:hiker/appears_in]], [[code:hiker/context]]
+note:: evidence: `app/src/appears_in/mod.rs` (`AppearsInSidebar` `View` + cached `State`), third view in the `context` container (`app/src/context/mod.rs`, dispatch arm in `activity/mod.rs`, `AppState::appears_in_state`); core lookups: `core/src/canvas.rs::canvases_referencing` (scan) + `core/src/trees/store.rs::trees_containing_note` (scan, returns `TreeContainingHit`) + existing `Store::boards_containing_note` / `trails_containing_note`; section titles title-cased in `workbench_host.rs::side_bar_title`
 
 
 ## Structured metadata index
@@ -300,8 +348,13 @@ Existing v0 commands stay unchanged (`open_vault`, `list_dir`, `read_file_with_h
 - `related_notes(path: String) -> Vec<RelatedHit>` — runs the related-notes query above. Empty vec for unindexed or empty notes; never errors on absence. [cmd-related-notes]
 status:: done
 note:: evidence: `core/src/store/search.rs` (`related_notes`)
-- `index_status() -> IndexStatus` — indexer-state snapshot (`{ model_ready, queued, total_notes, last_error }`) for the status bar / settings UI. `queued` is the mpsc-channel depth, ~1 during a `FullScan` (that handler processes per-file Upserts inline). The indexer-detail panel instead surfaces work-remaining via `IndexerHandle::pending_count()` — the in-flight `pending` paths set, pre-populated with every Upsert path at FullScan start — so the user sees a count down from N to 0. [cmd-index-status, indexer-detail-pending-counter]
-implements:: [[code:hiker/indexer/IndexStatus]], [[code:hiker/indexer/impl#[Handle]pending_count]], [[code:hiker/indexer/impl#[Handle]pending_paths]], [[code:hiker/indexer/impl#[Handle]is_pending]]
+- `index_status() -> IndexStatus` — indexer-state snapshot (`{ model_ready, queued, total_notes, last_error }`) for the status bar / settings UI. `queued` is the mpsc-channel depth, ~1 during a `FullScan` (that handler processes per-file Upserts inline). [cmd-index-status]
+status:: done
+implements:: [[code:hiker/indexer/IndexStatus]]
+- The indexer-detail panel surfaces work-remaining via `IndexerHandle::pending_count()` — the in-flight `pending` paths set, pre-populated with every Upsert path at FullScan start — so the user sees a count down from N to 0. `app/src/panels/indexer_detail.rs` (Pending row in the status grid reads `IndexerHandle::pending_count()`); `core/src/indexer/mod.rs::pending_count` returns the size of the in-flight `pending` paths set; `core/src/indexer/scheduler.rs` FullScan handler pre-populates the set with every Upsert path before draining so the count counts down from N to 0 across the scan. `IndexStatus.queued` (mpsc depth) still exists for callers that want the channel-level number. [indexer-detail-pending-counter]
+status:: done
+implements:: [[code:hiker/indexer/impl#[Handle]pending_count]], [[code:hiker/indexer/impl#[Handle]pending_paths]], [[code:hiker/indexer/impl#[Handle]is_pending]]
+touches:: [[code:hiker/panels/indexer_detail]]
 - `index(scope: IndexScope) -> ()` — enqueue index jobs. `IndexScope::All` triggers a full rescan; `IndexScope::Path(rel)` re-indexes a single file. Same command covers first-time and re-indexing (only difference is whether rows existed before). Returns immediately; progress via indexer-progress events. [cmd-index]
 status:: done
 note:: All / Path scopes
@@ -383,54 +436,3 @@ implements:: [[code:hiker/indexer/impl#[`ScanState<'a>`]walk_vault]]
 - External-file ingestion and source-derived notes
 - Reindex throttling / priority (currently strict FIFO)
 - Multi-vault routing (the route → recall → fuse pipeline assumes vault/folder embeddings that don't exist yet)
-
-## Registry imports (from status.md)
-
-Entries imported from the retired status registry that had no anchor in this doc —
-re-home them into the relevant sections as the doc evolves.
-
-- **op-log-bootstraps-first** — op-log seeds documents (by path) on first open, before the indexer starts; the indexer's `JobCtx` reads the seeded substrate so every ingest resolves by path [op-log-bootstraps-first]
-  status:: done
-  touches:: [[code:hiker/bootstrap]]
-  note:: evidence: `app/src/bootstrap.rs::open_and_seed_oplog` (called before `start_indexer`); `core/src/indexer/jobs.rs` (`UpsertCtx.oplog_cell` read in every upsert path)
-- **embedder-fastembed-bge-small** — bge-small-en-v1.5, 384 dims — the default model variant under [[spec:embedder-model-selectable]] [embedder-fastembed-bge-small]
-  status:: done
-  touches:: [[code:hiker/embed]]
-- **embedder-fastembed-v5** — v5 deprecates `InitOptions` in favor of `TextInitOptions`; `OutputKey` is read off the model registry automatically by `TextEmbedding::try_new` (Gemma's `Some(OutputKey::ByName("sentence_embedding"))` is baked into fastembed's `MODEL_MAP`, so no explicit per-model branch needed) [embedder-fastembed-v5]
-  status:: done
-  touches:: [[code:hiker/embed]]
-  note:: evidence: `Cargo.toml` (workspace dep `fastembed = "5"`); `core/src/embed.rs` (`TextInitOptions` constructor, `TextEmbedding` wrapped in `Mutex` because v5's `embed` takes `&mut self`)
-- **embedder-model-selectable** — the three v1 models map to `BGESmallENV15` / `BGEM3` / `EmbeddingGemma300M`; settings-UI dropdown landed under [[spec:settings-embedder-model-change-warning]] [embedder-model-selectable]
-  status:: done
-  implements:: [[code:hiker/config/patch/ValueType#EmbedderModel]], [[code:hiker/config/patch/ELIGIBLE_VAULT]], [[code:hiker/config/patch/ELIGIBLE_USER]]
-  touches:: [[code:hiker/embed]], [[code:hiker/panels/settings]]
-  note:: evidence: `core/src/embed.rs` (`KNOWN_MODELS`, `resolve_model`, `FastembedEmbedder::load_id`); `core/src/config.rs` (`ValueType::EmbedderModel`, `[indexing].model` in `ELIGIBLE_VAULT` + `ELIGIBLE_USER`, strict-load validator delegates to `is_known_model`); `app/src/panels/settings/mod.rs` (embedder-model `enum_combo()`)
-- **embedder-version-per-model** — switching `[indexing].model` flips the loader's model id, which becomes the `notes.embedder_version` stamp on the next ingest — the existing [[spec:embedder-version-tag]] re-embed trigger picks every row up automatically. [embedder-version-per-model]
-  status:: done
-  touches:: [[code:hiker/embed]]
-  note:: evidence: `core/src/embed.rs` (`FastembedEmbedder::version()` returns `&self.model_id` verbatim, set from the loader's `model_id` arg)
-- **embedder-version-tag** — embedder_version on notes row [embedder-version-tag]
-  status:: done
-  touches:: [[code:hiker/embed]]
-- **ingest-tx-upsert** — atomic chunks+vecs [ingest-tx-upsert]
-  status:: done
-- **ingest-progress-events** — indexer-progress events [ingest-progress-events]
-  status:: done
-- **related-notes-query** — per-chunk KNN, exclude source, group by note [related-notes-query]
-  status:: done
-  implements:: [[code:hiker/store/search/impl#[Store]related_notes]], [[code:hiker/store/search/impl#[Store]knn_chunks]]
-- **related-notes-snippet** — snippet + heading_path [related-notes-snippet]
-  status:: done
-- **canvas-appears-in** — "Appears in" view lists the canvases (File node), boards (note card), trails (waypoint), and cluster-trees (leaf) that reference the active note, grouped by type, each row click-to-open via `open_file`. Cached by active path (re-scans on note switch), the backlinks posture. Boards + trails use indexed derived tables; canvases + trees are on-demand scans — the trees derived-table optimization stays the planned [[spec:tree-leaves-derived-table]]. **Clicking a canvas row snaps the view to the referencing file-node** (selected, centered): `canvas::open_focused` sets a one-shot `Pane::focus_note_pending`, consumed by `render.rs::apply_pending_focus` (reuses `CanvasView::focus_node`, the `apply_follow` machinery) and takes precedence over the initial fit. Snap-to-node for cluster-trees / the vault graph is deferred — neither view has a programmatic center-on-node API yet. Test: `canvases_referencing_returns_only_canvases_with_a_matching_file_node` [canvas-appears-in]
-  status:: done
-  implements:: [[code:hiker/trees/types/TreeContainingHit]], [[code:hiker/trees/store/impl#[Db]trees_containing_note]], [[code:hiker/panels/canvas/Pane#focus_note_pending]], [[code:hiker/panels/canvas/render/persist_text_edit]]
-  verifies:: [[code:hiker/canvas/tests/canvases_referencing_returns_only_canvases_with_a_matching_file_node]]
-  touches:: [[code:hiker/appears_in]], [[code:hiker/context]]
-  note:: evidence: `app/src/appears_in/mod.rs` (`AppearsInSidebar` `View` + cached `State`), third view in the `context` container (`app/src/context/mod.rs`, dispatch arm in `activity/mod.rs`, `AppState::appears_in_state`); core lookups: `core/src/canvas.rs::canvases_referencing` (scan) + `core/src/trees/store.rs::trees_containing_note` (scan, returns `TreeContainingHit`) + existing `Store::boards_containing_note` / `trails_containing_note`; section titles title-cased in `workbench_host.rs::side_bar_title`
-- **cmd-index-status** — (imported without notes — spec text TBD) [cmd-index-status]
-  status:: done
-- **note-id-stamping** — obsolete under path-as-identity. `IdStampingMode` enum + `IndexingConfig.id_stamping` field + `ensure_note_id_stamped` helper + `IdStamper` + `frontmatter_hiker_id` removed in slice 1. Notes carry no `hiker.id` frontmatter; trail-docs and board-docs likewise dropped their `hiker.id` (identity is the vault path per [[spec:op-log-path-identity]]) [note-id-stamping]
-  status:: retired
-- **indexer-detail-pending-counter** — `app/src/panels/indexer_detail.rs` (Pending row in the status grid reads `IndexerHandle::pending_count()`); `core/src/indexer/mod.rs::pending_count` returns the size of the in-flight `pending` paths set; `core/src/indexer/scheduler.rs` FullScan handler pre-populates the set with every Upsert path before draining so the count counts down from N to 0 across the scan. `IndexStatus.queued` (mpsc depth) still exists for callers that want the channel-level number [indexer-detail-pending-counter]
-  status:: done
-  touches:: [[code:hiker/panels/indexer_detail]]

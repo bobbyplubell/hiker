@@ -157,7 +157,9 @@ impl Activity<dyn AppCtx> for ProjectsActivity {
         icons::ICONS.image(icons::Icon::Braces)
     }
     fn views(&self) -> Vec<&dyn View<dyn AppCtx>> {
-        vec![&ProjectsListView]
+        // Two stacked sections: the project list, then the Specs browser for the selected project
+        // (`spec_panel`) — Specs lives here rather than as its own activity-bar icon.
+        vec![&ProjectsListView, &crate::spec_panel::SpecsListView]
     }
 }
 

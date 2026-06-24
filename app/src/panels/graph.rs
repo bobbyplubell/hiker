@@ -612,7 +612,7 @@ fn find_popup(ui: &mut egui::Ui, app: &mut AppState) -> Option<String> {
     let paths: Vec<String> =
         vg.data.graph.node_weights().map(|n| n.path.clone()).collect();
     let source = crate::panels::graph_find::VaultNodeFindSource::new(&paths);
-    match autocomplete_picker::show(ui, &mut vg.find, &source) {
+    match autocomplete_picker::show(ui, &mut vg.find, &source, "Find note") {
         PickerOutcome::Selected(item) => Some(item.insert.to_string()),
         PickerOutcome::Cancelled | PickerOutcome::Open => None,
     }

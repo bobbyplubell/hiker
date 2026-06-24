@@ -104,6 +104,9 @@ pub struct AppState {
     /// Per-activity state marker for the Projects sidebar (listing is read fresh from the store's
     /// frontmatter index each frame). status: code-graph-view-source
     pub projects_activity_state: crate::projects_activity::State,
+    /// Per-activity state for the Specs sidebar (selected project + cached doc→section→slug tree).
+    /// status: spec-activity-panel
+    pub specs_state: crate::spec_panel::State,
     /// repo_id → bound `ScipAdapter` registry for `[[code:<repo_id>/<symbol>]]` spec→code wikilinks.
     /// Lazily populated when such a link is first navigated; survives the session. Default-constructed
     /// (no per-vault state to seed). status: spec-code-link
@@ -447,14 +450,36 @@ pub struct PanelStates {
     /// by `graph::show`. status: graph-scoped-query
     pub graph_pending_scope: Option<String>,
     pub cluster_graph: HashMap<String, crate::panels::cluster_graph::ClusterView>,
-    /// Per-project-note code-graph view state (the bound SCIP adapter + render engine + toggles).
-    /// Keyed by the project-note path. status: code-graph-view-source
-    pub code_graph: HashMap<String, crate::panels::code_graph::View>,
-    /// A spec waiting to be LIT on a code-graph view that isn't built yet —
+    /// Shared per-source code-graph DOCs (the bound SCIP adapter + full unified graph + governance
+    /// + changes + palette + SHARED selection/hover). Keyed by [`CodeSource::key`]. Both lenses of a
+    /// source read one doc. status: code-graph-view-source, container-tab
+    pub code_graph_docs: HashMap<String, crate::panels::code_graph::CodeGraphDoc>,
+    /// Per-lens code-graph VIEWS (one engine + display + drill scope each). Keyed by the lens-view's
+    /// state key (source + slot). status: container-tab
+    pub code_graph_lenses: HashMap<String, crate::panels::code_graph::LensView>,
+    /// Per-doc corner-minimap chrome (Poincaré projection + nav). Keyed by [`CodeSource::key`].
+    /// status: spec-minimap-swap
+    pub code_graph_minimaps:
+        HashMap<String, hiker_graph_view::graph_view::minimap::Minimap>,
+    /// Per-source "show corner minimap" toggle. Keyed by [`CodeSource::key`]. status: spec-minimap-swap
+    pub code_graph_minimap_on: HashMap<String, bool>,
+    /// Per-source pending primary↔secondary SWAP request. The toolbar's "Swap" button inserts the
+    /// source key; the code-graph [`Container`](crate::tab::TabKind::Container) render consumes it
+    /// (removing it) and flips its `swapped` flag. Keyed by [`CodeSource::key`]. status: container-tab
+    pub code_graph_swap_request: HashSet<String>,
+    /// Latched right-click node-menu target per doc: `(node id, pointer pos)`. Keyed by
+    /// [`CodeSource::key`]. status: code-graph-open-diff-from-node
+    pub code_graph_node_menu: HashMap<String, (String, eframe::egui::Pos2)>,
+    /// A spec waiting to be SELECTED on a code-graph view that isn't built yet —
     /// `(view key, spec slug)`, set by the vault graph's spec → code-graph
     /// jump, consumed by `code_graph::show` after the build.
     /// status: vault-graph-spec-drift-badge
-    pub code_graph_pending_light: Option<(String, String)>,
+    pub code_graph_pending_select: Option<(String, String)>,
+    /// Specs being HOVERED in the Specs side panel — `(view key, spec slugs)`. A slug row carries
+    /// one; a section / doc header carries every spec under it (so hovering a group lights all its
+    /// footprints). Set each frame by the panel while a row/header is hovered; consumed (taken) by
+    /// `code_graph::show` to drive a transient highlight. status: code-graph-spec-lighting
+    pub code_graph_hover_spec: Option<(String, Vec<String>)>,
     /// Per-tab project-config form state (name + source rows). Keyed by tab id.
     pub project_config: HashMap<TabId, crate::panels::project_config::Form>,
     pub home: crate::panels::home::State,

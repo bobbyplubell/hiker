@@ -160,7 +160,7 @@ pub struct GraphViewState {
     pub lod_marker_mag: f32,
     /// Vault-graph display filters, stored as the HIDDEN entries so a kind
     /// first appearing after a rebuild defaults to visible (mirrors
-    /// `CodeGraphViewState::hidden_kinds`). Empty/unused when this struct
+    /// `LensState::hidden_kinds`). Empty/unused when this struct
     /// rides inside `CodeGraphViewState` as the engine half.
     /// status: vault-graph-edge-toggles
     #[serde(default)]
@@ -197,11 +197,12 @@ pub struct GraphViewState {
 }
 
 /// A code-graph view's persisted state: its display controls (scope / selection /
-/// kind filter / edge filters / orphans / size-by-loc) plus the underlying graph
+/// the two lens configs (primary interactive + corner-minimap secondary), the
+/// "show changes" toggle, whether the minimap is on, plus the underlying graph
 /// engine's [`GraphViewState`] (positions + view). `scope` is stored as a String
 /// discriminant (`"overview"` / `"hops:1..3"`) because the `Scope` enum lives in
-/// the app crate, not here. The kind filter persists as the HIDDEN kinds, so a
-/// kind that first appears after a reindex defaults to visible.
+/// the app crate, not here. Each lens persists its HIDDEN kinds, so a kind that
+/// first appears after a reindex defaults to visible.
 /// status: graph-view-state-persist
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct CodeGraphViewState {
@@ -209,6 +210,36 @@ pub struct CodeGraphViewState {
     pub scope: String,
     #[serde(default)]
     pub selected: Option<String>,
+    /// The interactive primary lens.
+    #[serde(default)]
+    pub primary: LensState,
+    /// The corner-minimap secondary lens.
+    #[serde(default)]
+    pub secondary: LensState,
+    /// Whether the git-change ring is shown.
+    #[serde(default)]
+    pub show_changes: bool,
+    /// Focus-spotlight hop radius (1/2/3) for a selected CODE node in the overview. `0` (the serde
+    /// default for an older record) is treated as `1` on load. status: code-graph
+    #[serde(default)]
+    pub focus_hops: u8,
+    /// Whether the corner minimap is shown.
+    #[serde(default)]
+    pub minimap_on: bool,
+    /// User color overrides per entity kind (`code:type`, `spec`, …) → RGB. Empty = the built-in
+    /// per-kind palette. status: graph-view-state-persist
+    #[serde(default)]
+    pub palette: std::collections::HashMap<String, [u8; 3]>,
+    /// The code graph's own engine view (positions + pan/zoom + projection …).
+    #[serde(default)]
+    pub engine: GraphViewState,
+}
+
+/// One lens's persisted selection (`spec-graph-lens`): its HIDDEN node kinds (so a
+/// kind appearing after a reindex defaults to visible), its edge-kind toggles, and
+/// its sizing / changed-only / independent-layout view options.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LensState {
     #[serde(default)]
     pub hidden_kinds: Vec<String>,
     #[serde(default)]
@@ -216,12 +247,43 @@ pub struct CodeGraphViewState {
     #[serde(default)]
     pub show_impls: bool,
     #[serde(default)]
-    pub show_orphans: bool,
+    pub show_governs: bool,
+    #[serde(default)]
+    pub show_refs: bool,
     #[serde(default)]
     pub size_by_loc: bool,
-    /// The code graph's own engine view (positions + pan/zoom + projection …).
     #[serde(default)]
-    pub engine: GraphViewState,
+    pub changed_only: bool,
+    /// Hide degree-0 nodes in overview (default true).
+    #[serde(default = "default_true")]
+    pub hide_orphans: bool,
+    /// Spatial auto-bundling: collapse on-screen-close nodes into one cluster rep at low zoom. OFF by
+    /// default — the default view is the full dense graph; bundling is an opt-in toolbar toggle.
+    /// status: code-graph-bundling
+    #[serde(default)]
+    pub bundling: bool,
+}
+
+/// serde default for a `bool` field that should default to `true` (absent = on).
+const fn default_true() -> bool {
+    true
+}
+
+impl Default for LensState {
+    /// All edges on, nothing hidden, orphans hidden — the default lens.
+    fn default() -> Self {
+        Self {
+            hidden_kinds: Vec::new(),
+            show_calls: true,
+            show_impls: true,
+            show_governs: true,
+            show_refs: true,
+            size_by_loc: false,
+            changed_only: false,
+            hide_orphans: true,
+            bundling: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -699,11 +761,11 @@ mod tests {
         let cgv = CodeGraphViewState {
             scope: "hops:3".into(),
             selected: Some("scip:foo#bar".into()),
-            hidden_kinds: vec!["code:field".into()],
-            show_calls: true,
-            show_impls: false,
-            show_orphans: true,
-            size_by_loc: true,
+            primary: LensState { hidden_kinds: vec!["code:field".into()], ..Default::default() },
+            secondary: LensState { show_refs: false, ..Default::default() },
+            show_changes: true,
+            minimap_on: true,
+            palette: HashMap::from([("code:type".to_string(), [0x11, 0x22, 0x33])]),
             engine: gv.clone(),
         };
         let mut code_graph_views = HashMap::new();
@@ -730,7 +792,9 @@ mod tests {
         let lcgv = &loaded.code_graph_views["project:proj.md"];
         assert_eq!(lcgv.scope, "hops:3");
         assert_eq!(lcgv.selected.as_deref(), Some("scip:foo#bar"));
-        assert_eq!(lcgv.hidden_kinds, vec!["code:field".to_string()]);
+        assert_eq!(lcgv.primary.hidden_kinds, vec!["code:field".to_string()]);
+        assert!(!lcgv.secondary.show_refs);
+        assert!(lcgv.show_changes && lcgv.minimap_on);
         assert_eq!(lcgv.engine.positions, positions);
     }
 

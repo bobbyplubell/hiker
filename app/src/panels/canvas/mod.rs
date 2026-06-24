@@ -117,12 +117,20 @@ pub struct Pane {
     /// (and cleared) by `apply_pending_focus`, the same posture as `fit_pending`.
     /// status: canvas-appears-in
     focus_note_pending: Option<String>,
-    /// The Poincaré OVERVIEW minimap: a corner disk-of-dots of the canvas (each
-    /// card → a node at its canvas position, canvas edges → graph edges) with a
-    /// viewport-location indicator + click-to-expand swap, owned by the graph-view
-    /// engine. Navigating it + swapping back re-centers the canvas on the focused
-    /// node. View state only — never serialized. status: canvas-minimap
+    /// The Poincaré OVERVIEW minimap chrome: corner placement, expand-swap state,
+    /// indicator mode, and the persistent overview navigation. It renders through
+    /// the container-owned `overview_engine` (the canvas's single graph engine —
+    /// it has no peer engine) via `Minimap::ui_for`, the same corner-render seam
+    /// the code-graph peer minimap uses. View state only — never serialized.
+    /// status: canvas-minimap, container-tab
     overview: hiker_graph_view::graph_view::minimap::Minimap,
+    /// The canvas's SelfOverview engine: a `graph_view::State` whose `positions`
+    /// are set to the card centers each frame (never force-laid-out — the canvas
+    /// IS the layout), borrowed by `overview.ui_for` to project the corner disk.
+    /// This is the single engine the SelfOverview owns (the canvas board is not a
+    /// graph engine itself, so the overview keeps exactly one). View state only.
+    /// status: canvas-minimap, container-tab
+    overview_engine: hiker_graph_view::graph_view::State,
 }
 
 impl Default for Pane {
@@ -141,6 +149,7 @@ impl Default for Pane {
             followed: None,
             focus_note_pending: None,
             overview: hiker_graph_view::graph_view::minimap::Minimap::new(),
+            overview_engine: hiker_graph_view::graph_view::minimap::Minimap::overview_engine(),
         }
     }
 }

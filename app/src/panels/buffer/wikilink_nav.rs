@@ -190,8 +190,8 @@ fn open_code_target(app: &mut AppState, repo_id: &str, symbol: &str) {
     // at the resolved node so the detail line shows it. A not-yet-built (lazy) view is fine — the
     // toast below is sufficient for Phase A.
     let key = crate::tab::CodeSource::Project(note).key();
-    if let Some(view) = app.panels.code_graph.get_mut(&key) {
-        view.preselect(handle.id.clone());
+    if let Some(doc) = app.panels.code_graph_docs.get_mut(&key) {
+        doc.selected = Some(handle.id.clone());
     }
     let loc = adapter
         .locate(&handle)
@@ -618,15 +618,57 @@ pub(crate) fn track_hover(
         })
     });
 
-    // Only resolved links preview; unresolved / ambiguous show nothing.
-    if let Some((offset, anchor)) = pill_under_pointer
-        && let Some(target) = resolve_target_path(app, path, offset)
-    {
+    let Some((offset, anchor)) = pill_under_pointer else { return };
+
+    // A spec/code pill previews a 1-hop GRAPH of the link target's neighbourhood
+    // (`spec-link-preview`) rather than a note body — a different mechanism, registered on
+    // its own egui-memory slot and drawn by `render_link_graph_preview`. Spec links always
+    // register (adapter-free); a code link registers only when a code-graph view for the
+    // repo is already warm — otherwise nothing registers and the pill keeps its plain label.
+    // status: spec-link-preview
+    if let Some(kind) = link_graph_kind(app, path, offset) {
+        crate::panels::link_graph_preview::register_link_graph_hover(ui, anchor, kind);
+        return;
+    }
+
+    // A plain note link previews the target note's body. Only resolved links preview;
+    // unresolved / ambiguous show nothing.
+    if let Some(target) = resolve_target_path(app, path, offset) {
         // Interactive registration: the wikilink preview anchors at the pill,
         // scrolls under the wheel, and survives the cursor sliding onto it
         // (unlike the passive, side-anchored sidebar previews).
         crate::widgets::preview::register_note_hover_interactive(ui, anchor, &target);
     }
+}
+
+/// Classify the pill whose `[[…]]` span starts at `offset` in `path`'s buffer as a spec/code
+/// link graph preview target, when it is one. A `[[spec:slug]]` always yields a preview
+/// (adapter-free); a `[[code:repo/sym]]` yields one ONLY when a code-graph view bound to that
+/// repo is already open (its adapter is warm — no SCIP bind per hover, per the spec's
+/// fall-back-to-plain-label rule). Returns `None` for a plain note link. status: spec-link-preview
+fn link_graph_kind(
+    app: &AppState,
+    path: &str,
+    offset: usize,
+) -> Option<crate::panels::link_graph_preview::LinkPreviewKind> {
+    use crate::panels::link_graph_preview::LinkPreviewKind;
+    let text = app.session.buffers.get(path).map(crate::buffer::Buffer::current_text)?;
+    let link = wikilink::parse_links(&text).into_iter().find(|l| l.span.start == offset)?;
+    if let Some(slug) = wikilink::parse_spec_target(&link.target) {
+        return Some(LinkPreviewKind::Spec(slug.to_string()));
+    }
+    if let Some((repo_id, moniker)) = wikilink::parse_code_target(&link.target) {
+        // Only register when a view for this repo is already open + bound — a not-yet-open
+        // repo previews nothing (the plain label stands).
+        let warm = app.panels.code_graph_docs.values().any(|v| v.src.0 == repo_id);
+        if warm {
+            return Some(LinkPreviewKind::Code {
+                repo_id: repo_id.to_string(),
+                moniker: moniker.to_string(),
+            });
+        }
+    }
+    None
 }
 
 /// Resolve the wikilink whose full `[[…]]` span starts at `offset` in the

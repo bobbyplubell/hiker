@@ -14,6 +14,7 @@ mod bootstrap;
 mod canvas_activity;
 mod code_sources;
 mod projects_activity;
+mod spec_panel;
 mod charts;
 mod clusters;
 mod command_center;
@@ -48,6 +49,8 @@ mod workbench_host;
 
 #[cfg(test)]
 mod smoke_tests;
+#[cfg(test)]
+mod graph_harness;
 
 use std::path::PathBuf;
 
@@ -499,6 +502,10 @@ impl eframe::App for HikerApp {
             // of the hovered note. Runs at the frame-loop level because rendering a
             // note needs `&mut AppState` (diagram cache, buffers, title resolver).
             crate::widgets::preview::render_note_preview(ctx, &mut self.state);
+            // Spec/code wikilink pills: a read-only 1-hop GRAPH map of the link
+            // target's neighbourhood, drawn through the shared graph engine (which
+            // also needs `&mut AppState` + the store/vault). status: spec-link-preview
+            crate::panels::link_graph_preview::render_link_graph_preview(ctx, &mut self.state);
         }
 
         // Command palette overlay (Ctrl+K). Renders after panels so the
@@ -1025,29 +1032,57 @@ fn autosave_tick(&mut self) {
         return;
     }
     state.session.last_autosave_tick = std::time::Instant::now();
+    // Guarded so a stutter coinciding with the 5s tick (synchronous sidecar +
+    // tab-state writes on the UI thread) is attributable in the frame log
+    // instead of vanishing into the unnamed remainder of `update_total`.
+    let _g = crate::profiling::FrameProf::guard("autosave");
 
     let autosave = state.vault_session.services.autosave.clone();
+    // Gather the per-buffer work on the UI thread (reads live buffer state); the
+    // blocking disk I/O is pushed off-thread below. Each autosave call re-reads +
+    // atomically rewrites the index file, so doing N of them inline was the ~80ms
+    // tick stutter the frame log caught in a large vault.
+    let mut clears: Vec<String> = Vec::new();
+    let mut writes: Vec<(String, Vec<u8>, String)> = Vec::new();
     for (path, buffer) in &state.session.buffers {
-        if !buffer.is_dirty() {
-            let _ = autosave.clear(path);
-            continue;
-        }
-        let text = buffer.current_text();
-        let hash = buffer.current_hash();
-        if let Err(err) = autosave.write(path, text.as_bytes(), &hash) {
-            tracing::warn!(error = %err, path = %path, "autosave write failed");
+        if buffer.is_dirty() {
+            writes.push((
+                path.clone(),
+                buffer.current_text().into_bytes(),
+                buffer.current_hash(),
+            ));
+        } else {
+            clears.push(path.clone());
         }
     }
+    // Snapshot the open-tab + view state (reads app state, so it stays on the UI
+    // thread); the write moves off-thread with the buffer writes below.
+    let snapshot = state.build_tab_state_snapshot();
 
-    state.persist_tab_state(&autosave);
-
-    // Primary side-panel accordion: writes only when the arrangement
-    // changed since the last tick (no dirty flag — it mutates inside
-    // egui_workbench). [feature-multi-region-sidebar]
+    // Primary side-panel accordion: writes only when the arrangement changed
+    // since the last tick (change-gated + a tiny JSON write), so it stays inline.
+    // [feature-multi-region-sidebar]
     state.persist_side_panel();
+
+    // Push the blocking autosave writes onto a blocking task so the 5s tick never
+    // stalls a frame. Autosave is internally `Sync` (its own mutex), so an
+    // overlapping next tick serializes safely.
+    tokio::task::spawn_blocking(move || {
+        for path in clears {
+            let _ = autosave.clear(&path);
+        }
+        for (path, bytes, hash) in writes {
+            if let Err(err) = autosave.write(&path, &bytes, &hash) {
+                tracing::warn!(error = %err, path = %path, "autosave write failed");
+            }
+        }
+        if let Err(err) = autosave.save_tab_state(snapshot) {
+            tracing::warn!(error = %err, "tab-state snapshot failed");
+        }
+    });
 }
 
-fn persist_tab_state(&mut self, autosave: &std::sync::Arc<hiker_core::autosave::Autosave>) {
+fn build_tab_state_snapshot(&mut self) -> hiker_core::autosave::TabState {
     let state = self;
     // Snapshot every currently-open Canvas tab's view state (camera pan/zoom +
     // per-card scroll/zoom) into the session map first, so the persisted
@@ -1071,7 +1106,7 @@ fn persist_tab_state(&mut self, autosave: &std::sync::Arc<hiker_core::autosave::
     // (they live on `panels`, not per-tab), so capture by panel presence rather
     // than open-tab walk. status: graph-view-state-persist
     crate::panels::graph::capture_graph_view(state);
-    let code_graph_keys: Vec<String> = state.panels.code_graph.keys().cloned().collect();
+    let code_graph_keys: Vec<String> = state.panels.code_graph_docs.keys().cloned().collect();
     for key in code_graph_keys {
         crate::panels::code_graph::capture_code_graph_view(state, &key);
     }
@@ -1107,7 +1142,7 @@ fn persist_tab_state(&mut self, autosave: &std::sync::Arc<hiker_core::autosave::
         .and_then(crate::tab::Tab::persist_key)
         .map(|(key, _)| key);
 
-    let snapshot = hiker_core::autosave::TabState {
+    hiker_core::autosave::TabState {
         open_paths,
         active_path,
         preview_path,
@@ -1118,7 +1153,15 @@ fn persist_tab_state(&mut self, autosave: &std::sync::Arc<hiker_core::autosave::
         // status: graph-view-state-persist
         graph_views: state.session.graph_views.clone(),
         code_graph_views: state.session.code_graph_views.clone(),
-    };
+    }
+}
+
+/// Synchronous tab-state persist used by the smoke test: build the snapshot and
+/// write it on the calling thread. The 5s autosave tick instead uses
+/// [`build_tab_state_snapshot`] + an off-thread write so it never stalls a frame.
+#[cfg(test)]
+fn persist_tab_state(&mut self, autosave: &std::sync::Arc<hiker_core::autosave::Autosave>) {
+    let snapshot = self.build_tab_state_snapshot();
     if let Err(err) = autosave.save_tab_state(snapshot) {
         tracing::warn!(error = %err, "tab-state snapshot failed");
     }

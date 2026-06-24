@@ -8,7 +8,7 @@ Key decisions (detailed below):
 status:: done
 touches:: [[code:hiker/styling]]
 note:: Tier-1 generator walks the markdown syntax tree and emits decorations; no widgets/media/math · evidence: `editor/editor-md/src/styling.rs` (`markdown_decorations()`)
-- **Per-line reveal granularity** with selection-range reveal. [live-preview-cursor-line-reveal, live-preview-selection-reveal-all]
+- **Per-line reveal granularity** with selection-range reveal. The two halves are anchored where they're detailed: per-line in "Reveal mechanic" ([[spec:live-preview-cursor-line-reveal]]), selection-range in the same section ([[spec:live-preview-selection-reveal-all]]).
 - **Default on.** That's the editor's intended look; the toggle is [[spec:view-live-preview-toggle]] in the View options menu (`editor.md`), and off shows raw markdown. [live-preview-default-on]
 status:: done
 touches:: [[code:hiker/panels/buffer]]
@@ -38,7 +38,10 @@ Tiers 2 and 3 land as their own specs when built (see "Deferred").
 
 ## Reveal mechanic
 
-Per-line is the primary rule: marker decorations are conditioned on whether the active cursor's line equals the marker's line. The decoration provider recomputes the active-line set when the selection changes and rebuilds decorations from the syntax tree, scoping the rebuild to the affected ranges.
+Per-line is the primary rule: marker decorations are conditioned on whether the active cursor's line equals the marker's line. The decoration provider recomputes the active-line set when the selection changes and rebuilds decorations from the syntax tree, scoping the rebuild to the affected ranges. The active-lines set is rebuilt per selection change; the active-range check matches by line number first. [live-preview-cursor-line-reveal]
+status:: done
+touches:: [[code:hiker/styling]]
+note:: evidence: `editor/editor-md/src/styling.rs` (`markdown_decorations()` active-range check)
 
 Two augmentations:
 
@@ -136,13 +139,3 @@ The providers live in the `editor-md` crate (e.g. `editor/editor-md/src/styling.
 - Anything that mutates the source file (live preview is decoration-only by definition).
 - Spellcheck visuals, grammar squiggles, comment threads — separate extensions if they ever land.
 - "Source mode" — the toggle off-state already serves this purpose; we don't need a third mode.
-
-## Registry imports (from status.md)
-
-Entries imported from the retired status registry that had no anchor in this doc —
-re-home them into the relevant sections as the doc evolves.
-
-- **live-preview-cursor-line-reveal** — active-lines set rebuilt per selection change; the active-range check matches by line number first [live-preview-cursor-line-reveal]
-  status:: done
-  touches:: [[code:hiker/styling]]
-  note:: evidence: `editor/editor-md/src/styling.rs` (`markdown_decorations()` active-range check)

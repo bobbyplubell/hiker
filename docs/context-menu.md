@@ -64,7 +64,11 @@ note:: single `show(ui, menu) -> Option<A>`; only code touching egui menus (sepa
   nested-submenu state, and escape handling ride egui's built-in menu machinery
   (`containers/menu.rs`) — the renderer does not reimplement them.
 - The renderer is pure: it performs no mutation and holds no app reference, which is
-  what lets it live as a generic module in `egui_workbench::menu`.
+  what lets it live as a generic module in `egui_workbench::menu`. That generalized core is
+  the generic egui-only `egui_workbench::menu` module — the home for shared egui UI
+  primitives; `canvas-view` stays menu-lib-free via [[spec:ctxmenu-canvas-seam]]. [ctxmenu-crate]
+status:: done
+note:: evidence: `egui-workbench/src/menu/` (`pub mod menu`); `app` deps `egui_workbench` already
 
 Attaching a menu to a widget at the call site (egui's `context_menu` closure must
 return `()`, so the chosen action is captured out):
@@ -126,10 +130,15 @@ status:: done
 touches:: [[code:hiker/item_menu]]
 note:: shared base menu for any note/path-referencing list item — Open · Reveal in file tree · Copy path (Custom) · Properties — defined once, composed via `.extend`/prepend everywhere · evidence: `app/src/item_menu.rs` (`ItemAction`, `BaseOpts`, `note_item_base`)
 
-- **One builder, one dispatch.** `item_menu::note_item_base(path, opts, wrap)` returns the
-  base section — **Open · Reveal in file tree · Open in graph · Copy path · Properties** — and
-  `item_menu::apply_item_action(app, action, path)` applies it. Both live in
-  `app/src/item_menu.rs`; every list routes through them. [ctxmenu-item-base, ctxmenu-item-base-apply]
+- **One builder.** `item_menu::note_item_base(path, opts, wrap)` returns the
+  base section — **Open · Reveal in file tree · Open in graph · Copy path · Properties** — living
+  in `app/src/item_menu.rs`; every list routes through it.
+- **One dispatch.** `item_menu::apply_item_action(app, action, path)` applies the base action
+  (Open→`open_file`, Reveal→`reveal_in_files`, Properties→`open_properties`); Copy path copies at
+  render via the Custom entry. [ctxmenu-item-base-apply]
+status:: done
+touches:: [[code:hiker/item_menu]]
+note:: evidence: `app/src/item_menu.rs` (`apply_item_action`); `attach_note_item_menu` / `note_item_menu_response`
 - **"Open in graph"** is a base entry on the note-item builder, so it appears everywhere a
   note item is right-clicked — file tree, search results, backlinks/related/appears-in,
   vault-view rows, board cards, trail waypoints, queue/changes/project rows, and the graph
@@ -309,16 +318,3 @@ note:: deferred: same builders/verbs feeding a fuzzy command palette; command-la
   menu path.
 - **A global action enum / contribution registry.** Per-domain verbs stay; plugin-style
   menu contribution is a plugin-era concern (`scratch/plugins.md`).
-
-## Registry imports (from status.md)
-
-Entries imported from the retired status registry that had no anchor in this doc —
-re-home them into the relevant sections as the doc evolves.
-
-- **ctxmenu-crate** — generalized core is the generic egui-only `egui_workbench::menu` module — the home for shared egui UI primitives; `canvas-view` stays menu-lib-free via [[spec:ctxmenu-canvas-seam]] [ctxmenu-crate]
-  status:: done
-  note:: evidence: `egui-workbench/src/menu/` (`pub mod menu`); `app` deps `egui_workbench` already
-- **ctxmenu-item-base-apply** — one shared dispatch (Open→`open_file`, Reveal→`reveal_in_files`, Properties→`open_properties`); Copy path copies at render via the Custom entry [ctxmenu-item-base-apply]
-  status:: done
-  touches:: [[code:hiker/item_menu]]
-  note:: evidence: `app/src/item_menu.rs` (`apply_item_action`); `attach_note_item_menu` / `note_item_menu_response`

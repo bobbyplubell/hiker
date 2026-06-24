@@ -313,6 +313,14 @@ impl Governance {
         self.targets.keys()
     }
 
+    /// The `implements`/`touches` code-target monikers of `spec` (sorted) — the
+    /// spec→code edges the spec graph draws. Empty when `spec` has no targets.
+    /// Adapter-free (folded at build), so the spec graph renders before the
+    /// SCIP adapter binds. status: spec-graph-source
+    pub fn targets_of(&self, spec: &str) -> &[String] {
+        self.targets.get(spec).map_or(&[], Vec::as_slice)
+    }
+
     /// The doc `status::` value of `spec`, if its anchor carries one.
     pub fn status_of(&self, spec: &str) -> Option<&str> {
         self.statuses.get(spec).map(String::as_str)

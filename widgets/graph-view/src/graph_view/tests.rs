@@ -1,6 +1,244 @@
 //! Engine-level tests for the graph-view module: the locked Poincaré disk
 //! frame, Möbius navigation, and the view-snapshot persistence round-trip.
 
+/// Zoom-driven auto-bundling: the engine's per-frame cull + edge-rollup state.
+/// status: code-graph-bundling
+mod bundle_tests {
+    use eframe::egui;
+    use hiker_graph::LayoutKind;
+    use hiker_projection::{Mobius, ProjectionConfig};
+
+    use crate::graph_view::source::{NodeDescriptor, NodeShape};
+    use crate::graph_view::{styling::Style, Lens, State};
+
+    /// A descriptor at an explicit `world_pos` with a rep-rank (`label_scale`); everything else inert.
+    fn desc_at(index: usize, world_pos: egui::Vec2, label_scale: f32) -> NodeDescriptor {
+        NodeDescriptor {
+            index,
+            world_pos,
+            radius: 4.0,
+            shape: NodeShape::Circle,
+            fill: egui::Color32::WHITE,
+            resting_stroke: egui::Stroke::NONE,
+            hover_stroke: egui::Stroke::NONE,
+            badge: None,
+            bug_badge: None,
+            label: None,
+            label_min_zoom: 0.0,
+            label_scale,
+            click_path: None,
+            tooltip: None,
+        }
+    }
+
+    /// A descriptor at `(index, 0)` with a unit rep-rank — the simple line used by the reveal tests.
+    fn desc(index: usize, world_pos: egui::Vec2) -> NodeDescriptor {
+        desc_at(index, world_pos, 1.0)
+    }
+
+    /// SPATIAL clustering on the FA2 positions: two on-screen-close nodes share a world cell and the
+    /// lower-`label_scale` one culls into the higher-rank rep; zooming in (cell shrinks below their
+    /// separation) splits them into their own cells; a far-apart node is never bundled with them; and
+    /// because the grid is WORLD-FIXED, shifting every position by a sub-cell constant doesn't change
+    /// membership. status: code-graph-bundling
+    #[test]
+    fn spatial_cluster_splits_on_zoom_and_is_pan_stable() {
+        let state = State::new(Style::flat(), LayoutKind::ForceDirected);
+        // Two nodes 12 world units apart (node 1 has the higher label_scale → it's the rep), plus a
+        // far node at x=4000 that never shares their cell.
+        let near_a = desc_at(0, egui::vec2(0.0, 0.0), 1.0);
+        let near_b = desc_at(1, egui::vec2(12.0, 0.0), 1.8); // higher rank → rep
+        let far = desc_at(2, egui::vec2(4000.0, 0.0), 1.0);
+        let nodes = [near_a, near_b, far];
+        let positions: Vec<egui::Vec2> = nodes.iter().map(|d| d.world_pos).collect();
+        let lens = Lens::centred(ProjectionConfig::default(), Mobius::identity(), &positions);
+
+        // LOW screen scale (1.0): cell = pow2 ceil(MERGE_PX / 1.0 = 48) = 64 world units, so the two
+        // near nodes (12 apart) share one cell and collapse into the higher-rank rep (node 1). The far
+        // node (4000) is in its own cell. The 0.0 sentinel would disable bundling — we pass > 0.
+        let b = state.compute_bundles(&nodes, &lens, 1.0);
+        assert!(b.is_visible(1), "the higher-label_scale node is the visible rep");
+        assert!(!b.is_visible(0), "the lower-rank near node culls into the rep");
+        assert_eq!(b.rep(0), 1, "rep = max label_scale member of the shared cell");
+        assert_eq!(b.rolled_count(1), 1, "one member rolled into the rep");
+        assert!(b.is_visible(2), "the far node is never bundled with the near pair");
+        assert_eq!(b.rolled_count(2), 0);
+
+        // HIGH screen scale (8.0): cell = pow2 ceil(48/8 = 6) = 8 world units < the 12-unit separation,
+        // so the two near nodes fall into DIFFERENT cells → BOTH visible, nothing rolled up.
+        let b = state.compute_bundles(&nodes, &lens, 8.0);
+        assert!(b.is_visible(0) && b.is_visible(1), "zoom split the cluster — both shown");
+        assert!((0..3).all(|i| b.rolled_count(i) == 0), "no bundles once the cell shrinks past them");
+
+        // PAN stability: shift every node by a sub-cell constant (≪ 64) at the low scale — a
+        // world-fixed grid keeps the same membership (node 1 still the rep, node 0 still culled).
+        let shifted: Vec<NodeDescriptor> = nodes
+            .iter()
+            .map(|d| desc_at(d.index, d.world_pos + egui::vec2(3.0, -2.0), d.label_scale))
+            .collect();
+        let b = state.compute_bundles(&shifted, &lens, 1.0);
+        assert!(b.is_visible(1) && !b.is_visible(0), "a sub-cell pan never changes membership");
+        assert_eq!(b.rep(0), 1);
+
+        // The 0.0 sentinel (read-only / Poincaré panes) disables bundling → identity, every node shown.
+        let b = state.compute_bundles(&nodes, &lens, 0.0);
+        assert!((0..3).all(|i| b.is_visible(i)), "non-positive screen scale → no spatial bundling");
+        assert_eq!(b.fingerprint(), 0, "identity → zero cache perturbation");
+    }
+
+    /// Un-bundling reveal: a culled→visible transition restarts `reveal_t` at `0.0`, advancing by
+    /// `dt` eases it toward `1.0` and clamps there, and a node that stays visible just keeps
+    /// advancing (no restart). status: code-graph-bundling
+    #[test]
+    fn reveal_resets_and_advances_on_unbundle() {
+        let mut state = State::new(Style::flat(), LayoutKind::ForceDirected);
+        // Rep at origin (high label_scale) + a near member 12 units away (low rank). At a low screen
+        // scale (cell 64) they share a cell → the member culls into the rep; at a high scale (cell 8 <
+        // 12) they split → the member reveals.
+        let nodes = [desc_at(0, egui::vec2(0.0, 0.0), 1.8), desc_at(1, egui::vec2(12.0, 0.0), 1.0)];
+        state.positions = nodes.iter().map(|d| d.world_pos).collect();
+        state.reset_reveal_anim(); // sizes reveal_t to 2, all settled (1.0)
+        let lens = Lens::centred(ProjectionConfig::default(), Mobius::identity(), &state.positions);
+
+        // Frame 1 — low scale (1.0): the member is culled into the rep. No reveal yet; history seeded.
+        let b = state.compute_bundles(&nodes, &lens, 1.0);
+        assert!(!b.is_visible(1) && b.rep(1) == 0);
+        let animating = state.advance_reveal(&b, 0.1);
+        assert!(!animating, "nothing visible-but-unsettled yet");
+        assert_eq!(state.reveal_t[1], 1.0, "still-culled node untouched");
+
+        // Frame 2 — high scale (8.0): the cell splits, the member emerges. The culled→visible edge
+        // resets it to 0, captures the rep (node 0) as its fly-out origin, then advances by dt/REVEAL_DUR.
+        let b = state.compute_bundles(&nodes, &lens, 8.0);
+        assert!(b.is_visible(1));
+        let animating = state.advance_reveal(&b, 0.1);
+        assert!(animating, "a just-revealed member is mid-flight");
+        let after_one = state.reveal_t[1];
+        assert!(after_one > 0.0 && after_one < 1.0, "advanced off 0 but not settled: {after_one}");
+        assert!((after_one - 0.1 / super::super::REVEAL_DUR).abs() < 1e-5, "stepped by dt/REVEAL_DUR");
+
+        // Frame 3 — still visible (no restart): keeps advancing from where it was.
+        let b = state.compute_bundles(&nodes, &lens, 8.0);
+        state.advance_reveal(&b, 0.1);
+        assert!(state.reveal_t[1] > after_one, "kept advancing without a reset");
+
+        // A big dt clamps at 1.0 (settled), and the animation reports done.
+        let b = state.compute_bundles(&nodes, &lens, 8.0);
+        let animating = state.advance_reveal(&b, 10.0);
+        assert_eq!(state.reveal_t[1], 1.0, "clamped at fully settled");
+        assert!(!animating, "settled → not animating");
+    }
+
+    /// `effective_positions` lerps a mid-flight node from its SPATIAL cluster rep's `world_pos` at `t
+    /// = 0` to its own at `t = 1` (ease endpoints exact), reading the captured `reveal_origin`; a
+    /// settled node sits at its own position. status: code-graph-bundling
+    #[test]
+    fn effective_positions_lerp_from_rep() {
+        let mut state = State::new(Style::flat(), LayoutKind::ForceDirected);
+        // rep at x=0, member at x=10.
+        let nodes = [desc_at(0, egui::vec2(0.0, 0.0), 1.8), desc_at(1, egui::vec2(10.0, 0.0), 1.0)];
+        state.positions = nodes.iter().map(|d| d.world_pos).collect();
+        state.reset_reveal_anim();
+        // The member's recorded fly-out origin is node 0 (the cluster rep it emerged from).
+        state.reveal_origin = vec![0, 0];
+
+        // t = 0 → exactly the rep's position (fly-out origin).
+        state.reveal_t = vec![1.0, 0.0];
+        let eff = state.effective_positions(&nodes);
+        assert_eq!(eff[1], egui::vec2(0.0, 0.0), "at t=0 the member starts at the rep centre");
+
+        // t = 1 → exactly its own position.
+        state.reveal_t = vec![1.0, 1.0];
+        let eff = state.effective_positions(&nodes);
+        assert_eq!(eff[1], egui::vec2(10.0, 0.0), "at t=1 the member sits at its own spot");
+
+        // Mid-flight (t = 0.5) → strictly between, and past the linear midpoint (ease-out front-loads
+        // the motion: it's already MORE than halfway out at t=0.5).
+        state.reveal_t = vec![1.0, 0.5];
+        let eff = state.effective_positions(&nodes);
+        assert!(eff[1].x > 5.0 && eff[1].x < 10.0, "mid-flight past the midpoint: {}", eff[1].x);
+        // A node whose origin is itself never moves.
+        assert_eq!(eff[0], egui::vec2(0.0, 0.0));
+    }
+
+    /// A relayout (`recompute_layout`) clears the un-bundling animation: every node is reset to
+    /// settled (`reveal_t == 1.0`) and sized to the new node count, so a fresh layout never animates
+    /// the whole graph. status: code-graph-bundling
+    #[test]
+    fn relayout_clears_reveal_anim() {
+        use super::super::source::{LayoutConfig, NodeDescriptor, NodeShape, Source};
+        use hiker_graph::{LayoutKind as LK, LayoutTree};
+
+        struct TriSource;
+        impl Source for TriSource {
+            fn node_count(&self) -> usize {
+                3
+            }
+            fn nodes(&self, positions: &[egui::Vec2], _s: &Style) -> Vec<NodeDescriptor> {
+                positions
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &world_pos)| NodeDescriptor {
+                        index,
+                        world_pos,
+                        radius: 4.0,
+                        shape: NodeShape::Circle,
+                        fill: egui::Color32::WHITE,
+                        resting_stroke: egui::Stroke::NONE,
+                        hover_stroke: egui::Stroke::NONE,
+                        badge: None,
+                        bug_badge: None,
+                        label: None,
+                        label_min_zoom: 0.0,
+                        label_scale: 1.0,
+                        click_path: None,
+                        tooltip: None,
+                    })
+                    .collect()
+            }
+            fn edges(&self) -> Vec<(u32, u32)> {
+                vec![(0, 1), (1, 2)]
+            }
+            fn layout_tree(&self, _k: LK) -> LayoutTree {
+                LayoutTree::from_parents(&vec![None; 3])
+            }
+            fn preview_for(&self, _i: usize) -> Option<(String, String)> {
+                None
+            }
+        }
+
+        let mut state = State::new(Style::flat(), LayoutKind::ForceDirected);
+        // Dirty the animation state as if a fly-out were in progress.
+        state.positions = vec![egui::vec2(0.0, 0.0)];
+        state.reveal_t = vec![0.3];
+        state.prev_bundle_visible = vec![true];
+        state.prev_bundle_rep = vec![0];
+        state.reveal_origin = vec![0];
+
+        state.recompute_layout(&TriSource, LayoutConfig { area: 1_000.0, seed_box: 80.0 });
+        assert_eq!(state.reveal_t.len(), 3, "resized to the new node count");
+        assert!(state.reveal_t.iter().all(|&t| t == 1.0), "every node reset to settled");
+        assert!(state.prev_bundle_visible.is_empty(), "transition history cleared on relayout");
+        assert!(state.prev_bundle_rep.is_empty() && state.reveal_origin.is_empty(), "rep/origin cleared");
+    }
+
+    /// Nodes far apart on screen (one per cell) → every node visible + a zero fingerprint, even at a
+    /// positive screen scale, so a sparse graph never spuriously bundles. status: code-graph-bundling
+    #[test]
+    fn no_bundle_when_each_node_owns_its_cell() {
+        let state = State::new(Style::flat(), LayoutKind::ForceDirected);
+        // 2000 world units apart at screen scale 1.0 (cell 64) → different cells.
+        let nodes = [desc(0, egui::vec2(0.0, 0.0)), desc(1, egui::vec2(2000.0, 0.0))];
+        let positions: Vec<egui::Vec2> = nodes.iter().map(|d| d.world_pos).collect();
+        let lens = Lens::centred(ProjectionConfig::default(), Mobius::identity(), &positions);
+        let b = state.compute_bundles(&nodes, &lens, 1.0);
+        assert!(b.is_visible(0) && b.is_visible(1));
+        assert_eq!(b.rep(0), 0);
+        assert_eq!(b.rolled_count(0), 0, "no shared cell → nothing rolled up");
+        assert_eq!(b.fingerprint(), 0, "all visible → zero cache perturbation");
+    }
+}
+
 mod poincare_disk_tests {
     use crate::graph_view::{poincare_disk, Lens};
     use hiker_projection::{Complex, Mobius, ProjectionConfig, ProjectionKind};
@@ -299,5 +537,158 @@ mod pulse_tests {
         off.highlight.fluid = false;
         off.pulse_nodes(&[0]);
         assert!(off.fluid_energy.is_empty(), "fluid off → nothing injected");
+    }
+}
+
+/// `pump_layout` lets a host settle a force layout WITHOUT rendering through
+/// `ui()` — the fix for the spec graph sitting at its scatter seed when it was
+/// only ever driven as a read-only minimap. status: spec-minimap-swap
+mod pump_layout_tests {
+    use std::time::{Duration, Instant};
+
+    use hiker_graph::{LayoutKind, LayoutTree};
+
+    use super::super::source::{LayoutConfig, NodeDescriptor, Source};
+    use super::super::{styling::Style, LayoutWorker, State};
+
+    /// A trivial line graph A—B—C—D source (degree-weighted dots, stable keys),
+    /// enough to give the force worker something to relax.
+    struct LineSource {
+        n: usize,
+    }
+
+    impl Source for LineSource {
+        fn node_count(&self) -> usize {
+            self.n
+        }
+
+        fn nodes(&self, positions: &[egui::Vec2], _style: &Style) -> Vec<NodeDescriptor> {
+            positions
+                .iter()
+                .enumerate()
+                .map(|(index, &world_pos)| NodeDescriptor {
+                    index,
+                    world_pos,
+                    radius: 4.0,
+                    shape: super::super::source::NodeShape::Circle,
+                    fill: egui::Color32::WHITE,
+                    resting_stroke: egui::Stroke::NONE,
+                    hover_stroke: egui::Stroke::NONE,
+                    badge: None,
+                    bug_badge: None,
+                    label: None,
+                    label_min_zoom: 0.0,
+                    label_scale: 1.0,
+                    click_path: None,
+                    tooltip: None,
+                })
+                .collect()
+        }
+
+        fn edges(&self) -> Vec<(u32, u32)> {
+            (0..self.n.saturating_sub(1)).map(|i| (i as u32, (i + 1) as u32)).collect()
+        }
+
+        fn layout_tree(&self, _kind: LayoutKind) -> LayoutTree {
+            LayoutTree::from_parents(&vec![None; self.n])
+        }
+
+        fn node_key(&self, index: usize) -> Option<String> {
+            Some(format!("n{index}"))
+        }
+
+        fn preview_for(&self, _index: usize) -> Option<(String, String)> {
+            None
+        }
+    }
+
+    /// A settling worker's positions become readable via `pump_layout` alone —
+    /// no `ui()` call, no egui context to allocate a pane. The layout starts at a
+    /// scatter seed and `pump_layout` snapshots the worker's relaxed positions, so
+    /// the nodes move off the seed (the bug was: with only a minimap, nothing ever
+    /// pumped, so the spec graph stayed scattered).
+    #[test]
+    fn pump_layout_settles_without_ui() {
+        let ctx = egui::Context::default();
+        let mut s = State::new(Style::flat(), LayoutKind::ForceDirected);
+        let source = LineSource { n: 4 };
+        s.recompute_layout(&source, LayoutConfig { area: 1_000.0, seed_box: 80.0 });
+        let seed = s.positions.clone();
+        assert_eq!(seed.len(), 4, "scatter seed has one position per node");
+        // Pump until the worker converges (bounded by a wall-clock deadline so a
+        // slow/non-converging build can't hang the test), exactly as a
+        // minimap-only host would each frame.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while s.worker.as_ref().is_some_and(LayoutWorker::is_running)
+            && Instant::now() < deadline
+        {
+            s.pump_layout(&ctx);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The relaxed line graph spreads its endpoints apart — the positions are
+        // no longer the seed, proving the worker advanced through `pump_layout`.
+        assert!(
+            s.positions.iter().zip(&seed).any(|(a, b)| (*a - *b).length() > 1.0),
+            "pump_layout advanced the force layout off its scatter seed",
+        );
+    }
+}
+
+/// Affine glide-to-selection: `glide_to` aims `view.pan` at `-world`, `advance_glide`
+/// eases it there and lands exactly on target at `t >= 1`, and a tiny move snaps.
+/// status: code-graph
+mod glide_tests {
+    use eframe::egui;
+    use hiker_graph::LayoutKind;
+
+    use super::super::{styling::Style, State};
+
+    /// Mirror of the engine's affine glide duration (`nav::GLIDE_DUR`), inlined here so the test
+    /// doesn't depend on a private const's visibility.
+    const GLIDE_DUR: f32 = 0.4;
+
+    #[test]
+    fn glide_to_targets_negated_world_and_advance_lands_exactly() {
+        let mut s = State::new(Style::flat(), LayoutKind::ForceDirected);
+        s.view.pan = egui::vec2(0.0, 0.0);
+        s.view.zoom = 1.0;
+        let world = egui::vec2(100.0, -50.0);
+        s.glide_to(world);
+
+        // Target pan = -world (centring law `pan = -w`), animation just started.
+        let g = s.glide.expect("a non-tiny move starts a glide");
+        assert_eq!(g.target_pan, -world, "glide aims pan at the negated world point");
+        assert_eq!(g.start_pan, egui::vec2(0.0, 0.0), "starts from the current pan");
+        assert_eq!(g.t, 0.0);
+
+        // One sub-duration step moves pan off the start toward the target, but not
+        // all the way (ease-out has 0 < e < 1 for 0 < t < 1).
+        let still = s.advance_glide(GLIDE_DUR * 0.5);
+        assert!(still, "mid-flight at half the duration");
+        let mid = s.view.pan;
+        assert!(mid != egui::vec2(0.0, 0.0), "pan moved off the start");
+        assert!(mid != -world, "pan not yet at target");
+        // Moving toward the target: closer to -world than the start was.
+        assert!(
+            (mid - (-world)).length() < world.length(),
+            "pan glided toward the target",
+        );
+
+        // A step past the end lands EXACTLY on target and clears the glide.
+        let still = s.advance_glide(GLIDE_DUR);
+        assert!(!still, "glide finished");
+        assert_eq!(s.view.pan, -world, "ease endpoint is exact at t >= 1");
+        assert!(s.glide.is_none(), "finished glide is cleared");
+    }
+
+    #[test]
+    fn glide_to_snaps_on_a_tiny_move() {
+        let mut s = State::new(Style::flat(), LayoutKind::ForceDirected);
+        // Pan already centres a world point a hair away from the new target.
+        s.view.pan = egui::vec2(0.0, 0.0);
+        // world ~ (0.1, 0.0) → target pan (-0.1, 0) is < GLIDE_MIN_MOVE from start.
+        s.glide_to(egui::vec2(0.1, 0.0));
+        assert!(s.glide.is_none(), "a tiny move never starts an animation");
+        assert_eq!(s.view.pan, egui::vec2(-0.1, 0.0), "tiny move snaps straight to target");
     }
 }

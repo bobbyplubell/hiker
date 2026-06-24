@@ -2,6 +2,14 @@
 
 Hiker's file tree — the vault's notes browser — is the content of an `egui_workbench` primary-side-bar **Files** activity. The side-bar / accordion mechanics (sections, headers, collapse, resize, drag-to-add, persistence) belong to `egui_workbench` (`egui-workbench/SPEC.md`); this doc owns hiker's tree content: what the rows are, how they're created / moved / renamed / deleted, the trash, the per-row index-state markers, source visibility, and note multi-select.
 
+The dedicated three-button Files/Clusters/Trails switcher row that once sat above the tree is superseded by the egui-workbench activity-bar + multi-region sidebar (`egui-workbench/`, `app/src/workbench_host.rs`): each surface (Files / Clusters / Trails / Trash / Vault) is now an independent dockable panel reached from the activity bar, and per-vault layout persists via the workbench panel set (`app/src/side_panel_persist.rs`) rather than the old `vault.sidebar_mode` row. [sidebar-mode-switcher]
+status:: superseded
+touches:: [[code:hiker/side_panel_persist]], [[code:hiker/workbench_host]]
+
+One collapse toggle is shared across every surface: the sidebar collapse hides the whole sidebar regardless of which panel is active, so the modes share a single collapse state by virtue of operating on the same sidebar. [sidebar-mode-shared-collapse]
+status:: done
+note:: evidence: `app/src/sidebar/files.rs` (sidebar toggle unchanged across modes)
+
 ## File tree
 
 In Files mode the side bar hosts the file tree, including drag-and-drop note moves — the drop calls a single core `move_note` command that does the fs rename and updates the index path in one step, so the move is recorded explicitly rather than being inferred from watcher events. Same code path is exposed as a `hiker mv` CLI command. [drag-and-drop-move]
@@ -28,7 +36,12 @@ note:: `⋯` icon button in the unified sidebar top row, persistent across every
 
 - **New note** (Files-mode `+` left-click): creates a numbered `new-note-N.md` in the currently-selected folder (vault root if nothing's selected) via a `create_note(rel_path)` core command. `N` is the lowest positive integer that doesn't collide with an existing file in the target folder — `new-note-1.md` first, then `new-note-2.md`, and so on. The new file opens in the editor immediately, and the tree row enters inline-rename mode with the `new-note-N` basename pre-selected (extension excluded from selection so users can type a new name and hit Enter without re-typing `.md`). Submit renames via the same `move_note` path; Esc keeps the default name. [sidebar-new-item-button]
 - **`⋯` menu** (Files mode) opens a small popover with the v1 entries below. Adding new entries is intentionally low-friction — the menu is the catch-all for low-frequency filetree actions, so future verbs slot in here rather than growing the header row.
-  - **Refresh tree** — re-reads the directory and rebuilds the tree from disk. With the v1 watcher, the tree should mostly stay in sync on its own — refresh is a backstop for the watcher's known failure modes (notify queue overflow during big git checkouts, NFS/network filesystems, missed events) and for the "did I really just save that" sanity case. Auto-refresh from watcher events is a v2 add per `watcher.md`; refresh stays even after that lands. [tree-refresh-manual, tree-refresh-watcher]
+  - **Refresh tree** — re-reads the directory and rebuilds the tree from disk, restoring the active highlight with expansion state preserved across the refresh. With the v1 watcher, the tree should mostly stay in sync on its own — refresh is a backstop for the watcher's known failure modes (notify queue overflow during big git checkouts, NFS/network filesystems, missed events) and for the "did I really just save that" sanity case. Auto-refresh from watcher events is a v2 add per `watcher.md`; refresh stays even after that lands. [tree-refresh-manual]
+status:: done
+note:: evidence: `app/src/sidebar/files.rs` ("Refresh tree" entry)
+  - **Auto-refresh on watcher events** — a 200ms-debounced tree refresh on created/deleted/renamed events; modified events are no-ops (tree shape unchanged), and the manual [[spec:tree-refresh-manual]] refresh stays as a backstop. Lifted from v2 → v1; the `watcher.md` "Out of scope for v1" entry naming this is now stale. [tree-refresh-watcher]
+status:: done
+note:: evidence: `app/src/sidebar/files.rs` (watcher file events handling)
   - **Reindex all** — full-vault reindex via [[spec:reindex-all-action]] (see `index.md`). No confirm modal: re-embedding identical content is non-destructive, and the user opted in by clicking.
   - **Reindex this file** — single-file reindex via [[spec:reindex-current-file-action]]; greyed when no file is active.
   - **Sort by ▸** — submenu of mutually-exclusive sort orders applied to the file tree (folders always grouped first; the chosen order applies within folders and within files). v1 entries: **Name (A→Z)** (default), **Name (Z→A)**, **Modified (newest first)**, **Modified (oldest first)**. Selection persists in memory only for v1; per-vault persistence is a `settings.md` concern when that surface lands. Modified time comes from the filesystem's mtime — same field the watcher and indexer already use, no new metadata. [tree-sort-options]
@@ -142,6 +155,9 @@ Trash is its own activity-bar panel ([[spec:feature-trash-panel]]), not pinned i
 status:: done
 implements:: [[code:hiker/workbench_host/impl#[`HikerWbBehavior<'a>`][`Host<HikerWbTab, _>`]side_bar_actions_menu]]
 note:: Trash is a standalone activity-bar panel (folder/trash icon), not pinned inside Files. Body lists trashed items (name + deleted-at + Restore / Purge) read from `hiker_core::trash::Trash`; empty shows "Trash is empty". The batch "Empty trash" verb lives in the header right-click menu (`Host::side_bar_actions_menu` for `Trash`, disabled when empty) and routes through the `EmptyTrash` confirm modal. Removed from the Files panel (`sidebar/files.rs` no longer has `trash_bin`/`TrashTimeFmt`) · evidence: `app/src/sidebar/trash.rs` (`TrashView`), `panels_registry.rs` (`PANEL_TRASH` / `P_TRASH`), `workbench_host.rs` (`HikerMode::Trash` + label/panel_id/icon/`all`), `state.rs` (`ConfirmIntent::EmptyTrash`)
+
+The earlier in-tree trash bin — a row pinned at the bottom of the file tree — is superseded by the standalone panel above (`app/src/sidebar/trash.rs`); the bin no longer lives in the file tree. [tree-trash-bin]
+status:: superseded
 
 Planned richer interactions (the bullets below describe the intended surface; the current panel implements the disk listing + Restore / Purge / Empty):
 
@@ -258,23 +274,3 @@ note:: the multi-selection set is the target for bulk file-tree actions — move
 - **Drag-into-canvas (pending).** A file row or multi-selection dragged onto an open canvas should drop pointer nodes at the drop point — the deferred [[spec:canvas-dnd-add]] (`canvas.md`), riding the uniform vault-path drag payload (`design.md` [[spec:trails-dnd-ingestion]]). Until it lands, the **Add to canvas** verb and the canvas **Insert from vault** picker cover insertion. [note-multi-select-bulk-verbs]
 - **Selected-notes clustering build scope.** Multi-selection defaults the clustering build-scope picker ([[spec:cluster-editor-build-scope-picker]] in `cluster-editor.md`) to `BuildScope::Notes` (per [[spec:cluster-build-scope]] in `clustering.md`), feeding it the set of note ids.
 - **Drag-into-cluster authoring.** A multi-selected set can be dragged into a cluster in the cluster editor to author membership by example ([[spec:tree-author-blank]] in `cluster-editor.md`).
-
-## Registry imports (from status.md)
-
-Entries imported from the retired status registry that had no anchor in this doc —
-re-home them into the relevant sections as the doc evolves.
-
-- **tree-refresh-manual** — re-reads dir; restores active highlight; expansion state preserved across refresh; lives inside the `…` actions menu [tree-refresh-manual]
-  status:: done
-  note:: evidence: `app/src/sidebar/files.rs` ("Refresh tree" entry)
-- **tree-refresh-watcher** — 200ms-debounced tree refresh on created/deleted/renamed events; modified events are no-ops (tree shape unchanged); manual [[spec:tree-refresh-manual]] stays as a backstop. Lifted from v2 → v1; watcher.md "Out of scope for v1" entry now stale [tree-refresh-watcher]
-  status:: done
-  note:: evidence: `app/src/sidebar/files.rs` (watcher file events handling)
-- **tree-trash-bin** — superseded by [[spec:feature-trash-panel]]: Trash is now a standalone activity-bar panel (`app/src/sidebar/trash.rs`), no longer pinned at the bottom of the file tree [tree-trash-bin]
-  status:: superseded
-- **sidebar-mode-switcher** — superseded by the egui-workbench activity-bar + multi-region sidebar (`egui-workbench/`, `app/src/workbench_host.rs`): the dedicated three-button Files/Clusters/Trails switcher row is gone; each surface (Files / Clusters / Trails / Trash / Vault) is now an independent dockable panel reached from the activity bar. Per-vault layout persists via the workbench panel set (`app/src/side_panel_persist.rs`), not the old `vault.sidebar_mode` row [sidebar-mode-switcher]
-  status:: superseded
-  touches:: [[code:hiker/side_panel_persist]], [[code:hiker/workbench_host]]
-- **sidebar-mode-shared-collapse** — the existing sidebar collapse toggle hides the whole sidebar regardless of mode; modes share one collapse state by virtue of operating on the same sidebar [sidebar-mode-shared-collapse]
-  status:: done
-  note:: evidence: `app/src/sidebar/files.rs` (sidebar toggle unchanged across modes)

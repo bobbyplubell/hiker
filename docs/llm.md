@@ -39,10 +39,12 @@ note:: `core/src/llm.rs` — `client_from_config` / `provider_config_from` trans
 - **Background features** — triggered by routine actions (save, ingest), applying
   terminal results without per-call review (the user opted into the feature).
   Examples: auto-tag-on-save, summary-on-save, cluster summarization on cluster
-  build. Debounced so save bursts coalesce to one prompt. Default off; opt-in per
-  feature. When `[llm.background] review_required` is on, a background write stages
-  a **pending** op (reviewed per `patch-review.md`) instead of mutating frontmatter
-  directly. [llm-feature-type-background, llm-feature-debounce]
+  build. Default off; opt-in per feature. When `[llm.background] review_required`
+  is on, a background write stages a **pending** op (reviewed per `patch-review.md`)
+  instead of mutating frontmatter directly. [llm-feature-type-background]
+  - **Debounced** so save bursts coalesce to one prompt: a 1–2s coalesce window for
+    save-driven background LLM features so save bursts → one prompt. [llm-feature-debounce]
+    status:: planned
 - **Fan-out features** — user-initiated batch operations spanning many items.
   Examples: RAPTOR-shaped tree building (cluster naming + summarization across N
   clusters), regenerate-all-summaries, tag-all-unenriched-notes. Scope is determined
@@ -124,12 +126,17 @@ changes the prompt. Two-tier scope (mirrors the config tiers):
 - Vault scope: `vault/.hiker/prompts/<feature>.md` — per-project overrides, wins
   over user.
 
-Defaults written to user scope on first run if absent. Mustache `{{var}}`
-substitution; each shipped default starts with a comment block listing the
-placeholders that feature accepts. [llm-prompts-file-store, llm-prompts-mustache-templating]
+Defaults written to user scope on first run if absent; each shipped default starts
+with a comment block listing the placeholders that feature accepts. [llm-prompts-file-store]
 status:: done
 touches:: [[code:hiker/prompts]]
-note:: `core/src/prompts.rs` — two-tier loader (`ensure_user_default` auto-creates from bundled defaults; vault wins), `Prompts::load(vault_root)`, `bundled_defaults()`, `substitute` (`{{var}}`, unknown placeholders pass through verbatim).
+note:: `core/src/prompts.rs` — two-tier loader (`ensure_user_default` auto-creates from bundled defaults; vault wins), `Prompts::load(vault_root)`, `bundled_defaults()`.
+
+Mustache `{{var}}` substitution fills the placeholders: `core/src/prompts.rs::substitute`
+does `{{var}}` substitution (whitespace-tolerant); unknown placeholders pass through
+verbatim so a partially-customized prompt doesn't silently lose data. [llm-prompts-mustache-templating]
+status:: done
+touches:: [[code:hiker/prompts]]
 
 **Upgrade-aware staleness.** Hiker stamps each bundled default's content hash in a
 `<feature>.default.sha` sidecar next to the user-scope prompt; if the bundled
@@ -142,6 +149,14 @@ note:: `core/src/prompts.rs::Prompts::staleness` — `<feature>.default.sha` rec
 Bundled defaults register in `core::prompts::bundled_defaults()` keyed by feature;
 the prompt file lives at `core/prompts/<feature_key>.md` and is baked into the
 binary. New background/fan-out features land their default there.
+
+A **settings UI Prompts tab** surfaces the prompt files: editable text, default
+reference, reset, diff, and a test affordance. [llm-prompts-settings-tab]
+status:: planned
+
+The tab's **test affordance** is a "test prompt with sample data" button that runs
+the prompt against sample data. [llm-prompt-test-button]
+status:: planned
 
 
 ## Audit log
@@ -210,17 +225,3 @@ never into a hidden `.hiker/` substrate.
 - `op-log.md` / `patch-review.md` — the pending/patch-review layer agent and review-mode background writes flow through.
 - `index.md` — `core::embed` (embeddings), the separate module sharing the `hiker-llm` dep.
 - `design.md` enrichment pipeline — the background/fan-out features that consume the prompts above.
-
-## Registry imports (from status.md)
-
-Entries imported from the retired status registry that had no anchor in this doc.
-
-- **llm-feature-debounce** — 1–2s coalesce window for save-driven background LLM features so save bursts → one prompt [llm-feature-debounce]
-  status:: planned
-- **llm-prompts-mustache-templating** — `core/src/prompts.rs::substitute` — `{{var}}` substitution (whitespace-tolerant); unknown placeholders pass through verbatim so a partially-customized prompt doesn't silently lose data [llm-prompts-mustache-templating]
-  status:: done
-  touches:: [[code:hiker/prompts]]
-- **llm-prompts-settings-tab** — settings UI Prompts tab: editable text, default reference, reset, diff, test affordance [llm-prompts-settings-tab]
-  status:: planned
-- **llm-prompt-test-button** — "test prompt with sample data" affordance in the Prompts tab [llm-prompt-test-button]
-  status:: planned

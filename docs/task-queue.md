@@ -11,7 +11,10 @@ note:: new `core::tasks` module (queue + lease table + event emitter) wired into
 status:: partial
 note:: note-mutation menu (the first non-chat producer) now flows through the queue; RAPTOR / auto-tag / summary-on-save producers are still planned, so the slug stays partial until they land · evidence: `core/src/tasks.rs` (`TaskKind` enum); `submit_note_mutation` producer in the host
 
-**Non-LLM I/O lane.** I/O-bound work (a web crawl) drains on a dedicated in-process worker — not the single-shot direct-LLM drain, and not the synchronous `NonLlmHandlers` side-channel (a crawl runs for minutes with concurrent fetches). It's never an MCP client, carries no `output_schema`, and lives on the queue purely for its lease/progress/cancel/visibility surface. A crawl's per-page extractions roll up under the parent crawl via [[spec:task-queue-task-grouping]] so the widget shows one row, not N. [task-queue-io-worker-lane, crawl-task-queue-lane]
+**Non-LLM I/O lane.** I/O-bound work (a web crawl) drains on a dedicated in-process worker — not the single-shot direct-LLM drain, and not the synchronous `NonLlmHandlers` side-channel (a crawl runs for minutes with concurrent fetches). It's never an MCP client, carries no `output_schema`, and lives on the queue purely for its lease/progress/cancel/visibility surface. [task-queue-io-worker-lane]
+status:: planned
+
+A crawl's per-page extractions roll up under the parent crawl via [[spec:task-queue-task-grouping]] so the widget shows one row, not N. [crawl-task-queue-lane]
 
 
 ## Architecture
@@ -305,7 +308,10 @@ note:: enforced by absence — the queue is reachable only via `Queue::*` (in-pr
 
 ### Worker preference
 
-When both the direct worker and MCP-client consumers are eligible for a task, `[tasks] worker_preference` picks the winner:
+When both the direct worker and MCP-client consumers are eligible for a task, `worker_preference = 'auto' | 'internal' | 'external'` arbitrates direct vs MCP — it picks the winner: [task-queue-worker-preference]
+status:: done
+touches:: [[code:hiker/tasks]]
+note:: evidence: `core/src/config.rs::WorkerPreferenceCfg`; `core/src/tasks.rs::Queue::submit` uses `direct_grace()` to set `eligible_to_direct_at`
 
 - **`internal`** — direct worker grabs eligible `Direct` tasks immediately; MCP `task_checkout` only sees a task if the direct worker is disabled or busy. [task-queue-worker-preference-internal]
 status:: done
@@ -391,7 +397,15 @@ status:: done
 implements:: [[code:hiker/config/sections/TasksConfig]]
 note:: full schema, vault-scope-eligible; `worker_preference` also user-scope eligible per spec · evidence: `core/src/config.rs::TasksConfig` + sub-structs (`DirectWorkerConfig`, `LeaseConfig`); eligibility entries in `ELIGIBLE_VAULT` and `ELIGIBLE_USER`
 
-Settings UI gets a new "Task queue" section: the `direct_worker.enabled` toggle, a `worker_preference` radio, and a numeric retention field — all also surfaced inline on the queue detail page so the user can flip them without leaving the queue view. (`expose_to_chat_agent` is vestigial — no in-app chat agent — so it carries no live UI toggle.) [task-queue-settings-ui-section, task-queue-worker-toggles]
+Settings UI gets a new "Task queue" section, wired on both surfaces — the settings panel and inline on the queue detail page. [task-queue-settings-ui-section]
+status:: done
+touches:: [[code:hiker/panels/queue]], [[code:hiker/panels/settings]]
+note:: evidence: `app/src/panels/settings/mod.rs` Task queue section + inline toggles in `app/src/panels/queue.rs` (direct-worker, expose-to-chat-agent, worker-preference) bound to `set_setting` with a status flash on save
+
+The section carries the `direct_worker.enabled` toggle, a `worker_preference` radio, and a numeric retention field as independent toggles — all also surfaced inline on the queue detail page so the user can flip them without leaving the queue view. (`expose_to_chat_agent` is vestigial — no in-app chat agent — so it carries no live UI toggle.) [task-queue-worker-toggles]
+status:: done
+touches:: [[code:hiker/panels/settings]]
+note:: evidence: `core/src/config.rs::TasksConfig` (independent `direct_worker.enabled` + `expose_to_chat_agent`); same toggles surfaced in `app/src/panels/settings/mod.rs`'s Task queue section
 
 When `[llm] enabled = false` (per [[spec:llm-features-disable-entirely]]), the `[tasks]` settings still load but the direct worker is force-disabled regardless of `direct_worker.enabled` — no LLM means no in-process worker, by definition. The MCP `task_*` tools stop being advertised since the queue's only purpose is LLM work. The home-page widget renders an empty state. [task-queue-respects-llm-disable]
 status:: done
@@ -503,9 +517,14 @@ implements:: [[code:hiker/tasks/handlers/impl#[DirectWorker]record_outcome]]
 status:: done
 touches:: [[code:hiker/tasks]]
 note:: no on-disk persistence in v1; queue resets on vault swap · evidence: `core/src/tasks.rs::QueueState` is a plain `HashMap` — no persistence
-- **Server→client cancellation push to external workers.** External agents learn cancellation at submit time via `stale_lease`. rmcp-streamable cancellation notifications are the right v2 fix; tracked as [[spec:task-queue-mcp-cancel-notification]] (deferred).
-- **Task grouping / jobs.** Fan-out producers submit N tasks and aggregate themselves; the queue doesn't model "this batch of 50 tasks is one logical job." If the home-page widget grows a "RAPTOR build (50 tasks)" header view, that's a presentation-layer grouping by `metadata.group_id`, not a queue concept. ([[spec:task-queue-task-grouping]], deferred.)
-- **Per-task-type worker preference.** One global preference for v1. Per-type matrix (e.g. "always external for note-mutation, always internal for auto-tag") is a settings UI elaboration if the global setting proves too coarse. ([[spec:task-queue-per-type-preference]], deferred.)
+  The durable on-disk twin — surviving a task across restarts rather than resetting in-memory — is deferred. [task-queue-persistence]
+status:: planned
+- **Server→client cancellation push to external workers.** External agents learn cancellation at submit time via `stale_lease`. rmcp-streamable cancellation notifications are the right v2 fix; deferred. [task-queue-mcp-cancel-notification]
+status:: planned
+- **Task grouping / jobs.** Fan-out producers submit N tasks and aggregate themselves; the queue doesn't model "this batch of 50 tasks is one logical job." If the home-page widget grows a "RAPTOR build (50 tasks)" header view, that's a presentation-layer grouping by `metadata.group_id` for fan-out producers, not a queue concept. Deferred. [task-queue-task-grouping]
+status:: planned
+- **Per-task-type worker preference.** One global preference for v1. A per-task-type override of `worker_preference` — a per-type matrix (e.g. "always external for note-mutation, always internal for auto-tag") — is a settings UI elaboration if the global setting proves too coarse. Deferred. [task-queue-per-type-preference]
+status:: planned
 - **Cancellation chaining across producers.** A fan-out producer canceling itself cancels each of its outstanding handles individually; the queue doesn't have a "cancel all tasks tagged X" API. Producers manage their own bundles.
 - **Cross-vault queue.** One queue per vault, mirroring every other core module's vault scoping.
 - **Quota / rate-limit enforcement at the queue.** Throttling LLM calls is the underlying worker's concern (or the provider's). The queue doesn't model "no more than N direct-LLM calls per minute."
@@ -517,31 +536,3 @@ note:: no on-disk persistence in v1; queue resets on vault swap · evidence: `co
 - `mcp.md` adds the `task_*` tool surface alongside this spec; no separate spec doc.
 - `settings.md`'s settings UI gets the Task queue section once settings UI lands per its existing milestone.
 - `editor.md`'s vault-home widget table gains a row for the queue tile; no shape change to the home-page architecture.
-
-## Registry imports (from status.md)
-
-Entries imported from the retired status registry that had no anchor in this doc —
-re-home them into the relevant sections as the doc evolves.
-
-- **task-queue-io-worker-lane** — a dedicated in-process worker for long-running non-LLM I/O (web crawl, `crawl-task-queue-lane`); distinct from the direct-LLM drain and the synchronous `NonLlmHandlers` path; never an MCP client; no `output_schema`; on the queue for lease/progress/cancel/visibility; per-page tasks roll up via [[spec:task-queue-task-grouping]] [task-queue-io-worker-lane]
-  status:: planned
-- **task-queue-worker-toggles** — independent toggles [task-queue-worker-toggles]
-  status:: done
-  touches:: [[code:hiker/panels/settings]]
-  note:: evidence: `core/src/config.rs::TasksConfig` (independent `direct_worker.enabled` + `expose_to_chat_agent`); same toggles surfaced in `app/src/panels/settings/mod.rs`'s Task queue section
-- **task-queue-worker-preference** — `worker_preference = 'auto' | 'internal' | 'external'` arbitrates direct vs MCP [task-queue-worker-preference]
-  status:: done
-  touches:: [[code:hiker/tasks]]
-  note:: evidence: `core/src/config.rs::WorkerPreferenceCfg`; `core/src/tasks.rs::Queue::submit` uses `direct_grace()` to set `eligible_to_direct_at`
-- **task-queue-settings-ui-section** — both surfaces wired [task-queue-settings-ui-section]
-  status:: done
-  touches:: [[code:hiker/panels/queue]], [[code:hiker/panels/settings]]
-  note:: evidence: `app/src/panels/settings/mod.rs` Task queue section + inline toggles in `app/src/panels/queue.rs` (direct-worker, expose-to-chat-agent, worker-preference) bound to `set_setting` with a status flash on save
-- **task-queue-mcp-cancel-notification** — deferred — rmcp server→client streamable cancellation push [task-queue-mcp-cancel-notification]
-  status:: planned
-- **task-queue-persistence** — deferred — in-memory only in v1 [task-queue-persistence]
-  status:: planned
-- **task-queue-task-grouping** — deferred — `metadata.group_id` for fan-out producers [task-queue-task-grouping]
-  status:: planned
-- **task-queue-per-type-preference** — deferred — per-task-type override of `worker_preference` [task-queue-per-type-preference]
-  status:: planned

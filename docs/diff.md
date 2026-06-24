@@ -5,7 +5,7 @@ A unified diff primitive plus the editor surfaces that consume it. Every diff in
 - **Diff is a mode of the editor tab, not a tab kind.** A tab carries an optional `diff: DiffSource`; when set, it renders the buffer's `current` decorated by `DiffLayer(resolve(diff), current)`. Toggle is in the editor toolbar; no separate `BufferDiff` / `SnapshotPreview` / `StagingPreview` / `TrashPreview` tab kinds. [diff-as-mode]
 status:: done
 note:: the editor tab carries `Option<DiffSource>`; `diff_overlay::compute` resolves the source and pushes a `DiffLayer`-derived layer onto the same editor widget. Diff toggle in the toolbar flips the active tab's `diff` field; no separate diff-tab kind
-- **One diff engine, rendering in the editor crate.** `editor_core::diff::lines(left, right)` is the single line-diff engine (with a word-level intraline pass); `editor-diff` turns its hunks into a `DecorationSet`. There is no separate `core::diff` — the vestigial `hiker_core::diff` line-differ was deleted and its two callers moved onto this engine. [diff-core-module, diff-renderer]
+- **One diff engine, rendering in the editor crate.** `editor_core::diff::lines(left, right)` is the single line-diff engine (with a word-level intraline pass); `editor-diff` turns its hunks into a `DecorationSet`. There is no separate `core::diff` — the vestigial `hiker_core::diff` line-differ was deleted and its two callers moved onto this engine. (The engine `diff-core-module` and the renderer `diff-renderer` are defined under Module placement below.)
 
 
 ## DiffLayer
@@ -29,6 +29,9 @@ pub enum DiffOwner {
 }
 ```
 
+The input contract is `{ before, after }` — two ropes in (`app/src/tab.rs`'s `DiffSource` resolves the `before`; the buffer supplies the `after`). Banner actions + close move out of the renderer's contract since each consumer's preview pane owns its own banner + lifecycle. [diff-viewer-input-shape]
+status:: done
+
 Owners drive UI affordances, not rendering — the decoration set is identical across owners; only the per-hunk verbs differ (above), riding as overlay widgets on the hunk. [diff-layer-owner]
 status:: done
 note:: `DiffOwner::{ Index, Pending, Agent, HistoryVersion, Manual }` (`editor/editor-diff/src/lib.rs`). `diff_overlay::compute` picks the owner from buffer state (Agent for hydrated proposals) or the DiffSource shape. Agent owner additionally emits per-hunk Accept/Reject ActionRow widgets via `attach_agent_hunk_widgets`
@@ -37,11 +40,14 @@ The layer recomputes hunks each frame from `(base, current)`. Cheap because the 
 
 The decoration set the layer emits:
 
-- **Line decorations.** Pale-red background for `base`-only lines (deletion), pale-green for `current`-only lines (insertion), default for equal lines.
+- **Line decorations.** Pale-red background for `base`-only lines (deletion), pale-green for `current`-only lines (insertion), default for equal lines. Whole-file paint: the renderer paints full file context with the changes inline (red/green per-line decorations over `editor_core::diff::lines`), not just the changed hunks; the between-hunks `⋯` code path is in place but unreachable until [[spec:diff-viewer-grouped-hunks]] lands. [diff-viewer-line-unified]
+  status:: done
 - **View zones.** Removed lines from `base` are injected as phantom lines above their successor in `current` (block decorations that affect line height). Same mechanism the editor already uses for chunk-boundary widgets.
 - **Intraline marks.** For each paired delete/insert line, a second pass (in the editor renderer over `editor_core::diff`, not `core::diff`) emits `Decoration::mark` ranges with saturated red/green over the pale line background. Controlled by the per-vault `view.intraline_diff` toggle. [diff-viewer-intraline]
 status:: done
 note:: character-level highlights inside paired delete/insert lines. Renderer adds intra mark decorations on top of the line backgrounds
+  - The renderer emits `.cm-diff-add-intra` / `.cm-diff-del-intra` mark decorations keyed by line + UTF-8 byte offsets on top of the line decorations. [diff-intraline-render-marks]
+    status:: done
 - **Gutter markers.** `DiffAdded` / `DiffRemoved` / `DiffModified` glyphs per hunk. The only thing `Index` ownership emits.
 - **Overlay widgets (per hunk).** Owner-driven action buttons positioned at the hunk's first visible line. [diff-layer-hunk-widgets]
 status:: done
@@ -85,7 +91,11 @@ A tab is `Editor { buffer, diff: Option<DiffSource> }` (the only buffer-backed k
 2. If `diff` is `Some`, resolves the `DiffSource` to a `Rope` `base`, constructs a `DiffLayer { base, current: buffer.current, owner: owner_for(diff) }`, and pushes its decoration set onto the editor's decoration stack.
 3. Renders the toolbar's diff toggle as pressed when `diff.is_some()`. Right-clicking the toggle opens a source picker (per `editor.md` `editor-diff-target-picker`).
 
-The buffer's `current` is whatever the buffer normally holds — its rope is unchanged by entering diff mode. Diff is a content lens, not a buffer swap. Cursor and selection survive toggling on and off.
+The toolbar diff toggle is greyed when the buffer is clean *and* the `DiffSource` is `Disk(path)` *and* the path exists. Click toggles the tab's diff mode against the current `DiffSource` (default `Disk(path)`); right-click opens the source picker — `Diff against on-disk`, `Show changes…` (submenu), future sources. [editor-diff-vs-disk-toggle]
+status:: done
+
+The buffer's `current` is whatever the buffer normally holds — its rope is unchanged by entering diff mode. Diff is a content lens, not a buffer swap. Cursor and selection survive toggling on and off. Because entering diff mode is not a buffer swap — the tab's `current` is unchanged and decorations layer on top — [[spec:file-switch-guard-dirty]] doesn't fire and dirty-buffer state is preserved across mode toggles. [diff-viewer-respects-dirty-source]
+status:: done
 
 `owner_for(diff)` maps: `Disk` / `LiveBuffer` / `GitRef` / `Trash` / `Empty` → `Manual`; `HistoryVersion` → `HistoryVersion` (a snapshot); `PendingProposal` → `Agent`. (Verbs per the `DiffOwner` variants above.)
 
@@ -120,6 +130,12 @@ note:: `app/src/panels/git_diff.rs`; registered like its sibling singleton tabs 
 - `editor_core::diff` (editor-core crate) — the single diff engine: `lines(left, right) -> Vec<Hunk>` with line hunks (`HunkKind::{Context,Added,Removed,Modified}`, 0-based `left_lines`/`right_lines` ranges) plus a word-level intraline pass. `similar` confined here. There is no `core::diff`; the former `hiker_core::diff` line-differ was deleted and its callers (the sync fork-diff, the dirty-state gutter) moved onto this engine. [diff-core-module]
 status:: done
 note:: `core/src/diff.rs` (`compute`, `DiffResult`, `DiffHunk`, `DiffLine`, `DiffOp`). Pure text → diff using `similar`'s `TextDiff::from_lines` + `grouped_ops(3)`; `similar` confined to the module
+  - The dead intraline-IPC scaffolding in `hiker_core::diff` (zero callers) was deleted per `scratch/substrate_decision.md`'s safe-now cleanup. Intraline highlighting lives in the editor renderer ([[spec:diff-intraline-render-marks]]) over `editor_core::diff`, which is unaffected. [diff-intraline-core-pair]
+    status:: removed
+  - Superseded with [[spec:diff-intraline-core-pair]] — `IntralineSpan` deleted from `hiker_core::diff`. [diff-intraline-char-level-v1]
+    status:: removed
+  - Superseded with [[spec:diff-intraline-core-pair]] — `Line::intraline_spans` field + the `intraline` flag arg deleted from `hiker_core::diff`. [diff-intraline-ipc-flag]
+    status:: removed
 - `editor::diff` (editor crate, `editor-diff` module) — `DiffLayer`, `unified_decorations`, the intraline mark pass, view-zone construction for removed lines, gutter markers, hunk overlay widgets. Consumes `editor_core::diff` output. [diff-renderer]
 - `app/src/panels/buffer/` — the editor tab body. Owns `Editor { buffer, diff }` rendering, the toolbar diff toggle and source picker, the right-click "Show changes" menu, and per-owner hunk-verb dispatch.
 - CLI: `hiker diff <path> [<frame-id>]` calls `editor_core::diff::lines` directly and prints a unified diff. [cli-diff]
@@ -148,37 +164,14 @@ note:: reserved as deferred — agents can already retrieve two blobs (`get_note
 
 - [[spec:diff-viewer-split-view]] — side-by-side layout option on `DiffLayer`.
 - [[spec:diff-viewer-three-way]] — third rope input for merge resolution (the git conflict-marker resolver, `git.md`).
-- [[spec:diff-viewer-ignore-whitespace]] — toggle on the compute call.
+- **Ignore whitespace.** A toggle on the `compute` call to normalize whitespace before diffing. [diff-viewer-ignore-whitespace]
+  status:: planned
 - [[spec:diff-viewer-export-patch]] — "copy as unified diff" affordance.
+- **Grouped hunks.** A future `core::diff` entry point emits multiple hunks with bounded context (~3 lines per side); `⋯` separators + click-to-expand land then. Triggered by large-file ergonomics or [[spec:mcp-tool-diff]]. The wire format already accommodates a list of hunks. [diff-viewer-grouped-hunks]
+  status:: planned
 - [[spec:snapshot-diff-between-versions]] — multi-select two snapshot rows + "Diff selected" opens a tab with `diff = Some(HistoryVersion { path, snapshot_id: a })` against a buffer whose content is `content_at_snapshot(path, b)`.
+- **Activity-detail diff between versions.** Multi-select two activity rows + "Diff selected"; opens a `buffer` tab with `current = content_at(id_a)`, `diff = Some(HistoryVersion { op_id: id_b })`; depends on activity-detail multi-select. [activity-detail-diff-between-versions]
+  status:: planned
 - [[spec:mcp-tool-diff]] — agent-facing diff IPC.
 - **Two-sided rev-vs-rev diff in the summary panel.** v1 ([[spec:diff-summary-panel]]) always diffs against the live buffer on row-open even when both picks are revisions; the true rev-vs-rev view needs a read-only buffer materialized at the head rev. [diff-git-two-sided]
 status:: planned
-
-## Registry imports (from status.md)
-
-Entries imported from the retired status registry that had no anchor in this doc —
-re-home them into the relevant sections as the doc evolves.
-
-- **diff-viewer-input-shape** — `app/src/tab.rs` (`DiffSource` — the diff input). `{ before, after }` — actions + close move out of the renderer's contract since each consumer's preview pane owns its own banner + lifecycle [diff-viewer-input-shape]
-  status:: done
-- **diff-viewer-line-unified** — whole-file paint with red/green per-line decorations over `editor_core::diff::lines`; the renderer paints full file context with changes inline. The between-hunks `⋯` code path is in place but unreachable until [[spec:diff-viewer-grouped-hunks]] lands [diff-viewer-line-unified]
-  status:: done
-- **diff-viewer-grouped-hunks** — future `core::diff` entry point emits multiple hunks with bounded context (~3 lines per side); `⋯` separators + click-to-expand land then. Triggered by large-file ergonomics or [[spec:mcp-tool-diff]]. Wire format already accommodates a list of hunks [diff-viewer-grouped-hunks]
-  status:: planned
-- **diff-viewer-respects-dirty-source** — entering diff mode is not a buffer swap — the tab's `current` is unchanged, decorations layer on top — so [[spec:file-switch-guard-dirty]] doesn't fire and dirty-buffer state is preserved across mode toggles [diff-viewer-respects-dirty-source]
-  status:: done
-- **editor-diff-vs-disk-toggle** — toolbar diff toggle. Greyed when buffer is clean *and* `DiffSource` is `Disk(path)` *and* the path exists. Click toggles the tab's diff mode against the current `DiffSource` (default `Disk(path)`). Right-click opens a source picker: `Diff against on-disk`, `Show changes…` (submenu), future sources [editor-diff-vs-disk-toggle]
-  status:: done
-- **activity-detail-diff-between-versions** — multi-select two activity rows + "Diff selected"; opens a `buffer` tab with `current = content_at(id_a)`, `diff = Some(HistoryVersion { op_id: id_b })`; depends on activity-detail multi-select [activity-detail-diff-between-versions]
-  status:: planned
-- **diff-intraline-core-pair** — dead intraline-IPC scaffolding in `hiker_core::diff` (zero callers) deleted per `scratch/substrate_decision.md` safe-now cleanup. Intraline highlighting lives in the editor renderer ([[spec:diff-intraline-render-marks]]) over `editor_core::diff`, which is unaffected [diff-intraline-core-pair]
-  status:: removed
-- **diff-intraline-char-level-v1** — superseded with [[spec:diff-intraline-core-pair]] — `IntralineSpan` deleted from `hiker_core::diff` [diff-intraline-char-level-v1]
-  status:: removed
-- **diff-intraline-ipc-flag** — superseded with [[spec:diff-intraline-core-pair]] — `Line::intraline_spans` field + the `intraline` flag arg deleted from `hiker_core::diff` [diff-intraline-ipc-flag]
-  status:: removed
-- **diff-intraline-render-marks** — renderer emits `.cm-diff-add-intra` / `.cm-diff-del-intra` mark decorations keyed by line + UTF-8 byte offsets on top of the line decorations [diff-intraline-render-marks]
-  status:: done
-- **diff-viewer-ignore-whitespace** — toggle on the `compute` call to normalize whitespace before diffing [diff-viewer-ignore-whitespace]
-  status:: planned

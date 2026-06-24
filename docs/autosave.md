@@ -2,7 +2,7 @@
 
 Crash-recovery snapshots of dirty editor buffers, plus a tab-state restore on vault re-open. Written periodically from the frontend, owned by the backend, auto-restored as dirty sticky tabs on next launch when an autosaved buffer has unsaved deltas (no modal — the dirty-marker is the affordance). One snapshot per dirty buffer, overwritten in place each tick, separate from the actual file the user is editing.
 
-Autosave is distinct from saving and from the op log. Saving writes the *user's file*; autosave writes a *sidecar shadow copy* the user never sees unless we crash. The op log (`op-log.md`) records *committed* writes (accepted ops) for agent rollback / future sync, is durable and retention-bounded; autosave records *uncommitted* in-flight per-keystroke content for force-kill recovery, is ephemeral and GC'd on save. Different lifecycle, different consumers, different invariants; the two stores never share state, and conflating them would inflate the op log by orders of magnitude. [autosave-one-per-buffer, autosave-backend-module, autosave-store-layout, autosave-recover-cmd, autosave-tab-state-silent-restore, autosave-recovery-auto-restore]
+Autosave is distinct from saving and from the op log. Saving writes the *user's file*; autosave writes a *sidecar shadow copy* the user never sees unless we crash. The op log (`op-log.md`) records *committed* writes (accepted ops) for agent rollback / future sync, is durable and retention-bounded; autosave records *uncommitted* in-flight per-keystroke content for force-kill recovery, is ephemeral and GC'd on save. Different lifecycle, different consumers, different invariants; the two stores never share state, and conflating them would inflate the op log by orders of magnitude.
 
 
 ## Storage layout
@@ -46,7 +46,10 @@ Notes:
 - **Path-keyed entries.** The vault-relative path is the primary key. One entry per buffer; the `autosave_id` is just the file naming.
 - **`content_hash` is blake3 of the autosaved bytes.** Used by `autosave_recover()` to compare against the live on-disk hash and surface only the genuine deltas.
 - **`tab_state` is a single snapshot.** Most-recently-pushed value wins; `autosave_save_tab_state` overwrites it in place. Same write path as the per-buffer entries — one `index.json` rewrite covers both.
-- **Atomic writes only.** `index.json` updates use the `vim`-style write-temp-then-rename pattern so a crash mid-write leaves either the prior or new index, never a half-written one. Per-buffer `<id>.md` writes use the same pattern.
+- **Atomic writes only.** `index.json` updates use the `vim`-style write-temp-then-rename pattern so a crash mid-write leaves either the prior or new index, never a half-written one. Per-buffer `<id>.md` writes use the same pattern. [autosave-store-layout]
+status:: done
+touches:: [[code:hiker/autosave]]
+note:: `core/src/autosave.rs` (`Autosave::open` creates `<vault>/.hiker/autosave/`, `IndexFile` with `version`/`entries`/`tab_state` fields, atomic `write_file_atomic` helper write-temp-then-rename for both per-buffer `<id>--<slug>.md` files and `index.json`)
 
 The autosave directory is in the [[spec:watcher-ignore-hardcoded]] list (everything under `.hiker/` is). No [[spec:watcher-suppress-self-writes]] dance needed — autosave writes never reach the watcher's normalization stage. [autosave-no-watcher-suppression]
 status:: done
@@ -186,12 +189,3 @@ Autosave is on by default with a fixed 5s tick. No `[autosave]` config section i
 - `watcher.md` [[spec:watcher-ignore-hardcoded]] — autosave writes don't reach the watcher because `.hiker/` is hard-coded ignored.
 - `op-log.md` — separate store, separate lifecycle. Autosave never appends to the op log; saving a recovered buffer routes through the existing save path, which appends accepted ops as usual.
 - `design.md` "Sync / backup" — autosave directory falls into the regenerable bucket; the `index.json` is durable but trivial.
-
-## Registry imports (from status.md)
-
-Entries imported from the retired status registry that had no anchor in this doc —
-re-home them into the relevant sections as the doc evolves.
-
-- **autosave-store-layout** — `core/src/autosave.rs` (`Autosave::open` creates `<vault>/.hiker/autosave/`, `IndexFile` with `version`/`entries`/`tab_state` fields, atomic `write_file_atomic` helper write-temp-then-rename for both per-buffer `<id>--<slug>.md` files and `index.json`) [autosave-store-layout]
-  status:: done
-  touches:: [[code:hiker/autosave]]

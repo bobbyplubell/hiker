@@ -102,14 +102,22 @@ impl View {
     /// because the force layout's natural scale can vary from ~100 to
     /// ~10,000 world units depending on graph size, so a fixed default
     /// zoom always loses for some vault sizes.
+    ///
+    /// Returns the **unclamped** ideal fit zoom (`min(avail_w/span_x,
+    /// avail_h/span_y)`), guarded to a tiny positive floor — the TRUE
+    /// fitted-overview scale even when the actual `self.zoom` is clamped to
+    /// `zoom_range`. The code-graph view records this as its
+    /// `last_fit_zoom` so its LOD gate can be expressed as a ratio over the
+    /// fitted overview (`view.zoom / last_fit_zoom`), making the gate
+    /// independent of the graph's world extent. status: code-graph-bundling
     pub fn fit_to_positions(
         &mut self,
         positions: &[egui::Vec2],
         canvas: egui::Rect,
         zoom_range: (f32, f32),
-    ) {
+    ) -> f32 {
         if positions.is_empty() {
-            return;
+            return 1.0;
         }
         let mut lo = positions[0];
         let mut hi = positions[0];
@@ -124,9 +132,47 @@ impl View {
         let margin = 40.0;
         let avail_w = (canvas.width() - margin * 2.0).max(50.0);
         let avail_h = (canvas.height() - margin * 2.0).max(50.0);
-        let zoom = (avail_w / span_x).min(avail_h / span_y).clamp(zoom_range.0, zoom_range.1);
+        // The ideal (pre-clamp) fit — the genuine fitted-overview scale. A huge
+        // graph's ideal can fall below `zoom_range.0`; we still return the ideal
+        // so the LOD gate's ratio stays extent-independent (floored away from
+        // 0/NaN).
+        let ideal = (avail_w / span_x).min(avail_h / span_y).max(1e-6);
+        let zoom = ideal.clamp(zoom_range.0, zoom_range.1);
         let centre = (lo + hi) * 0.5;
         self.pan = -centre;
         self.zoom = zoom;
+        ideal
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `fit_to_positions` returns the UNCLAMPED ideal fit even when the actual `self.zoom` is floored
+    /// at the range minimum — the true fitted-overview scale the LOD gate's ratio needs. status: code-graph-bundling
+    #[test]
+    fn fit_returns_unclamped_ideal_when_zoom_clamped() {
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 1000.0));
+        // A very wide layout: span ~1e6, so the ideal fit (~9.2e-4) sits BELOW the 0.005 floor.
+        let positions = [egui::vec2(-500_000.0, -500_000.0), egui::vec2(500_000.0, 500_000.0)];
+        let mut v = View::default();
+        let ideal = v.fit_to_positions(&positions, canvas, (0.005, 6.0));
+        // The written zoom is clamped to the floor, but the returned ideal is the genuine (smaller)
+        // fit — so a ratio gate (view.zoom / ideal) stays extent-independent.
+        assert!((v.zoom - 0.005).abs() < 1e-9, "actual zoom floored to the range minimum");
+        assert!(ideal < 0.005, "returned ideal {ideal} must be the unclamped (smaller) fit");
+        assert!(ideal > 0.0, "ideal must be positive");
+    }
+
+    /// When the ideal fit is comfortably within the range, the returned ideal EQUALS the written
+    /// zoom — so a small graph's overview reads at ratio exactly 1.0.
+    #[test]
+    fn fit_returns_equal_when_unclamped() {
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 1000.0));
+        let positions = [egui::vec2(-100.0, -100.0), egui::vec2(100.0, 100.0)];
+        let mut v = View::default();
+        let ideal = v.fit_to_positions(&positions, canvas, (0.005, 6.0));
+        assert!((ideal - v.zoom).abs() < 1e-6, "unclamped fit: ideal == written zoom");
     }
 }

@@ -184,13 +184,18 @@ fn render_minimap(
             let host_rect = ui.max_rect();
             state.ui(ui, &graph, |_p, _r, _t, _b, _a| {});
             // The corner overview is now a standalone `Minimap` composed over the
-            // main pane (a Poincaré disk of dots), not an inline State branch.
+            // main pane (a Poincaré disk of dots), not an inline State branch. It
+            // renders through a BORROWED overview engine (the `ui_for` seam): the
+            // host owns the engine, sets its positions, and the minimap projects
+            // them into the corner disk.
             let mut minimap = Minimap::new();
             minimap.enabled = true;
             minimap.corner = Corner::BottomRight;
             minimap.shape = shape;
             minimap.indicator = IndicatorMode::Off;
-            minimap.ui(ui, host_rect, &graph, &graph.positions(), None);
+            let mut overview = Minimap::overview_engine();
+            overview.positions = graph.positions();
+            minimap.ui_for(ui, host_rect, &mut overview, &graph, None);
         });
 
     harness.run();
@@ -235,7 +240,9 @@ fn render_expand(swap_t: f32, out_path: &PathBuf) -> Result<(u32, u32), String> 
             minimap.corner = Corner::BottomRight;
             minimap.shape = Shape::Circle;
             minimap.set_swap_t_for_demo(swap_t);
-            minimap.ui(ui, host_rect, &graph, &graph.positions(), None);
+            let mut overview = Minimap::overview_engine();
+            overview.positions = graph.positions();
+            minimap.ui_for(ui, host_rect, &mut overview, &graph, None);
         });
 
     harness.run();

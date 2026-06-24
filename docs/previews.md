@@ -203,10 +203,25 @@ plain canvas icon in the row, the spatial `CanvasPreview` only on hover (via
 Every preview-showing view (the three context sub-views, the Vault lens, the
 canvases activity) carries an **eye button** in its section-header actions whose
 menu holds one **Show hover previews** toggle (`[ui].hover_previews_enabled`,
-[[spec:preview-toggle]]) — one global flag surfaced per-view for discoverability. It
-gates the hover-expand draw at the frame loop (both `render_expanded_preview` and
-`render_note_preview`); when off, the popups are suppressed but always-on inline
-thumbnails remain.
+`Scope::Vault`) — one global flag surfaced per-view for discoverability. Off
+suppresses the hover-expand popups (canvas / tree / note) — registration still
+runs, only the draw is gated at the frame loop (both `render_expanded_preview`
+and `render_note_preview`); always-on inline thumbnails (vault cluster-tree rows,
+canvases activity) stay. [preview-toggle]
+status:: done
+touches:: [[code:hiker/workbench_host]]
+note:: evidence: `core/src/config/mod.rs` (`Ui::hover_previews_enabled`, default true) + `patch.rs` (eligible bool, both scopes); gate in `app/src/main.rs::update` (skips `render_expanded_preview` + `render_note_preview` when off); `app/src/workbench_host.rs::hover_preview_eye` + the `side_bar_action_buttons` eye, shown for `context/backlinks` / `context/appears-in` / `context/related` / `vault` / `canvases`
+
+A cluster-tree note (`hiker.kind: cluster-tree`) opens in its force-graph
+`ClusterGraph` tab — `find_or_open_tab` keyed on the frontmatter `hiker.id` —
+not as raw markdown; it has no in-buffer view (unlike a board's Markdown toggle,
+so a buffer would just show YAML). Central in `open_file`, so it fires from every
+caller: vault sidebar, backlinks, related, appears-in, wikilinks, Back/Forward.
+Boards keep their existing file-tree `is_board_doc` routing. [cluster-tree-open-routing]
+status:: done
+implements:: [[code:hiker/trees/store/impl#[Db]tree_id_at_path]]
+touches:: [[code:hiker/editor_pane]]
+note:: evidence: `app/src/editor_pane.rs::open_file` (branch after `.canvas`); `core/src/trees/store.rs::Db::tree_id_at_path` (reads `hiker.kind`/`hiker.id` frontmatter)
 
 
 ## Note previews (markdown + diagrams)
@@ -252,18 +267,3 @@ cache (it live-renders, like the canvas expanded preview).
   via the app-level note-preview path above ([[spec:preview-note-hover]]), but an image
   or PDF preview is not built — each would be its own provider or app-level path,
   not a change to the widget.
-
-## Registry imports (from status.md)
-
-Entries imported from the retired status registry that had no anchor in this doc —
-re-home them into the relevant sections as the doc evolves.
-
-- **preview-toggle** — An eye button in every preview-showing sidebar view's section header opens a **Show hover previews** toggle (`[ui].hover_previews_enabled`, `Scope::Vault`). Off suppresses the hover-expand popups (canvas / tree / note) — registration still runs, only the draw is gated; always-on inline thumbnails (vault cluster-tree rows, canvases activity) stay. One global flag, surfaced per-view for discoverability [preview-toggle]
-  status:: done
-  touches:: [[code:hiker/workbench_host]]
-  note:: evidence: `core/src/config/mod.rs` (`Ui::hover_previews_enabled`, default true) + `patch.rs` (eligible bool, both scopes); gate in `app/src/main.rs::update` (skips `render_expanded_preview` + `render_note_preview` when off); `app/src/workbench_host.rs::hover_preview_eye` + the `side_bar_action_buttons` eye, shown for `context/backlinks` / `context/appears-in` / `context/related` / `vault` / `canvases`
-- **cluster-tree-open-routing** — A cluster-tree note (`hiker.kind: cluster-tree`) opens in its force-graph `ClusterGraph` tab — `find_or_open_tab` keyed on the frontmatter `hiker.id` — not as raw markdown; it has no in-buffer view (unlike a board's Markdown toggle, so a buffer would just show YAML). Central in `open_file`, so it fires from every caller: vault sidebar, backlinks, related, appears-in, wikilinks, Back/Forward. Boards keep their existing file-tree `is_board_doc` routing [cluster-tree-open-routing]
-  status:: done
-  implements:: [[code:hiker/trees/store/impl#[Db]tree_id_at_path]]
-  touches:: [[code:hiker/editor_pane]]
-  note:: evidence: `app/src/editor_pane.rs::open_file` (branch after `.canvas`); `core/src/trees/store.rs::Db::tree_id_at_path` (reads `hiker.kind`/`hiker.id` frontmatter)

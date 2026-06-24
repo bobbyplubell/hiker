@@ -1,8 +1,9 @@
 //! First-class corner **minimap** for the graph-view engine: a locked-Poincaré
 //! overview of a [`Source`], inset in a pane corner, click-to-expand to fill the
 //! pane, with a **viewport-location indicator** and a **swap-back focus** the host
-//! acts on. It owns a private overview [`State`] plus the placement / expand-swap
-//! / indicator settings that consumers used to hand-roll.
+//! acts on. It is pure CHROME — placement / expand-swap / indicator / overview
+//! navigation — and owns **no engine**: every render borrows one through
+//! [`Minimap::ui_for`].
 //!
 //! It supersedes the old built-in two-pane minimap that lived inline in
 //! [`State::ui`] (used by nobody in the app — only examples). The canonical
@@ -13,12 +14,14 @@
 //!
 //! **Standalone by design.** The host's main view need not be a graph-view (the
 //! canvas board isn't), so the minimap is driven explicitly — the host hands it a
-//! [`Source`], the per-node world `positions`, and (optionally) the world rect its
-//! main view currently shows (`viewport_world`). A graph view showing a minimap of
-//! *itself* is just the case where those come from its own state. status: canvas-minimap
+//! borrowed [`State`] engine, its [`Source`], and (optionally) the world rect its
+//! main view currently shows (`viewport_world`). A peer host passes its secondary
+//! view's engine; a self-overview host (the canvas, with no peer engine) passes an
+//! engine from [`Minimap::overview_engine`] whose `positions` it set to its node
+//! positions (the card centers) for the frame. status: canvas-minimap, container-tab
 
 use hiker_graph::{LayoutKind, LayoutTree};
-use hiker_projection::ProjectionKind;
+use hiker_projection::{Mobius, ProjectionConfig, ProjectionKind};
 use hiker_projection_view::{centroid_scale, disk_to_screen, lens_disk, poincare_disk};
 
 use super::source::{NodeDescriptor, Source};
@@ -64,7 +67,7 @@ pub enum IndicatorMode {
     ShowViewport,
 }
 
-/// What the host should act on after a [`Minimap::ui`] frame.
+/// What the host should act on after a [`Minimap::ui_for`] frame.
 #[derive(Default)]
 pub struct Output {
     /// A clicked node's `click_path` (the canvas's card id) — the host brings it
@@ -75,11 +78,30 @@ pub struct Output {
     pub focused_on_collapse: Option<String>,
 }
 
+/// The borrowed engine's main-view chrome fields that [`Minimap::ui_for`] overrides for the
+/// corner render, saved so they can be restored after the frame (so the same engine still renders
+/// faithfully as the full-size primary). status: container-tab
+struct SavedEngineView {
+    projection: ProjectionConfig,
+    nav: Mobius,
+    poincare_zoom: f32,
+    needs_fit: bool,
+    show_boundary: bool,
+    show_labels: bool,
+    show_preview: bool,
+    background: Option<egui::Color32>,
+    label_bg: Option<egui::Color32>,
+}
+
 /// A first-class corner minimap over a graph [`Source`].
+///
+/// The minimap is pure CHROME: corner placement, the expand/collapse swap
+/// animation, the [`IndicatorMode`], the persistent overview navigation, and the
+/// [`Output`]. It owns NO engine — every render borrows one through
+/// [`ui_for`](Self::ui_for): a peer host hands its secondary view's engine; a
+/// self-overview host (the canvas board, with no peer engine) hands an engine it
+/// owns via [`overview_engine`](Self::overview_engine). status: container-tab
 pub struct Minimap {
-    /// The private overview engine: locked Poincaré, labels off, positions set
-    /// directly each frame (never force-laid-out).
-    state: State,
     /// Whether the corner minimap is shown at all.
     pub enabled: bool,
     /// Which corner the inset occupies.
@@ -99,6 +121,22 @@ pub struct Minimap {
     /// When set (demo/snapshot), `swap_t` is held fixed so a filmstrip can capture
     /// intermediate frames.
     swap_pinned: bool,
+    /// Host opt-in to labels. When set, labels are drawn in the corner inset AND when expanded — the
+    /// engine's budget LOD (`draw_nodes`) caps the small corner to a readable handful of the top
+    /// labels, so a labelled overview (e.g. the code graph's spec minimap, where the specdoc
+    /// containers want names) reads even at inset size. Off by default (the canvas overview is a
+    /// clean disk of dots). status: graph-label-dim
+    labels_when_expanded: bool,
+    /// Persistent overview navigation for the BORROWED-engine path ([`ui_for`](Self::ui_for)): the
+    /// Poincaré disk pan/zoom the minimap accumulates from drags. Kept HERE, not on the borrowed
+    /// engine, so the secondary engine's own main-view nav (it also renders full-size when swapped to
+    /// primary) is never corrupted by the corner overview's navigation. status: container-tab
+    overview_nav: Mobius,
+    /// Overview disk-radius scroll-zoom for the borrowed-engine path (paired with `overview_nav`).
+    overview_zoom: f32,
+    /// Overview refit flag for the borrowed-engine path: snap the disk back to the whole-graph fit on
+    /// the next `ui_for` frame (set on a collapse). status: container-tab
+    overview_needs_fit: bool,
 }
 
 impl Default for Minimap {
@@ -108,20 +146,13 @@ impl Default for Minimap {
 }
 
 impl Minimap {
-    /// A fresh minimap with an overview engine configured for the locked-Poincaré
-    /// disk-of-dots look (flat style; per-node colours come from the host's
-    /// [`Source`], labels off so a dense graph doesn't hairball in the corner).
+    /// A fresh minimap chrome (corner placement / swap / indicator / overview
+    /// nav). It owns no engine — see [`overview_engine`](Self::overview_engine)
+    /// for the self-overview host's engine and [`ui_for`](Self::ui_for) for the
+    /// render seam.
     #[must_use]
     pub fn new() -> Self {
-        let mut state = State::new(Style::flat(), LayoutKind::ForceDirected);
-        state.projection.kind = ProjectionKind::Poincare;
-        state.projection.strength = 1.0;
-        // The disk is locked to the inset — there's no view framing to do.
-        state.needs_fit = false;
-        state.toggles.show_labels = false;
-        state.toggles.show_preview = false;
         Self {
-            state,
             enabled: false,
             corner: Corner::default(),
             size: 0.26,
@@ -130,7 +161,51 @@ impl Minimap {
             expanded: false,
             swap_t: 0.0,
             swap_pinned: false,
+            labels_when_expanded: false,
+            overview_nav: Mobius::identity(),
+            overview_zoom: 1.0,
+            overview_needs_fit: true,
         }
+    }
+
+    /// A fresh engine configured for the SelfOverview corner-render seam: the
+    /// locked-Poincaré disk-of-dots look (flat style; labels/preview off) a host
+    /// with NO peer engine (the canvas board) owns and borrows to [`ui_for`].
+    ///
+    /// The host sets the engine's `positions` to its supplied node positions each
+    /// frame (the canvas hands it the card centers — never force-laid-out), then
+    /// passes `&mut engine` to [`ui_for`](Self::ui_for) alongside the host's
+    /// `viewport_world`. [`ui_for`] re-asserts the Poincaré projection / labels /
+    /// boundary every frame, so this only seeds the starting state.
+    /// status: canvas-minimap, container-tab
+    #[must_use]
+    pub fn overview_engine() -> State {
+        let mut state = State::new(Style::flat(), LayoutKind::ForceDirected);
+        state.projection.kind = ProjectionKind::Poincare;
+        state.projection.strength = 1.0;
+        // The disk is locked to the inset — there's no view framing to do.
+        state.needs_fit = false;
+        state.toggles.show_labels = false;
+        state.toggles.show_preview = false;
+        state
+    }
+
+    /// Show (or hide) node labels in the overview. Off by default (the canvas overview is a clean
+    /// disk of dots); a host that wants a labelled overview (e.g. the code graph's spec minimap)
+    /// opts in. Labels then appear in the corner inset AND when expanded — the engine's budget LOD
+    /// caps the small corner to the top handful of labels (the specdoc containers + a few top
+    /// specs), so it stays readable. A readable background pill rides along. status: graph-label-dim
+    pub const fn set_labels(&mut self, on: bool) {
+        self.labels_when_expanded = on;
+    }
+
+    /// Whether labels are drawn in the CORNER inset for the current state — `true` once a host has
+    /// opted in via [`set_labels`](Self::set_labels), regardless of swap progress (the budget LOD
+    /// keeps the corner readable). Exposed for the host's tests; the canvas SelfOverview never opts
+    /// in, so this stays `false` for it. status: graph-label-dim
+    #[must_use]
+    pub const fn corner_labels_enabled(&self) -> bool {
+        self.labels_when_expanded
     }
 
     /// Force the swap progress directly — for headless snapshot/demo filmstrips
@@ -183,45 +258,44 @@ impl Minimap {
         });
     }
 
-    /// Render the minimap over `host_rect` and run its interaction.
+    /// Render the minimap chrome through a **BORROWED** engine. The sole render
+    /// path — the corner-render seam that keeps the minimap engine-free: the host
+    /// owns the engine (the secondary lens-view's, or — for a self-overview host
+    /// like the canvas — the engine from [`overview_engine`](Self::overview_engine)),
+    /// and the minimap only supplies the corner placement, the Poincaré projection,
+    /// the expand/collapse swap animation (~0.35s), the nav, the [`IndicatorMode`],
+    /// and the [`Output`]. For the peer case the secondary engine already holds a
+    /// force layout + positions; for the self-overview case the host SETS the
+    /// engine's positions to its supplied node positions (the canvas card centers)
+    /// before the call — either way the positions ARE the overview, never re-laid
+    /// out here.
     ///
-    /// - `source` / `positions`: the overview graph and its per-node world
-    ///   positions (assigned to the engine directly — never laid out).
-    /// - `viewport_world`: the world rect the host's main view currently shows, for
-    ///   the indicator. `None` (or [`IndicatorMode::Off`]) draws no indicator.
+    /// - `engine`: the borrowed engine to render through; its existing
+    ///   `engine.positions` ARE the overview positions (never re-laid-out here).
+    /// - `source`: the engine's data source (same one the host renders it with).
+    /// - `viewport_world`: the world rect the host's main view shows, for the
+    ///   indicator. `None` (the code-graph peer case) draws no indicator.
     ///
-    /// Returns the clicked node and, on collapse, the focused node for the host to
-    /// recentre on.
-    pub fn ui(
+    /// The engine's own view-affecting fields (projection / nav / disk-zoom / fit /
+    /// boundary / labels / preview / background / label-pill) are SAVED, swapped for
+    /// the minimap's locked-Poincaré overview chrome + this minimap's persistent
+    /// `overview_nav`/`overview_zoom`, then RESTORED after the frame — so the same
+    /// engine still renders byte-faithfully when it's the full-size primary (post
+    /// swap). The minimap's overview navigation persists across frames on `self`,
+    /// not the engine. status: container-tab
+    pub fn ui_for(
         &mut self,
         ui: &mut egui::Ui,
         host_rect: egui::Rect,
+        engine: &mut State,
         source: &dyn Source,
-        positions: &[egui::Vec2],
         viewport_world: Option<egui::Rect>,
     ) -> Output {
         let mut out = Output::default();
         if !self.enabled && !self.expanded && self.swap_t == 0.0 {
             return out;
         }
-
-        // Advance the expand swap toward its target; repaint while in flight. A
-        // pinned `swap_t` (demo/snapshot) is held fixed.
-        if !self.swap_pinned {
-            let dt = ui.input(|i| i.stable_dt);
-            let target = if self.expanded { 1.0 } else { 0.0 };
-            if self.swap_t != target && dt > 0.0 {
-                let step = dt / SWAP_DURATION;
-                if (target - self.swap_t).abs() <= step {
-                    self.swap_t = target;
-                } else {
-                    self.swap_t += step * (target - self.swap_t).signum();
-                }
-            }
-            if self.swap_t > 0.0 && self.swap_t < 1.0 {
-                ui.ctx().request_repaint();
-            }
-        }
+        self.advance_swap(ui);
 
         // The inset eases from the corner (swap_t = 0) to the full pane (1).
         let area = lerp_rect(self.corner_rect(host_rect), host_rect, self.swap_t);
@@ -229,13 +303,42 @@ impl Minimap {
             return out;
         }
         let full = self.swap_t >= 0.999;
+        // A host that opted into labels (the code-graph spec minimap) gets them in the CORNER inset
+        // too, not only when expanded: the engine's own budget LOD (`draw_nodes`) caps the corner to
+        // a readable handful of the top labels — the specdoc containers and a few top specs — exactly
+        // like the crate labels in the main view. The canvas SelfOverview never opts in
+        // (`labels_when_expanded == false`), so its disk-of-dots is unaffected. status: graph-label-dim
+        let labelled = self.labels_when_expanded;
 
-        self.state.positions = positions.to_vec();
-        // Chrome: the corner inset reads as a floating disk over the host (the
-        // pane fills transparent and we paint a round/square inset bg); the full
-        // expanded overview is opaque with its boundary ring.
-        self.state.style.background = (!full).then_some(egui::Color32::TRANSPARENT);
-        self.state.show_boundary = full;
+        // The borrowed engine's positions ARE the overview — clone them out for the
+        // indicator / outline / focus math (and so the restore below leaves the
+        // engine untouched).
+        let positions = engine.positions.clone();
+
+        // SAVE the engine's main-view chrome, then install the locked-Poincaré
+        // overview look + THIS minimap's persistent overview nav.
+        let saved = SavedEngineView {
+            projection: engine.projection,
+            nav: engine.nav,
+            poincare_zoom: engine.poincare_zoom,
+            needs_fit: engine.needs_fit,
+            show_boundary: engine.show_boundary,
+            show_labels: engine.toggles.show_labels,
+            show_preview: engine.toggles.show_preview,
+            background: engine.style.background,
+            label_bg: engine.style.label_bg,
+        };
+        engine.projection.kind = ProjectionKind::Poincare;
+        engine.projection.strength = 1.0;
+        engine.nav = self.overview_nav;
+        engine.poincare_zoom = self.overview_zoom;
+        engine.needs_fit = self.overview_needs_fit;
+        engine.show_boundary = full;
+        engine.toggles.show_labels = labelled;
+        engine.toggles.show_preview = false;
+        engine.style.background = (!full).then_some(egui::Color32::TRANSPARENT);
+        engine.style.label_bg = labelled.then_some(super::styling::LABEL_PILL);
+
         if !full {
             let bg = ui.visuals().extreme_bg_color.gamma_multiply(0.9);
             let p = ui.painter().with_clip_rect(area);
@@ -245,9 +348,6 @@ impl Minimap {
             };
         }
 
-        // The viewport indicator is applied engine-side so the host's Source stays
-        // a plain data provider: brighten the in-viewport dots via a wrapping
-        // Source, or stroke the projected outline after the paint.
         let highlight = ui.visuals().selection.stroke.color;
         let in_viewport = match (self.indicator, viewport_world) {
             (IndicatorMode::BrightenVisible, Some(vp)) => {
@@ -260,17 +360,39 @@ impl Minimap {
         let clicked = {
             let mut child =
                 ui.new_child(egui::UiBuilder::new().max_rect(area).layout(*ui.layout()));
-            self.state.ui(&mut child, &indicator_src, |_, _, _, _, _| {})
+            engine.ui(&mut child, &indicator_src, |_, _, _, _, _| {})
         };
 
         if matches!(self.indicator, IndicatorMode::ShowViewport)
             && let Some(vp) = viewport_world
         {
-            self.draw_viewport_outline(ui, area, positions, vp, highlight);
+            self.draw_viewport_outline(
+                ui,
+                area,
+                &positions,
+                vp,
+                highlight,
+                engine.projection,
+                engine.nav,
+                engine.poincare_zoom,
+            );
         }
 
-        // A clicked dot is the host's to act on; it also suppresses the
-        // empty-area expand toggle for this frame.
+        // Read THIS minimap's overview nav back out (so a drag persists across
+        // frames), then RESTORE the engine's main-view chrome.
+        self.overview_nav = engine.nav;
+        self.overview_zoom = engine.poincare_zoom;
+        self.overview_needs_fit = engine.needs_fit;
+        engine.projection = saved.projection;
+        engine.nav = saved.nav;
+        engine.poincare_zoom = saved.poincare_zoom;
+        engine.needs_fit = saved.needs_fit;
+        engine.show_boundary = saved.show_boundary;
+        engine.toggles.show_labels = saved.show_labels;
+        engine.toggles.show_preview = saved.show_preview;
+        engine.style.background = saved.background;
+        engine.style.label_bg = saved.label_bg;
+
         if let Some(id) = clicked {
             out.clicked = Some(id);
             return out;
@@ -284,27 +406,59 @@ impl Minimap {
             let collapsing = self.expanded;
             self.expanded = !self.expanded;
             if collapsing {
-                // Report the focused node so the host recentres its main view, then
-                // snap the inset back to the whole-graph overview (drop the
-                // expanded session's accumulated pan/zoom/fly-to).
-                out.focused_on_collapse = self.focused_node(source);
-                self.state.needs_fit = true;
+                // The render used the locked Poincaré overview projection (strength 1)
+                // + this minimap's overview nav — match it for the focus pick.
+                let overview_cfg = ProjectionConfig {
+                    kind: ProjectionKind::Poincare,
+                    strength: 1.0,
+                    ..ProjectionConfig::default()
+                };
+                out.focused_on_collapse =
+                    Self::focused_node_for(source, &positions, overview_cfg, self.overview_nav);
+                // Snap the overview disk back to the whole-graph fit next frame.
+                self.overview_needs_fit = true;
             }
         }
         out
     }
 
-    /// The node whose projected disk point is nearest the disk centre under the
-    /// minimap's current projection + navigation — the swap-back focus target.
-    /// `None` for an empty graph or a source without stable node keys.
-    fn focused_node(&self, source: &dyn Source) -> Option<String> {
-        let positions = &self.state.positions;
+    /// Advance the expand-swap animation toward its `expanded` target (eased over
+    /// [`SWAP_DURATION`]); requests a repaint while in flight. A pinned `swap_t`
+    /// (demo/snapshot) is held fixed. Driven by [`ui_for`](Self::ui_for).
+    /// status: container-tab
+    fn advance_swap(&mut self, ui: &egui::Ui) {
+        if self.swap_pinned {
+            return;
+        }
+        let dt = ui.input(|i| i.stable_dt);
+        let target = if self.expanded { 1.0 } else { 0.0 };
+        if self.swap_t != target && dt > 0.0 {
+            let step = dt / SWAP_DURATION;
+            if (target - self.swap_t).abs() <= step {
+                self.swap_t = target;
+            } else {
+                self.swap_t += step * (target - self.swap_t).signum();
+            }
+        }
+        if self.swap_t > 0.0 && self.swap_t < 1.0 {
+            ui.ctx().request_repaint();
+        }
+    }
+
+    /// The node whose projected disk point is nearest the disk centre under an
+    /// explicit projection + nav — the swap-back focus target the borrowed-engine
+    /// [`ui_for`](Self::ui_for) reports on collapse. `None` for an empty graph or a
+    /// source without stable node keys.
+    fn focused_node_for(
+        source: &dyn Source,
+        positions: &[egui::Vec2],
+        cfg: ProjectionConfig,
+        nav: Mobius,
+    ) -> Option<String> {
         if positions.is_empty() {
             return None;
         }
         let (focus, scale) = centroid_scale(positions);
-        let cfg = self.state.projection;
-        let nav = self.state.nav;
         let disk_abs =
             |i: usize| lens_disk((positions[i] - focus) / scale, cfg, nav).abs();
         let best = (0..positions.len())
@@ -315,6 +469,7 @@ impl Minimap {
     /// Stroke the host viewport rect, projected onto the disk through the same
     /// lens the overview rendered with (straight segments between the projected
     /// corners — geodesic bowing is a later polish).
+    #[allow(clippy::too_many_arguments)]
     fn draw_viewport_outline(
         &self,
         ui: &egui::Ui,
@@ -322,11 +477,12 @@ impl Minimap {
         positions: &[egui::Vec2],
         vp: egui::Rect,
         color: egui::Color32,
+        cfg: ProjectionConfig,
+        nav: Mobius,
+        poincare_zoom: f32,
     ) {
         let (focus, scale) = centroid_scale(positions);
-        let cfg = self.state.projection;
-        let nav = self.state.nav;
-        let (center, radius) = poincare_disk(area, self.state.poincare_zoom);
+        let (center, radius) = poincare_disk(area, poincare_zoom);
         let to_screen = |w: egui::Vec2| disk_to_screen(lens_disk((w - focus) / scale, cfg, nav), center, radius);
         let pts: Vec<egui::Pos2> = [
             vp.min,
@@ -399,4 +555,23 @@ impl Source for IndicatorSource<'_> {
 fn brighten(c: egui::Color32) -> egui::Color32 {
     let mix = |v: u8| (u16::from(v) + (255 - u16::from(v)) * 6 / 10) as u8;
     egui::Color32::from_rgb(mix(c.r()), mix(c.g()), mix(c.b()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh minimap draws NO corner labels (the canvas SelfOverview disk-of-dots default); a host
+    /// that opts in (the code graph's spec minimap) gets corner labels — the engine's budget LOD then
+    /// caps the small corner to the top handful (the specdoc containers + a few top specs).
+    /// status: graph-label-dim
+    #[test]
+    fn corner_labels_off_by_default_on_when_opted_in() {
+        let mut m = Minimap::new();
+        assert!(!m.corner_labels_enabled(), "canvas overview: no corner labels by default");
+        m.set_labels(true);
+        assert!(m.corner_labels_enabled(), "opted-in spec minimap shows corner labels");
+        m.set_labels(false);
+        assert!(!m.corner_labels_enabled(), "labels can be turned back off");
+    }
 }

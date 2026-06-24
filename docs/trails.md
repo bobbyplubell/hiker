@@ -86,7 +86,16 @@ hiker:
 ---
 ```
 
-Body is the user's annotation — empty when the waypoint is created (clean canvas), filled in by the user as they author commentary. Standard markdown; renders in the editor like any other note when opened directly. [waypoint-note-shape, trail-empty-waypoint-body]
+Body is the user's annotation — filled in by the user as they author commentary. Standard markdown; renders in the editor like any other note when opened directly. [waypoint-note-shape]
+status:: done
+implements:: [[code:hiker/trails/parse_waypoint]], [[code:hiker/trails/write_waypoint_frontmatter]], [[code:hiker/trails/ops/AppendWaypointArgs]]
+note:: slice 2: ops + empty-body creation landed · evidence: `core/src/trails/{mod,ops}.rs` (`WaypointFrontmatter`, `parse_waypoint`, `write_waypoint_frontmatter`, `append_waypoint`)
+
+The waypoint-note body is **empty when the waypoint is created** (clean canvas). [trail-empty-waypoint-body]
+status:: done
+implements:: [[code:hiker/trails/ops/AppendWaypointArgs]]
+verifies:: [[code:hiker/trails/tests/parse/empty_waypoint_note_has_zero_bytes_after_closing_fm]]
+note:: unit test asserts zero bytes after the closing FM · evidence: `core/src/trails/{mod,ops}.rs` (`empty_waypoint_note`, `append_waypoint` with `annotation=None`)
 
 The two-hop structure (trail-doc → waypoint-note → source-note) makes each waypoint searchable, editable, cross-reference-addressable, and visible in the autosave / changes / trash pipelines like any other note.
 
@@ -116,6 +125,11 @@ note:: `SelfHeal` + `PathConflict` retired; resolution is a single `store.note_e
 implements:: [[code:hiker/trails/ops/ResolutionOutcome]], [[code:hiker/trails/ops/resolve_reference]]
 verifies:: [[code:hiker/store/tests]]
 
+Under path-as-identity there is **nothing left to wire** for a path-conflict modal — an unresolved reference is just an orphan, so the old conflict-resolution dialog was retired. [trail-path-conflict-modal]
+status:: retired
+touches:: [[code:hiker/panels/board]], [[code:hiker/widgets/modal]]
+note:: evidence: `Modal::PathConflict`, `PathConflictTarget`, `path_conflict_dialog`, `panels/board::repoint_card` + `break_card` all removed (`app/src/state.rs`, `app/src/widgets/modal.rs`, `app/src/panels/board.rs`); `core::boards::ops::repoint_card` removed; resolution-outcome enum collapsed
+
 **Auto-update on note move.** Path rewriting rides the shared [[spec:wikilink-rename-rewrite]] pass: when a source note moves (via [[spec:move-note-core-cmd]], [[spec:drag-and-drop-move]], or a watcher-detected external rename), the indexer's referrer-rewrite pass updates every affected `hiker.references.path` in waypoint-notes and every affected `hiker.waypoints[].path` in trail-docs in the same transaction as the move itself. Wikilink bodies, kanban card paths, and trail/waypoint paths all flow through one rewrite path. [trail-auto-update-on-note-move]
 status:: done
 note:: trail-side rewriter now consolidated into the shared [[spec:wikilink-rename-rewrite]] pass — one entry point in the indexer (`IndexJob::Rename` / `Move` / `MoveFolder`) fans out to all three referrer types; indexer's `trails_containing_note` enumeration stays the load-bearing primitive · evidence: `core/src/trails/ops.rs::on_note_moved` (case 1: source-note move → waypoint `references.path`; case 2: trail-doc move → waypoint `in_trail.path`; case 3: waypoint-note move → trail-doc `hiker.waypoints[].path` + derived `trail_waypoints.waypoint_path` rename); called from `core/src/links_rename.rs::on_note_moved` (the shared rename-rewrite orchestrator alongside boards + wikilinks)
@@ -142,7 +156,13 @@ note:: slice U2: vertical waypoint card list, header (dropdown + trail-head + ex
 
 A compact row at the top of the sidebar body:
 
-- **Active-trail dropdown** — left side, takes most of the row width. Lists trails ordered by most-recent activation (`hiker.last_activated_at`), top N entries, plus an **"All trails…"** entry at the bottom that opens a flat picker of every trail in the vault, plus **"None"** as the always-present top item that clears the active trail. Selecting a trail activates it (sets `vault.active_trail`, stamps `hiker.last_activated_at` on the trail-doc, body re-renders). [trails-mode-active-trail-dropdown, trails-dropdown-ordering]
+- **Active-trail dropdown** — left side, takes most of the row width. Lists trails ordered by most-recent activation (`hiker.last_activated_at`), top N entries, plus an **"All trails…"** entry at the bottom that opens a flat picker of every trail in the vault, plus **"None"** as the always-present top item that clears the active trail. Selecting a trail activates it (sets `vault.active_trail`, stamps `hiker.last_activated_at` on the trail-doc, body re-renders). [trails-mode-active-trail-dropdown]
+  status:: done
+  implements:: [[code:hiker/trails/ops/stamp_last_activated_at]]
+  note:: popover (matches the existing dropdown idiom) — None + ordered trails + "All trails…" picker; click activates by writing `vault.active_trail` config + `bridge::stamp_activated` (core verb), no host seam · evidence: `app/src/trails/sidebar.rs` (active-trail dropdown + all-trails picker)
+  The dropdown sorts trails by `last_activated_at` descending with nulls last, alphabetical title fallback inside ties. [trails-dropdown-ordering]
+  status:: done
+  note:: sort by `last_activated_at` desc with nulls last; alphabetical title fallback inside ties · evidence: `app/src/trails/sidebar.rs` (trail sort)
 - **Trail-head icon** — right of the dropdown. Clicking opens the active trail's trail-doc in the editor pane on the right (so the user can read or edit the trail's framing prose). The icon is the squiggly-trail glyph (same SVG family as the Trails-mode button in the sidebar mode switcher). Disabled when no trail is active. [trails-mode-trail-head-icon]
 status:: done
 note:: squiggly-trail icon button right of the dropdown; disabled when no active trail; click opens active trail-doc · evidence: `app/src/trails/sidebar.rs` (`header_row()` trail-head button)
@@ -347,6 +367,11 @@ Trail-docs and waypoint-notes live in visible vault folders ([[spec:subsystem-no
 
 The `core::trails` module owns watcher suppression around its own writes (create / append / remove) using the existing `Watcher::suppress` shape, so notify can't surface an event for a path the indexer has already routed.
 
+There is **no `.hiker/trails/` watcher carve-out** — waypoints live in a visible vault folder ([[spec:subsystem-notes-visible]]), so none is needed. [trail-watcher-carve-out]
+status:: done
+touches:: [[code:hiker/watcher]]
+note:: Retired — waypoints live in a visible vault folder ([[spec:subsystem-notes-visible]]), so no `.hiker/trails/` carve-out is needed. The carve-out (and the `.hiker/sessions/` one) was removed via `bug-watcher-drop-subsystem-carveouts` · evidence: `core/src/watcher.rs::is_ignored` — no per-subsystem carve-out; everything under `.hiker/` is ignored
+
 
 ## Trash integration
 
@@ -385,6 +410,20 @@ Trails are a first-class MCP surface (read and write) so attached agents can con
 
 Agent-authored trails are auditable two ways: the `Author::Agent(<client-id>)` class on every agent write to the trail-doc and its waypoint-notes (the git `Hiker-Author` trailer when git is integrated, `git.md`), plus the [[spec:mcp-audit-log-mcp-calls]] record of every trail tool call to `<vault>/.hiker/agent-log/<YYYY-MM-DD>.jsonl` — surface `mcp-tool-call`, feature `trails_list` / `trail_get` / `trail_create` / etc., redacted-by-default body content per `[mcp.audit] log_full_input`.
 
+**No trails-specific draft mechanism.** Agent-created trails are plain trails that ride the normal op-log pending/patch-review path; the earlier `hiker.draft` flag and `.hiker/trails/drafts/` staging surface were removed. The MCP `trail_create` tool (when built per [[spec:mcp-tool-trail-create]]) creates plain trails through that path. [trail-draft-from-agent]
+status:: retired
+note:: drafts removed 2026-06-05; agent trails use the op-log pending path. Trail drafts (the `hiker.draft` flag, `.hiker/trails/drafts/`, `create_trail(draft)`, `default_draft_for_review_mode`) were deleted from `core::trails`; agent-created trails ride the normal op-log pending/patch-review path like any other agent write. The MCP `trail_create` tool (when built per [[spec:mcp-tool-trail-create]]) creates plain trails through that path
+
+A clustering-proposed trail likewise emits a plain `create_trail` + ordered `append_waypoint`s on the op-log pending path rather than a draft; the conservative reading-order detector + `[clustering] propose_trails` config survive as the gate. [trail-draft-from-clustering]
+status:: retired
+implements:: [[code:hiker/cluster/ReadingOrderChain]], [[code:hiker/cluster/detect_reading_order_chain]], [[code:hiker/config/sections/ClusteringConfig]], [[code:hiker/config/sections/ClusteringConfig#propose_trails]], [[code:hiker/config/Config#clustering]]
+touches:: [[code:hiker/cluster]]
+note:: drafts removed 2026-06-05. The conservative reading-order detector + `[clustering] propose_trails` config survive as the gate, but a fired chain now emits a plain `create_trail` + ordered `append_waypoint`s that ride the op-log pending path (no `create_trail(draft=true)`). Still not wired into the live streaming build pipeline (`core::cluster::build::stream`)
+
+Agent/clustering-proposed trails are reviewed through the **shared op-log pending surfaces** ([[spec:staging-accept-reject-from-tree]]/`-editor`/`-chat-card`), not a trails-specific draft review surface. [trail-draft-review-surface]
+status:: retired
+note:: drafts removed 2026-06-05; agent trails use the op-log pending path. The `hiker.draft` flag, `list(include_drafts)`/`TrailListItem.draft`, `accept_draft`, `reject_draft`, and the `.hiker/trails/drafts/` staging surface were all deleted from `core::trails`. Agent/clustering-proposed trails are reviewed through the shared op-log pending surfaces ([[spec:staging-accept-reject-from-tree]]/`-editor`/`-chat-card`), not a trails-specific draft surface
+
 
 ## Out of scope (v1)
 
@@ -409,42 +448,3 @@ note:: deferred polish — toggle (default off) colorizes filenames in the file 
 - **CLI surface.** `hiker trail list / show / activate / new` for shell-script-driven workflows; rides the broader `cli-*` family in `status.md`. [cli-trail-list, cli-trail-show, cli-trail-activate, cli-trail-new]
 - **Active-trail indicator outside Trails mode.** A small chip in the editor toolbar or status bar showing which trail is active when sidebar is in Files / Cluster trees mode. Useful if capture-into-wrong-trail becomes a real footgun in v1 use; revisit then.
 - **Graph view of trails.** Multi-trail visualization on a note-graph; rides the v4+ graph view feature per `design.md`'s graph-view bullet. Trails are one of two consumers (the other being wikilinks once they exist), not the owner.
-
-## Registry imports (from status.md)
-
-Entries imported from the retired status registry that had no anchor in this doc —
-re-home them into the relevant sections as the doc evolves.
-
-- **waypoint-note-shape** — slice 2: ops + empty-body creation landed [waypoint-note-shape]
-  status:: done
-  implements:: [[code:hiker/trails/parse_waypoint]], [[code:hiker/trails/write_waypoint_frontmatter]], [[code:hiker/trails/ops/AppendWaypointArgs]]
-  note:: evidence: `core/src/trails/{mod,ops}.rs` (`WaypointFrontmatter`, `parse_waypoint`, `write_waypoint_frontmatter`, `append_waypoint`)
-- **trail-empty-waypoint-body** — unit test asserts zero bytes after the closing FM [trail-empty-waypoint-body]
-  status:: done
-  implements:: [[code:hiker/trails/ops/AppendWaypointArgs]]
-  verifies:: [[code:hiker/trails/tests/parse/empty_waypoint_note_has_zero_bytes_after_closing_fm]]
-  note:: evidence: `core/src/trails/{mod,ops}.rs` (`empty_waypoint_note`, `append_waypoint` with `annotation=None`)
-- **trail-path-conflict-modal** — nothing left to wire — under path-as-identity an unresolved reference is just an orphan [trail-path-conflict-modal]
-  status:: retired
-  touches:: [[code:hiker/panels/board]], [[code:hiker/widgets/modal]]
-  note:: evidence: `Modal::PathConflict`, `PathConflictTarget`, `path_conflict_dialog`, `panels/board::repoint_card` + `break_card` all removed (`app/src/state.rs`, `app/src/widgets/modal.rs`, `app/src/panels/board.rs`); `core::boards::ops::repoint_card` removed; resolution-outcome enum collapsed
-- **trails-mode-active-trail-dropdown** — popover (matches the existing dropdown idiom) — None + ordered trails + "All trails…" picker; click activates by writing `vault.active_trail` config + `bridge::stamp_activated` (core verb), no host seam [trails-mode-active-trail-dropdown]
-  status:: done
-  implements:: [[code:hiker/trails/ops/stamp_last_activated_at]]
-  note:: evidence: `app/src/trails/sidebar.rs` (active-trail dropdown + all-trails picker)
-- **trails-dropdown-ordering** — sort by `last_activated_at` desc with nulls last; alphabetical title fallback inside ties [trails-dropdown-ordering]
-  status:: done
-  note:: evidence: `app/src/trails/sidebar.rs` (trail sort)
-- **trail-watcher-carve-out** — Retired — waypoints live in a visible vault folder ([[spec:subsystem-notes-visible]]), so no `.hiker/trails/` carve-out is needed. The carve-out (and the `.hiker/sessions/` one) was removed via `bug-watcher-drop-subsystem-carveouts` [trail-watcher-carve-out]
-  status:: done
-  touches:: [[code:hiker/watcher]]
-  note:: evidence: `core/src/watcher.rs::is_ignored` — no per-subsystem carve-out; everything under `.hiker/` is ignored
-- **trail-draft-from-agent** — drafts removed 2026-06-05; agent trails use the op-log pending path. Trail drafts (the `hiker.draft` flag, `.hiker/trails/drafts/`, `create_trail(draft)`, `default_draft_for_review_mode`) were deleted from `core::trails`; agent-created trails ride the normal op-log pending/patch-review path like any other agent write. The MCP `trail_create` tool (when built per [[spec:mcp-tool-trail-create]]) creates plain trails through that path [trail-draft-from-agent]
-  status:: retired
-- **trail-draft-from-clustering** — drafts removed 2026-06-05. The conservative reading-order detector + `[clustering] propose_trails` config survive as the gate, but a fired chain now emits a plain `create_trail` + ordered `append_waypoint`s that ride the op-log pending path (no `create_trail(draft=true)`). Still not wired into the live streaming build pipeline (`core::cluster::build::stream`) [trail-draft-from-clustering]
-  status:: retired
-  implements:: [[code:hiker/cluster/ReadingOrderChain]], [[code:hiker/cluster/detect_reading_order_chain]], [[code:hiker/config/sections/ClusteringConfig]], [[code:hiker/config/sections/ClusteringConfig#propose_trails]], [[code:hiker/config/Config#clustering]]
-  touches:: [[code:hiker/cluster]]
-  note:: evidence: `core/src/config/sections.rs` (`ClusteringConfig::propose_trails`) + `core/src/cluster/mod.rs` (`detect_reading_order_chain`, `ChainCandidate`, `ReadingOrderChain`)
-- **trail-draft-review-surface** — drafts removed 2026-06-05; agent trails use the op-log pending path. The `hiker.draft` flag, `list(include_drafts)`/`TrailListItem.draft`, `accept_draft`, `reject_draft`, and the `.hiker/trails/drafts/` staging surface were all deleted from `core::trails`. Agent/clustering-proposed trails are reviewed through the shared op-log pending surfaces ([[spec:staging-accept-reject-from-tree]]/`-editor`/`-chat-card`), not a trails-specific draft surface [trail-draft-review-surface]
-  status:: retired

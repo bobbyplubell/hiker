@@ -211,18 +211,11 @@ Path-form is the single representation every link producer emits:
 - **Embeds / transclusion** — `![[Name]]` rendering the target's content (or an image/PDF) inline rather than as a link. [wikilink-embed]
 status:: planned
 note:: deferred — `![[Name]]` transclusion rendering the target's content/image/PDF inline
-- **Bloom-filter optimization** for referrer enumeration on rename — [[spec:wikilink-rename-bloom-filter-deferred]]. Build the straightforward index-driven version first; add the filter if profiling shows it matters.
+- **Bloom-filter optimization** for referrer enumeration on rename — a Bloom over "note contains any wikilinks" to skip the no-link majority on rename. Build the straightforward index-driven enumerator first; add the filter if profiling shows it matters. [wikilink-rename-bloom-filter-deferred]
+status:: planned
 
 
 ## Out of scope
 
 - **Opaque-ID-based links** (the prior ULID model). Rejected for visible stamping and opaque identifiers; path-based identity keeps notes clean and round-trippable at the cost of one referrer-rewrite pass per rename.
 - **The vault-wide graph view.** Wikilinks are an edge source for it, but the graph view is its own `design.md` feature.
-
-## Registry imports (from status.md)
-
-Entries imported from the retired status registry that had no anchor in this doc —
-re-home them into the relevant sections as the doc evolves.
-
-- **wikilink-rename-bloom-filter-deferred** — deferred optimization: Bloom over "note contains any wikilinks" to skip the no-link majority on rename; build the straightforward enumerator first [wikilink-rename-bloom-filter-deferred]
-  status:: planned

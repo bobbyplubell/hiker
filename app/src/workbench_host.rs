@@ -26,7 +26,7 @@ use egui_workbench::theme::Palette;
 use crate::panels;
 use crate::clusters;
 use crate::state::AppState;
-use crate::tab::{TabId, TabKind};
+use crate::tab::{ChildSlot, TabId, TabKind};
 
 /// View-model for an editor tab inside the workbench. Carries a
 /// `TabId` pointer back into `Session::tabs` plus enough cached state
@@ -221,7 +221,7 @@ impl<'a> Host<HikerWbTab, String> for HikerWbBehavior<'a> {
             });
             return;
         };
-        self.render_tab_body(ui, tab.id, &kind);
+        self.render_tab_body(ui, tab.id, ChildSlot::Primary, &kind);
     }
 
     fn on_preview_promoted(&mut self, tab: &HikerWbTab) {
@@ -603,9 +603,38 @@ impl<'a> HikerWbBehavior<'a> {
         });
     }
 
-    fn render_tab_body(&mut self, ui: &mut egui::Ui, tab_id: TabId, kind: &TabKind) {
+    fn render_tab_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        tab_id: TabId,
+        slot: ChildSlot,
+        kind: &TabKind,
+    ) {
         crate::profile_scope!("render_tab_body", tab_kind_name(kind));
         let _g = crate::profiling::FrameProf::guard(tab_kind_name(kind));
+        // A container's two children share its `TabId`. So `TabId`-keyed panels
+        // never collide across the two slots (and never follow the slot on
+        // swap), each child renders under a distinct synthetic id derived from
+        // its `child_state_key` (the single rule for child identity): hash the
+        // key, set the high bit so the id can never collide with a real
+        // sequential id from `next_tab_id` (small, high-bit clear). The Primary
+        // top-level slot keeps the real id verbatim so every existing call site
+        // is behavior-identical. Source-keyed panels (CodeGraph) ignore
+        // `tab_id` and warm-reuse by source — matching `child_state_key`'s rule.
+        // status: container-tab
+        let orig_tab_id = tab_id;
+        let tab_id = match slot {
+            ChildSlot::Primary => tab_id,
+            ChildSlot::Secondary => synthetic_child_id(tab_id, slot, kind),
+        };
+        // A Container is handled before the borrow split below: it recurses
+        // into `render_tab_body` for each child (which itself re-borrows
+        // `self.app`), so it can't run inside the `let app = &mut *self.app`
+        // scope the leaf kinds use. status: container-tab
+        if let TabKind::Container { primary, secondary, swapped } = kind {
+            self.render_container(ui, orig_tab_id, primary, secondary, *swapped);
+            return;
+        }
         let app = &mut *self.app;
         let rt = self.rt;
         match kind {
@@ -654,8 +683,14 @@ impl<'a> HikerWbBehavior<'a> {
                 clusters::panel::show(ui, app, tab_id, config_json)
             }
             TabKind::ClusterGraph { tree_id } => panels::cluster_graph::show(ui, app, tree_id),
-            TabKind::CodeGraph { source } => {
-                panels::code_graph::show(ui, app, tab_id, source)
+            // A single lens-view (the main interactive pane). The child slot
+            // determines the default lens (primary-default vs specs-only) + the
+            // lens-view key. The code-graph open path wraps two of these in a
+            // `Container` (this primary pane + a peer corner-minimap, the corner
+            // rendered by `render_container` via the borrowed-engine Minimap).
+            // status: container-tab
+            TabKind::CodeGraphLens { source } => {
+                panels::code_graph::show_lens(ui, app, orig_tab_id, slot, source)
             }
             TabKind::ProjectConfig { source_note } => {
                 panels::project_config::show(ui, app, tab_id, source_note.as_deref())
@@ -664,9 +699,144 @@ impl<'a> HikerWbBehavior<'a> {
                 panels::zim::show(ui, app, tab_id, zim_path, article)
             }
             TabKind::ChartBuilder { source } => panels::charts_tab::show(ui, app, source),
+            // Handled above (early-returns into `render_container`); never
+            // reaches the leaf-dispatch match. status: container-tab
+            TabKind::Container { .. } => unreachable!("container handled before leaf dispatch"),
         }
     }
 
+    /// Render a [`TabKind::Container`]: the visible primary fills the pane; the
+    /// secondary draws as a corner inset. status: container-tab
+    ///
+    /// The CODE-GRAPH case (a `Peer(CodeGraphLens)` over the SAME source as a
+    /// `CodeGraphLens` primary) renders the corner through the **Minimap chrome
+    /// borrowing the secondary lens-view's own engine** ([`code_graph::show_secondary`])
+    /// — NOT a recursive full render — so the code-graph view uses exactly two
+    /// engines (one per lens-view). The swap (flip `swapped`) is owned here: it
+    /// fires on the toolbar's "Swap" request OR a click on the corner inset. A
+    /// generic `Peer` that is not a same-source code-graph lens keeps the Phase-A
+    /// recursive-inset fallback. status: container-tab
+    fn render_container(
+        &mut self,
+        ui: &mut egui::Ui,
+        tab_id: TabId,
+        primary: &TabKind,
+        secondary: &crate::tab::ContainerSecondary,
+        swapped: bool,
+    ) {
+        use crate::tab::ContainerSecondary;
+        // Resolve which child shows large vs in the corner (honoring swap).
+        // SelfOverview never swaps, so for it the primary always stays large.
+        let (large, large_slot, corner) = match (secondary, swapped) {
+            (ContainerSecondary::Peer(peer), true) => {
+                (peer.as_ref(), ChildSlot::Secondary, Some((primary, ChildSlot::Primary)))
+            }
+            (ContainerSecondary::Peer(peer), false) => {
+                (primary, ChildSlot::Primary, Some((peer.as_ref(), ChildSlot::Secondary)))
+            }
+            (ContainerSecondary::SelfOverview, _) => (primary, ChildSlot::Primary, None),
+        };
+
+        // Is this the code-graph container? (a same-source CodeGraphLens primary
+        // + peer). Its corner renders via the borrowed-engine Minimap, not a
+        // recursive inset. status: container-tab
+        let code_source = code_container_source(primary, secondary);
+
+        let full = ui.max_rect();
+        // The large child fills the whole pane.
+        {
+            let mut large_ui = ui.new_child(egui::UiBuilder::new().max_rect(full));
+            self.render_tab_body(&mut large_ui, tab_id, large_slot, large);
+        }
+
+        let Some((corner_kind, corner_slot)) = corner else { return };
+
+        // CODE-GRAPH corner: the Minimap chrome borrows the corner lens-view's
+        // engine over the SAME host rect as the large pane (an overlay inset, not
+        // a separate framed box). A node click selects on the shared doc; the
+        // toolbar's "Swap" request flips `swapped`. status: container-tab
+        if let Some(source) = code_source {
+            let swap = crate::panels::code_graph::show_secondary(
+                ui,
+                &mut *self.app,
+                full,
+                &source,
+                corner_slot,
+            );
+            if swap
+                && let Some(tab) = self.app.tab_by_id_mut(tab_id)
+                && let TabKind::Container { swapped, .. } = &mut tab.kind
+            {
+                *swapped = !*swapped;
+            }
+            let _ = (corner_kind, corner_slot);
+            return;
+        }
+
+        // GENERIC peer corner inset (Phase-A fallback): bottom-right framed box.
+        let inset_w = (full.width() * 0.28).clamp(160.0, 360.0);
+        let inset_h = (full.height() * 0.28).clamp(120.0, 280.0);
+        let margin = 12.0;
+        let inset = egui::Rect::from_min_size(
+            egui::pos2(full.right() - inset_w - margin, full.bottom() - inset_h - margin),
+            egui::vec2(inset_w, inset_h),
+        );
+        // Frame the inset so it reads as a distinct corner view.
+        ui.painter().rect_filled(inset, 4.0, ui.visuals().panel_fill);
+        ui.painter().rect_stroke(
+            inset,
+            4.0,
+            ui.visuals().window_stroke(),
+            egui::StrokeKind::Inside,
+        );
+        {
+            let mut inset_ui = ui.new_child(egui::UiBuilder::new().max_rect(inset.shrink(2.0)));
+            self.render_tab_body(&mut inset_ui, tab_id, corner_slot, corner_kind);
+        }
+        // Click-to-swap affordance (peer only): an invisible click sink over the
+        // inset. Defer the flip past the render borrow. status: container-tab
+        let resp =
+            ui.interact(inset, ui.id().with(("container_swap", tab_id.0)), egui::Sense::click());
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if resp.clicked()
+            && let Some(tab) = self.app.tab_by_id_mut(tab_id)
+            && let TabKind::Container { swapped, .. } = &mut tab.kind
+        {
+            *swapped = !*swapped;
+        }
+    }
+}
+
+/// The [`CodeSource`] of a code-graph container — `Some` only when `primary` is a
+/// [`TabKind::CodeGraphLens`] and `secondary` is a `Peer` `CodeGraphLens` over the SAME source. This
+/// is the case whose corner renders through the borrowed-engine Minimap (two engines total), not a
+/// recursive inset. status: container-tab
+fn code_container_source(
+    primary: &TabKind,
+    secondary: &crate::tab::ContainerSecondary,
+) -> Option<crate::tab::CodeSource> {
+    use crate::tab::ContainerSecondary;
+    let TabKind::CodeGraphLens { source: ps } = primary else { return None };
+    let ContainerSecondary::Peer(peer) = secondary else { return None };
+    match peer.as_ref() {
+        TabKind::CodeGraphLens { source: ss } if ss == ps => Some(ps.clone()),
+        _ => None,
+    }
+}
+
+/// A stable synthetic `TabId` for a container child, so `TabId`-keyed panels
+/// under one container never collide / never follow the slot on swap. Derived
+/// from the child's [`crate::tab::child_state_key`] (the single source of truth
+/// for child identity) by hashing it and setting the high bit — that bit can
+/// never appear in a real sequential id from `next_tab_id`. status: container-tab
+fn synthetic_child_id(tab_id: TabId, slot: ChildSlot, kind: &TabKind) -> TabId {
+    use std::hash::{Hash, Hasher};
+    let key = crate::tab::child_state_key(tab_id, slot, kind);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    TabId(0x8000_0000_0000_0000 | (hasher.finish() & 0x7fff_ffff_ffff_ffff))
 }
 
 /// Stable per-kind label for the frame profiler / puffin scopes.
@@ -689,10 +859,11 @@ const fn tab_kind_name(kind: &TabKind) -> &'static str {
         TabKind::GitDiff => "tab:GitDiff",
         TabKind::ClusterReview { .. } => "tab:ClusterReview",
         TabKind::ClusterGraph { .. } => "tab:ClusterGraph",
-        TabKind::CodeGraph { .. } => "tab:CodeGraph",
+        TabKind::CodeGraphLens { .. } => "tab:CodeGraphLens",
         TabKind::ProjectConfig { .. } => "tab:ProjectConfig",
         TabKind::ZimView { .. } => "tab:ZimView",
         TabKind::ChartBuilder { .. } => "tab:ChartBuilder",
+        TabKind::Container { .. } => "tab:Container",
     }
 }
 

@@ -407,7 +407,7 @@ fn insert_from_vault(ui: &mut egui::Ui, app: &mut AppState, tab_id: TabId) {
         return;
     };
     if let PickerOutcome::Selected(item) =
-        autocomplete_picker::show(ui, &mut pane.insert_picker, &source)
+        autocomplete_picker::show(ui, &mut pane.insert_picker, &source, "Insert from vault")
     {
         let node = file_node(item.insert.as_str());
         pane.view_widget.insert_node_centered(node);
@@ -784,9 +784,21 @@ fn render_overview(ui: &mut egui::Ui, taken: &mut TakenDoc, viewport: egui::Rect
     let viewport_world = camera_viewport_world(taken, viewport);
     let source = super::overview::CanvasGraphSource::new(&model, ui.visuals());
 
-    let out = taken
-        .overview
-        .ui(ui, viewport, &source, &positions, Some(viewport_world));
+    // Render through the BORROWED SelfOverview engine (the same `ui_for` seam the
+    // code-graph peer minimap uses). The canvas IS the layout, so the overview
+    // engine's positions are SET to the card centers each frame — never force-/
+    // tree-laid-out (`CanvasGraphSource::layout_tree` is empty). The viewport-
+    // location indicator (BrightenVisible) is driven off `viewport_world`, the
+    // canvas CAMERA's world rect (Poincaré-correct, not the graph-view affine
+    // helper). status: canvas-minimap, container-tab
+    taken.overview_engine.positions = positions;
+    let out = taken.overview.ui_for(
+        ui,
+        viewport,
+        &mut taken.overview_engine,
+        &source,
+        Some(viewport_world),
+    );
 
     // A clicked dot → select that card AND bring it into view on the canvas. On a
     // collapse the engine reports the focused card, which the canvas recenters on.
@@ -1035,10 +1047,15 @@ struct TakenDoc {
     view_widget: canvas_view::widget::CanvasView,
     last_parsed_text: String,
     fit_pending: bool,
-    /// The Poincaré overview minimap, carried out alongside the widget so the
-    /// panel can render the corner overview / expand-swap and sync the camera in
-    /// the same borrow window. status: canvas-minimap
+    /// The Poincaré overview minimap chrome, carried out alongside the widget so
+    /// the panel can render the corner overview / expand-swap and sync the camera
+    /// in the same borrow window. status: canvas-minimap
     overview: hiker_graph_view::graph_view::minimap::Minimap,
+    /// The SelfOverview engine the minimap chrome borrows (`ui_for`): its
+    /// `positions` are set to the card centers each frame, never force-laid-out.
+    /// Carried out with the minimap so both live in one borrow window.
+    /// status: canvas-minimap, container-tab
+    overview_engine: hiker_graph_view::graph_view::State,
 }
 
 /// Move the parsed document + widget out of the pane for the frame.
@@ -1054,6 +1071,10 @@ fn take_pane_doc(app: &mut AppState, tab_id: TabId) -> Option<TakenDoc> {
             &mut pane.overview,
             hiker_graph_view::graph_view::minimap::Minimap::new(),
         ),
+        overview_engine: std::mem::replace(
+            &mut pane.overview_engine,
+            hiker_graph_view::graph_view::minimap::Minimap::overview_engine(),
+        ),
     })
 }
 
@@ -1065,6 +1086,7 @@ fn put_pane_doc(app: &mut AppState, tab_id: TabId, taken: TakenDoc) {
     pane.last_parsed_text = taken.last_parsed_text;
     pane.fit_pending = taken.fit_pending;
     pane.overview = taken.overview;
+    pane.overview_engine = taken.overview_engine;
 }
 
 /// Forward binding: re-serialize the live canvas to canonical JSON and mirror

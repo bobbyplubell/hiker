@@ -270,7 +270,7 @@ fn find_popup(
     }
     let paths: Vec<String> = nodes.iter().filter_map(|n| n.note_path.clone()).collect();
     let source = crate::panels::graph_find::VaultNodeFindSource::new(&paths);
-    match autocomplete_picker::show(ui, &mut view.find, &source) {
+    match autocomplete_picker::show(ui, &mut view.find, &source, "Find node") {
         PickerOutcome::Selected(item) => Some(item.insert.to_string()),
         PickerOutcome::Cancelled | PickerOutcome::Open => None,
     }

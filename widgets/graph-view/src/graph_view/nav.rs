@@ -6,6 +6,25 @@ use hiker_projection::{clamp_inside_disk, forward, Complex, Mobius, DEFAULT_BOUN
 
 use super::{centroid_scale, ease_out_cubic, lerp_complex, FlyTo, FocusMode, Lens, State};
 
+/// An affine glide-to-selection in progress: the affine `view.pan` eases from
+/// `start_pan` to `target_pan` over `dur` seconds (ease-out-cubic), panning the
+/// newly-selected node to the pane centre. Pan only — zoom is left untouched (an
+/// auto-zoom on every click is jarring). status: code-graph
+#[derive(Clone, Copy)]
+pub(super) struct Glide {
+    pub(super) start_pan: egui::Vec2,
+    pub(super) target_pan: egui::Vec2,
+    pub(super) t: f32,
+    pub(super) dur: f32,
+}
+
+/// Default affine glide duration (seconds).
+const GLIDE_DUR: f32 = 0.4;
+
+/// Below this world-distance the glide-to-selection just snaps (no animation) — a
+/// tiny move would be an imperceptible animation that only delays the paint.
+const GLIDE_MIN_MOVE: f32 = 1.0;
+
 impl State {
     /// The interactive pane's lens focus for this frame, per [`FocusMode`]:
     /// - [`LockedCenter`](FocusMode::LockedCenter): the layout centroid.
@@ -102,5 +121,57 @@ impl State {
             t: 0.0,
             dur: self.flyto_duration.clamp(0.1, 2.0),
         });
+    }
+
+    /// Start an affine glide that pans `target_world` to the pane centre, easing
+    /// out over [`GLIDE_DUR`]. Centring a world point means `view.pan == -w` (the
+    /// `center_on` law), so the glide eases `view.pan` from its current value to
+    /// `-target_world`. Pan only — zoom is left untouched. A tiny move snaps
+    /// (sets the pan directly, no animation). status: code-graph
+    pub fn glide_to(&mut self, target_world: egui::Vec2) {
+        let start_pan = self.view.pan;
+        let target_pan = -target_world;
+        if (target_pan - start_pan).length() < GLIDE_MIN_MOVE {
+            self.view.pan = target_pan;
+            self.glide = None;
+            return;
+        }
+        self.glide = Some(Glide { start_pan, target_pan, t: 0.0, dur: GLIDE_DUR });
+    }
+
+    /// Advance an in-flight affine glide by `dt` seconds: step `t`, ease-out-cubic,
+    /// lerp `view.pan` from `start_pan` to `target_pan`. Clears the glide (landing
+    /// exactly on `target_pan`) once `t` reaches 1. Returns `true` while still
+    /// animating so the caller can request a repaint. status: code-graph
+    pub(super) fn advance_glide(&mut self, dt: f32) -> bool {
+        let Some(mut g) = self.glide else {
+            return false;
+        };
+        g.t += dt / g.dur;
+        if g.t >= 1.0 {
+            self.view.pan = g.target_pan;
+            self.glide = None;
+            return false;
+        }
+        let e = ease_out_cubic(g.t);
+        self.view.pan = g.start_pan + (g.target_pan - g.start_pan) * e;
+        self.glide = Some(g);
+        true
+    }
+
+    /// The positions-vector index of the node whose last-drawn LABEL centre is nearest `screen`
+    /// (companion to [`nearest_label_center`](State::nearest_label_center)). The harness uses it to
+    /// drive `selected_node` from a pane-centre click so the affine glide-to-selection is exercised.
+    /// status: code-graph
+    pub fn nearest_label_node(&self, screen: egui::Pos2) -> Option<usize> {
+        self.label_hits
+            .iter()
+            .min_by(|(a, _), (b, _)| {
+                (a.center() - screen)
+                    .length_sq()
+                    .partial_cmp(&(b.center() - screen).length_sq())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(_, i)| *i)
     }
 }

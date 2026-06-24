@@ -47,7 +47,10 @@ pub struct NodeDescriptor {
     /// Labels draw only at or above this zoom (0.0 = always).
     pub label_min_zoom: f32,
     /// Multiplier on the base label font size, so high-level nodes (e.g. crates /
-    /// modules) can render larger text than leaves. `1.0` = the base size.
+    /// modules) can render larger text than leaves. `1.0` = the base size. Also the
+    /// SPATIAL-bundling representative rank: when several nodes collapse into one
+    /// on-screen cell, the member with the highest `label_scale` is the bundle's
+    /// drawn rep (a crate/module wins over its members). status: code-graph-bundling
     pub label_scale: f32,
     /// A small status-badge dot painted at the node's top-right in this color —
     /// a *mark* layered over the fill, not a recolor, so it stays legible
@@ -100,6 +103,19 @@ pub trait Source {
     /// Edges as `positions`-index pairs. Used both for drawing and as the
     /// force-worker topology.
     fn edges(&self) -> Vec<(u32, u32)>;
+
+    /// The edges the FORCE layout should treat as springs — defaults to
+    /// [`Source::edges`] (so the draw set IS the spring set, today's behaviour
+    /// for the canvas / vault / cluster sources). A source whose CONTAINMENT
+    /// shouldn't be drawn but SHOULD co-locate members with their container (the
+    /// code graph: a module's members near the module, modules near their
+    /// package) overrides this to add containment springs WITHOUT drawing them.
+    /// Duplicate pairs are summed by the force worker, so a spring added `k`
+    /// times pulls `k`× harder. Only consulted for the force-directed layout —
+    /// the layered (dagre) layout stays on [`Source::edges`]. status: code-graph-containment-layout
+    fn layout_edges(&self) -> Vec<(u32, u32)> {
+        self.edges()
+    }
 
     /// Spanning/parent tree for a tree layout. The vault graph BFS/DFS-es a
     /// spanning tree per kind; the cluster graph uses its parent tree for

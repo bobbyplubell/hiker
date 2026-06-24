@@ -44,21 +44,21 @@ note:: every source read clamped to repo root; refuses absolute / `..` / symlink
 
 ## The code graph
 
-The code graph is a third `graph_view::Source` beside the vault link graph and the cluster graph (`graph-view.md`); it renders through the same engine. The semantic structure (containment, drill-down) lives here; the *rendering* policy (label LOD by zoom, size-by-LOC) is specced in `graph-view.md` ([[spec:graph-label-lod]], [[spec:graph-size-by-loc]]).
+The code graph is a third `graph_view::Source` beside the vault link graph and the cluster graph (`graph-view.md`); it renders through the same engine. The semantic structure (containment, drill-down) lives here; the *rendering* policy (the constant-font label budget, size-by-LOC) is specced in `graph-view.md` ([[spec:graph-label-budget]], [[spec:graph-size-by-loc]]).
 
 - **`CodeGraph` Source.** `ScipAdapter::code_graph()` exposes the in-memory graph in render shape (`CodeGraph { nodes, edges }`, stable per-node index, external/local endpoints dropped, deterministic ordering); `app/src/panels/code_graph.rs::CodeGraphSource` maps entity kind → shape (type = square, else circle) + colour, and edges → index pairs. Verified headlessly: `widgets/graph-view/examples/code_graph_snapshot.rs` drives the real engine over a fixture `.scip` to a PNG. [code-graph-source]
 status:: done
 touches:: [[code:hiker/panels/code_graph]], [[code:hiker/scip_adapter]]
 note:: third `graph_view::Source`: `CodeGraph { nodes, edges }`, kind → shape/colour, edges → index pairs; verified headlessly to PNG over a fixture `.scip` · evidence: `app/src/panels/code_graph.rs` (`CodeGraphSource`), `code-intel/hiker-code/src/scip_adapter.rs` (`code_graph()`), `widgets/graph-view/examples/code_graph_snapshot.rs`
-- **The code-graph view panel.** The panel module that owns the surface: per-source `View` state lives on `AppState::panels.code_graph` keyed by `CodeSource::key()`, so flipping tabs keeps each project's layout (and its non-Clone adapter + background layout worker) warm; the file tree routes both openable shapes here (a `.scip` directly, a `hiker.kind: project` note); the first build seeds the global nav stack with the initial overview drill location, so a Back after the first drill returns to the overview rather than leaving the tab; and `apply_nav_target` is the pure (egui-free, unit-testable) restore side of Back/Forward. [code-graph-view-source]
+- **The code-graph view panel: shared doc + per-lens views.** The code-graph tab is a `TabKind::Container { primary: CodeGraphLens, secondary: Peer(CodeGraphLens), swapped }` ([[spec:tab-kinds]]). State splits in two: a shared `CodeGraphDoc` (one per `CodeSource`, in `AppState::panels.code_graph_docs` keyed by `CodeSource::key()`) holds the bound adapter, the full unified `EntityGraph`, governance + change set + palette + label-importance, and the SHARED `selected`/`hover_specs`/`focus_hops`; each visible lens is a `LensView` (in `code_graph_lenses`, keyed by `child_state_key`) carrying its OWN single force-layout engine + filtered display + drill scope. A pick in one lens reflects in the other because both read the doc. Flipping tabs keeps each source's doc + lenses (and the non-Clone adapter + layout workers) warm; the file tree routes both openable shapes here (a `.scip` directly, a `hiker.kind: project` note); the first build seeds the global nav stack with the initial overview drill location; and `apply_nav_target` is the pure (egui-free, unit-testable) restore side of Back/Forward. [code-graph-view-source]
 status:: done
-implements:: [[code:hiker/panels/code_graph/show]], [[code:hiker/panels/code_graph/apply_nav_target]]
+implements:: [[code:hiker/panels/code_graph/show_lens]], [[code:hiker/panels/code_graph/apply_nav_target]]
 touches:: [[code:hiker/panels/code_graph]], [[code:hiker/files/sidebar]]
-note:: previously a comment-only slug (`// status:` tags with no doc anchor to land on) — the module doc, `show`'s nav-stack seeding, the sidebar's `.scip` / project-note routing, and `apply_nav_target` carry the tags · evidence: `app/src/panels/code_graph.rs` (module doc, `show`, `apply_nav_target`), `app/src/files/sidebar.rs` (open routing), `app/src/tab.rs` (`TabKind::CodeGraph`)
-- **Open a project note or a `.scip` directly.** `TabKind::CodeGraph` carries a `CodeSource` enum (`Project(note) | Index(scip)`): opening a `hiker.kind: project` note routes here (mirroring `is_board_doc`), and the file tree can open a `.scip` directly (repo root defaults to the index's own directory). Both funnel through one `ScipAdapter::load`. [code-graph-tab]
+note:: shared `CodeGraphDoc` (per `CodeSource`) + per-visible-lens `LensView` (one engine each — the old monolithic three-engine `View` is gone). `open` builds a `Container` of two same-source `CodeGraphLens` children (`code_container`); `show_lens` renders the active lens as the main pane, `show_secondary` the corner minimap; both warm-reuse the source-keyed doc. `apply_nav_target` restores `(selected, scope)` without re-recording · evidence: `app/src/panels/code_graph/{doc,lens,mod}.rs` (`CodeGraphDoc`, `LensView`, `show_lens`, `show_secondary`, `apply_nav_target`), `app/src/files/sidebar.rs` (open routing), `app/src/tab.rs` (`TabKind::Container`/`CodeGraphLens`)
+- **Open a project note or a `.scip` directly.** `TabKind::CodeGraphLens` carries a `CodeSource` enum (`Project(note) | Index(scip)`): opening a `hiker.kind: project` note routes here (mirroring `is_board_doc`), and the file tree can open a `.scip` directly (repo root defaults to the index's own directory). Both funnel through one `ScipAdapter::load`. [code-graph-tab]
 status:: done
 touches:: [[code:hiker/panels/code_graph]]
-note:: opens a `hiker.kind: project` note or a `.scip` directly; both funnel through one `ScipAdapter::load` · evidence: `app/src/panels/code_graph.rs` (`TabKind::CodeGraph`, `CodeSource::{Project,Index}`), `workbench_host.rs` (`is_project_doc`)
+note:: opens a `hiker.kind: project` note or a `.scip` directly; both funnel through one `ScipAdapter::load` · evidence: `app/src/panels/code_graph/mod.rs` (`open`, `CodeSource::{Project,Index}`), `app/src/tab.rs` (`TabKind::CodeGraphLens`), `workbench_host.rs` (`is_project_doc`)
 - **Click → read-only detail.** A node's `click_path` carries the SCIP moniker; the panel resolves the selected node's kind + definition `file:line` via the adapter's `locate`. No editable tab is opened — consistent with [[spec:code-read-vs-write]]. [code-node-detail]
 status:: done
 touches:: [[code:hiker/panels/code_graph]]
@@ -82,11 +82,11 @@ note:: Calls / Implements edge-type toggles relayout on change · evidence: `app
 
 ### Selection, scope + back/forward
 
-- **Selection + scope dial.** Clicking a node (or a Find-popup pick) **selects** it — selection drives the detail line, the edge highlight, and the hops anchor; it never recenters the view by itself. A four-position toolbar **Scope** dial decides the display: **Overview** (the whole kind-filtered graph) or the selection's **undirected 1/2/3-hop neighbourhood** (`hop_mask`, a BFS over the symmetric adjacency of the *full* graph — hop distance is structural; the kind filter only decides what's drawn, and the anchor always shows even when its own kind is filtered out). The hop positions are disabled until a node is selected; a cleared/stale selection falls back to the overview display. Fresh-layout-on-anchor-change is the crucial bit: when the hops anchor changes, `rebuild_display` calls `engine.reset_layout_history()` so the small neighbourhood lays out fresh/compact rather than warm-seeding from the huge overview's positions; hop-count and filter tweaks keep the warm morph. A Find pick from the overview switches to 2-hop scope so the picked node is revealed even when the filter would hide it. [code-graph-scope-hops]
+- **Selection + scope dial.** Clicking a node (or a Find-popup pick) **selects** it — selection drives the detail line and the focus spotlight; it never recenters the view by itself (the engine's glide does that, [[spec:code-graph-glide-to-selected]]). A four-position toolbar **Scope** dial decides the display: **Overview** (the whole kind-filtered graph) or the selection's **undirected 1/2/3-hop neighbourhood** (`hop_mask`, a BFS over the symmetric adjacency of the *full* graph — hop distance is structural; the kind filter only decides what's drawn, and the anchor always shows even when its own kind is filtered out). The hop positions are disabled until a node is selected; a cleared/stale selection falls back to the overview display. In a Hops drill the anchor is **stored** (`LensView.hops_anchor`, latched once at drill time by `sync_hops_anchor`) DECOUPLED from the live selection — so clicking empty background clears the spotlight highlight but STAYS in the filtered view; only Esc (the middle rung) or the toolbar Overview leaves it. The small filtered subgraph then shows MOST labels (the small-graph rule, [[spec:graph-label-budget]]). Fresh-layout-on-anchor-change is the crucial bit: when the hops anchor changes, `rebuild_display` re-lays-out the small neighbourhood fresh/compact rather than warm-seeding from the huge overview's positions; hop-count and filter tweaks keep the warm morph. A Find pick from the overview switches to 2-hop scope so the picked node is revealed even when the filter would hide it. [code-graph-scope-hops]
 status:: done
-implements:: [[code:hiker/panels/graph_nav/hop_mask]], [[code:hiker/panels/code_graph/rebuild_display]], [[code:hiker/panels/code_graph/apply_nav_target]]
+implements:: [[code:hiker/panels/graph_nav/hop_mask]], [[code:hiker/panels/code_graph/lens/rebuild_display]], [[code:hiker/panels/code_graph/lens/sync_hops_anchor]], [[code:hiker/panels/code_graph/apply_nav_target]]
 touches:: [[code:hiker/panels/code_graph]]
-note:: supersedes the click-to-drill focus mode ([[spec:code-graph-focus-neighbourhood]]): click selects, the scope dial drills — selection and scope are orthogonal · the scaffolding (BFS `hop_mask`, the scope dial, the Esc rung, scope persist strings) moved to the shared navigation layer ([[spec:graph-nav-extract]], `app/src/panels/graph_nav.rs`); this panel keeps the code-specific policy (collapse-through-filters, fresh-layout-on-anchor-change, SCIP kinds)
+note:: supersedes the click-to-drill focus mode ([[spec:code-graph-focus-neighbourhood]]): click selects, the scope dial drills — orthogonal. The drill anchor is `LensView.hops_anchor`, stored separately from `doc.selected` (`sync_hops_anchor` latches it once, clears it only on Overview), so a background deselect keeps the subgraph put; a small filtered subgraph (≤ `SMALL_GRAPH_LABELS`) lifts the label budget so most labels show. The BFS `hop_mask`, scope dial, Esc rung, and scope persist strings live in the shared navigation layer ([[spec:graph-nav-extract]]); this panel keeps the code policy (collapse-through-filters, fresh-layout-on-anchor-change, SCIP kinds) · evidence: `app/src/panels/code_graph/lens.rs` (`hops_anchor`, `sync_hops_anchor`, `hops_mask`, `rebuild_display`), tests `hops_anchor_persists_through_deselect_and_clears_on_overview`
 - **Focus-mode neighbourhood drill.** Clicking a node set `focus` and the display became its neighbourhood, with a separate hops selector and "← Overview" — drill and selection were entangled. [code-graph-focus-neighbourhood]
 status:: superseded
 note:: superseded by [[spec:code-graph-scope-hops]] — selection and scope split into orthogonal controls; the BFS neighbourhood machinery carries over as `hop_mask`
@@ -94,6 +94,10 @@ note:: superseded by [[spec:code-graph-scope-hops]] — selection and scope spli
 status:: done
 touches:: [[code:hiker/panels/code_graph]]
 note:: global-stack back/forward over `(selected, scope)`; restores replay through `apply_nav_target` without re-recording · evidence: `app/src/panels/code_graph.rs` (`nav_snapshot`, `nav_restoring`), `app/src/panels/graph_nav.rs` (`nav_controls`, shared with the vault graph per [[spec:graph-nav-extract]]), `app/src/state.rs` (`NavTarget::CodeGraphNode`), `app/src/editor_pane.rs` (restore arm)
+- **Glide to the selected node.** Selecting a node smoothly pans the affine view to centre it (~0.4s ease-out), so the selection's footprint frames itself without a jarring jump. The glide is the engine's affine glide-to-selection ([[spec:graph-glide-to-selected]]), fired when the lens sets the engine's `selected_node`: cancelled on a manual pan/zoom and skipped during a fit/re-fit (a fresh build / scope-drill owns the framing then). [code-graph-glide-to-selected]
+status:: done
+touches:: [[code:hiker/panels/code_graph]], [[code:hiker/graph_view]]
+note:: a thin cross-reference — the behaviour is the engine-level [[spec:graph-glide-to-selected]] (`State::glide_to`, triggered in `panes.rs` from a `selected_node` change); the lens drives it by setting `engine.selected_node` from `doc.selected`. Code tag `code-graph` · evidence: `widgets/graph-view/src/graph_view/nav.rs` (`glide_to`), `app/src/panels/code_graph/lens.rs` (`render_canvas` maps `doc.selected` → `engine.selected_node`)
 
 ### Governance & diff overlays
 
@@ -106,74 +110,78 @@ the active encoding explicit. Kind → shape (type = square) is constant across 
 switches are pure recolors: no relayout, just an explicit GPU paint-cache invalidation (fills are
 baked into the cached affine batch).
 
-- **Spec-governance overlay.** Spec mode loads the repo-root `links.json` beside the adapter
-  (lazily, on the first switch — drift-checking fingerprints every linked body) and runs
-  `check_drift`; each symbol's per-link reports fold to one state by severity (missing > drifted >
-  ok) in `hiker_code::governance`, and the node fill colors it: **ok** green, **drifted** amber,
-  **missing** red (linked but no longer fingerprintable), **ungoverned** muted gray — the
-  ungoverned share of the codebase becomes a literally visible mass, with the numeric breakdown
-  appended to the summary line and the selected node's state + governing specs on the detail line.
-  The toggle is disabled (with a hint) when the repo has no `links.json`. [code-graph-governance-overlay]
+- **Governance drift, directly on translucent edges.** The unified entity graph ([[spec:spec-graph-source]])
+  makes a spec a real node and `Governs` a real edge, so spec governance shows WITHOUT a fill
+  overlay: the repo-root `links.json` loads beside the adapter (lazily, `GovCache::ensure` —
+  drift-checking fingerprints every linked body), folds each symbol's per-link reports to one state
+  by severity (missing > drifted > ok) in `hiker_code::governance`, and each `Governs` edge takes
+  that state's colour (**ok** green, **drifted** amber, **missing** red, **ungoverned** muted gray —
+  `gov_color`). `Governs`/`Reference`/`Implements` edges draw **translucent** (low alpha) so the
+  many-to-many spec fan-out recedes into a faint wash like the call edges, instead of an opaque
+  saturated hairball; the drift hue is retained at low alpha, and selecting/hovering a spec still
+  lights its edges bright via the highlight overlay. The numeric breakdown still appends to the
+  summary line and the selected node's state + governing specs to the detail line. Node fill stays
+  entity-kind throughout. The old Kind/Spec/Diff fill-overlay dial (`OverlayMode`,
+  `Overlay::node_fill`) is gone. [code-graph-governance-overlay]
 status:: done
-implements:: [[code:hiker/panels/code_governance/toolbar_section]], [[code:hiker/panels/code_governance/impl#[Overlay]node_fill]], [[code:hiker/governance/impl#[Governance]build]], [[code:hiker/governance/classify]]
+implements:: [[code:hiker/panels/entity_graph/edge_color_for]], [[code:hiker/panels/code_governance/gov_color]], [[code:hiker/governance/impl#[Governance]build]], [[code:hiker/governance/classify]]
 verifies:: [[code:hiker/governance/tests/classify_folds_by_severity]], [[code:hiker/governance/tests/build_rolls_up_drift_per_target]], [[code:hiker/panels/code_governance/tests/governance_palette_is_distinct]]
 touches:: [[code:hiker/panels/code_graph]], [[code:hiker/governance]]
-note:: per-view, loaded once per panel build (a re-open re-checks drift); the engine grew `invalidate_paint_cache` for recolors. Overlay mode is session-only (not in `CodeGraphViewState`) — persistence deferred
-- **Spec lighting.** In Spec mode, a toolbar dropdown (or a node menu's "Light spec" entry —
-  every governed node lists its specs there) lights one spec: its `implements`/`touches` targets
-  plus their 1-hop blast radius via the adapter's `neighbors` stay at full strength while every
-  other fill dims toward the background, and the lit nodes get a one-shot fluid pulse
-  (`State::pulse_nodes` injects energy into [[spec:graph-hover-fluid]]'s field, so the lighting
-  *drains* across the graph rather than blinking). `verifies` targets don't seed the lighting —
-  it shows where a spec lives, not what vouches for it. [code-graph-spec-lighting]
+note:: reframed from a fill overlay to a direct edge colour per the "no overlays" direction. `Governs`/`Reference` edges draw at `GOV_EDGE_ALPHA`, `Implements` at `IMPL_EDGE_ALPHA` (both via `translucent`), so the spec fan-out is a faint wash; the highlight overlay lights a selected/hovered spec's edges bright. Governance loads at view build (`GovCache`) so the spec layer is present from the first frame; `Governs` colours come from `EntityGraphSource::edge_color`/`edge_color_for`. New symbols not in the current `.scip` snapshot — `implements::` resolves on the next index regen
+- **Select to spotlight a footprint, with a configurable hop radius.** Selecting a node lights it +
+  its footprint and dims the rest to faint context (the focus spotlight, [[spec:code-graph-spec-lighting]]
+  in `spec-graph.md`): a SPEC lights itself + every entity it governs; a CODE node lights itself +
+  its **1/2/3-hop** neighbourhood (configurable, default 1, set from the node right-click "Highlight
+  N hops"). A spec is selected by clicking it, the find popup, the vault graph's spec → code jump
+  (`code_graph::select_spec`), or a code node's "Select spec" menu entry. This stays in the full
+  overview — it is NOT the filtered `Scope::Hops` drill ([[spec:code-graph-scope-hops]]). It replaces
+  the old "light a spec" fill overlay: no dropdown, no whole-graph recolour mode. [code-graph-spec-lighting]
 status:: done
-implements:: [[code:hiker/governance/impl#[Governance]lighting]], [[code:hiker/panels/code_governance/impl#[Overlay]light]], [[code:hiker/panels/code_graph/pulse_lit]], [[code:hiker/graph_view/impl#[State]pulse_nodes]]
-verifies:: [[code:hiker/governance/tests/lighting_is_targets_plus_blast_radius]], [[code:hiker/graph_view/tests/pulse_tests/pulse_nodes_injects_energy_where_fluid_is_on]]
-touches:: [[code:hiker/panels/code_governance]]
-note:: the steady signal is the dimmed-fill contrast; the pulse is the "where did it go" moment. Lit members hidden by the kind filter don't pulse (their visible ancestor carries structure, not the spec claim)
-- **`status::` badge.** Nodes whose governing spec entry is `status:: planned`/`partial` carry a
-  small violet dot on the node's top-right shoulder — a separate channel from the governance fill
-  (status is "are the spec's claims landed", not "did the code drift"). Statuses are scanned once
-  with `links.json` from the repo's `docs/` by the same `[slug]`-anchor association reconcile's
-  link lines use, so the two can't disagree on what an anchor is. The badge is engine-level
-  (`NodeDescriptor.badge`, Painter-drawn above GPU fills at the FULL LOD tier) and shows in Spec
-  mode only. [code-graph-status-badge]
+implements:: [[code:hiker/panels/code_graph/select_spec]], [[code:hiker/panels/code_graph/lens/focus_set]], [[code:hiker/panels/entity_graph/impl#[EntityGraphSource]with_focus]]
+touches:: [[code:hiker/panels/code_graph]], [[code:hiker/graph_view/edges]]
+note:: the spotlight is `EntityGraphSource::with_focus` (dim-the-rest); `lens::focus_set` builds the lit index set — a spec's governed-in-display, or a code node's `doc.focus_hops`-bounded BFS over the display edges (`focus_hops == 1` = the historical direct-neighbour set). The hop radius is the shared `CodeGraphDoc.focus_hops`, set by `NodeAction::FocusHops(n)` (right-click "Highlight 1/2/3 hops", clamp 1–3) and persisted. Replaces the removed lighting machinery (`Overlay::light`/`lit_ids`, `pulse_lit`). New symbols not in the current `.scip` snapshot — resolves on the next index regen · evidence: `app/src/panels/code_graph/lens.rs` (`focus_set`, test `focus_set_code_node_bfs_widens_with_hop_radius`), `mod.rs` (`node_menu_ui` `FocusHops` arm)
+- **`status::` badge.** A spec node whose `status::` is `planned`/`partial` carries a small violet
+  dot on its top-right shoulder — its claims aren't fully landed. Statuses are scanned with
+  `links.json` from the repo's `docs/` by the same `[slug]`-anchor association reconcile's link
+  lines use. The badge is engine-level (`NodeDescriptor.badge`, Painter-drawn above GPU fills at
+  the FULL LOD tier), set by `EntityGraphSource` from the spec node's `status`. [code-graph-status-badge]
 status:: done
-implements:: [[code:hiker/governance/doc_statuses]], [[code:hiker/panels/code_governance/impl#[Overlay]node_badge]]
+implements:: [[code:hiker/governance/doc_statuses]], [[code:hiker/governance/status_flagged]]
 verifies:: [[code:hiker/governance/tests/doc_statuses_bind_to_nearest_anchor]], [[code:hiker/governance/tests/flagged_follows_planned_and_partial_statuses]]
-touches:: [[code:hiker/graph_view/source]], [[code:hiker/graph_view/edges]]
-- **Open-bugs badge.** Nodes with a `manifests-in` edge from a non-struck `bug_tracking.md` row
-  ([[spec:tracker-relation-links]], [[spec:tracker-open-is-not-struck]]) carry a hot-coral dot on
-  the top-LEFT shoulder in Spec mode — the bug twin of the status badge (violet, top-right): an
-  independent engine mark channel (`NodeDescriptor.bug_badge`, Painter-drawn at FULL LOD), fed by
-  the same governance rollup pass (`links.json` + the tracker's struck-row scan, loaded together).
-  The selected node's detail line appends "N open bugs: <slugs>". Struck rows stop counting as
-  open but keep their `verifies-fix` regression watch in drift; bug slugs stay out of the spec
-  channels (no "Light spec" menu entries, since bugs have no lighting targets). [code-graph-bug-badge]
+touches:: [[code:hiker/panels/entity_graph]], [[code:hiker/graph_view/source]]
+note:: moved from the old Spec-mode `Overlay::node_badge` to `EntityGraphSource::nodes` (the spec node's own status); shown on spec nodes whenever the graph is drawn
+- **Open-bugs badge.** A node with a `manifests-in` edge from a non-struck `bug_tracking.md` row
+  ([[spec:tracker-relation-links]], [[spec:tracker-open-is-not-struck]]) carries a hot-coral dot on
+  the top-LEFT shoulder — the bug twin of the status badge (violet, top-right): an independent
+  engine mark channel (`NodeDescriptor.bug_badge`, Painter-drawn at FULL LOD), fed by the
+  governance rollup (`Governance::open_bugs_of`). Struck rows stop counting as open but keep their
+  `verifies-fix` regression watch in drift. [code-graph-bug-badge]
 status:: done
-implements:: [[code:hiker/governance/impl#[Governance]build]], [[code:hiker/panels/code_governance/impl#[Overlay]detail_fragment]]
-touches:: [[code:hiker/graph_view/source]], [[code:hiker/graph_view/edges]]
-note:: `Governance::open_bugs_of` / `Overlay::node_bug_badge` / `governance::struck_bug_rows` and the rollup tests (`open_bugs_rollup_counts_non_struck_manifests_in`, `struck_bug_rows_collects_only_struck_slugs`) are new symbols not in the current `.scip` snapshot — point `implements::`/`verifies::` at them on the next index regen
-- **File-level diff coloring.** Diff mode colors each node by its **file's** HEAD-vs-worktree
-  change status from `GitBackend::diff_paths` (via the vault git engine; vault-relative rows map
-  onto the repo root), using the diff-summary panel's status palette (added green / modified blue
-  / deleted red / renamed orange) with unchanged files as the same muted mass. The map reloads on
-  every switch into the mode so it tracks the working tree; the toggle is disabled (with a hint)
-  when git isn't the vault transport. Refined to symbol grain by
-  [[spec:code-graph-diff-symbol-level]]: within a `Modified` file, body-unchanged symbols dim to
-  a quieter tone of the same status color. [code-graph-diff-coloring]
+implements:: [[code:hiker/governance/impl#[Governance]open_bugs_of]], [[code:hiker/governance/impl#[Governance]build]]
+touches:: [[code:hiker/panels/entity_graph]], [[code:hiker/graph_view/source]]
+note:: now read directly in `EntityGraphSource::nodes` via `Governance::open_bugs_of` (the `Overlay::node_bug_badge` wrapper is gone); shown whenever the graph is drawn, not Spec-mode-gated
+- **Change ring (direct, not a fill).** Toggling "Changes" rings each node by its **file's**
+  HEAD-vs-worktree change status from `GitBackend::diff_paths` (via the vault git engine;
+  vault-relative rows map onto the repo root), using the diff-summary palette (added green /
+  modified blue / deleted red / renamed orange). The ring is the node's `resting_stroke` — fill
+  stays entity-kind, so change layers over identity instead of replacing it (the "no overlays"
+  direction). The change set loads on enable; the toggle is disabled (with a hint) when git isn't
+  the vault transport. Refined to symbol grain by [[spec:code-graph-diff-symbol-level]]: within a
+  `Modified` file a body-unchanged symbol rings dim, a body-changed one rings full. Change is also
+  a lens predicate ("only changed", [[spec:spec-graph-lens]]). [code-graph-diff-coloring]
 status:: done
-implements:: [[code:hiker/panels/code_governance/rows_to_repo]]
-verifies:: [[code:hiker/panels/code_governance/tests/rows_to_repo_strips_the_repo_prefix]]
-touches:: [[code:hiker/git_sync]], [[code:hiker/panels/git_diff]]
+implements:: [[code:hiker/panels/code_governance/impl#[Changes]ring]], [[code:hiker/panels/code_governance/impl#[Changes]load]], [[code:hiker/panels/code_governance/rows_to_repo]]
+verifies:: [[code:hiker/panels/code_governance/tests/change_ring_and_touches_follow_refinement]], [[code:hiker/panels/code_governance/tests/rows_to_repo_strips_the_repo_prefix]]
+touches:: [[code:hiker/git_sync]], [[code:hiker/panels/entity_graph]]
+note:: reframed from a fill overlay mode to a direct node ring (`Changes::ring` → `NodeDescriptor.resting_stroke`) per the "no overlays" direction; the diff DATA generation is unchanged
 - **Symbol-level diff coloring.** Within a `Modified` file, Diff mode distinguishes *which*
   symbols actually changed: the file's HEAD text (`show_at`, i.e. `git show HEAD:<path>`) and its
   working-tree text are both parsed whole with the same tree-sitter grammars the drift
   fingerprint uses; every definition-shaped node carrying a `name` field is hashed through the
   drift fingerprint's own token walk (comment/format-insensitive — drift generalized from "vs.
   baseline" to "vs. HEAD"); a symbol is *unchanged* only when its name's sorted fingerprint
-  multiset is identical on both sides. Body-unchanged nodes render the file's status color
-  dimmed ("the file churned around it"); body-changed nodes keep full color. **Span-mapping
+  multiset is identical on both sides. Body-unchanged nodes ring the file's status color
+  dimmed ("the file churned around it"); body-changed nodes ring full ([[spec:code-graph-diff-coloring]]). **Span-mapping
   design:** index spans are index-time, so the HEAD side is located by **name-anchored
   extraction**, never spans — a pure line move cannot misattribute by construction. **Failure
   direction is over-flag, never silently dim:** anything unprovable stays at the louder full
@@ -188,25 +196,26 @@ touches:: [[code:hiker/git_sync]], [[code:hiker/panels/git_diff]]
   the constant itself changed (the namesake under-flag hole; code fix deferred). Known scope
   cut: attribute/decorator-only edits sit outside the definition node on *both* sides, so they
   read as file churn (dim), not body change. The refinement runs synchronously on each switch
-  into Diff mode (one `show` + two parses per modified file), beside the diff-map reload.
+  the change set loads (one `show` + two parses per modified file), beside the diff-map build.
   [code-graph-diff-symbol-level]
 status:: done
 implements:: [[code:hiker/scip_adapter/symbol_changed_vs]], [[code:hiker/scip_adapter/impl#[ScipAdapter]changed_symbols_vs]], [[code:hiker/panels/code_governance/refine_symbol_diff]]
-verifies:: [[code:hiker/scip_adapter/tests/symbol_changed_vs_flags_body_edits_not_formatting]], [[code:hiker/scip_adapter/tests/symbol_changed_vs_is_span_free_so_pure_moves_do_not_misattribute]], [[code:hiker/scip_adapter/tests/symbol_changed_vs_overflags_whenever_unprovable]], [[code:hiker/panels/code_governance/tests/diff_fill_dims_only_proven_unchanged_bodies]]
+verifies:: [[code:hiker/scip_adapter/tests/symbol_changed_vs_flags_body_edits_not_formatting]], [[code:hiker/scip_adapter/tests/symbol_changed_vs_is_span_free_so_pure_moves_do_not_misattribute]], [[code:hiker/scip_adapter/tests/symbol_changed_vs_overflags_whenever_unprovable]], [[code:hiker/panels/code_governance/tests/change_ring_and_touches_follow_refinement]]
 touches:: [[code:hiker/git_sync]], [[code:hiker/panels/code_governance]]
 note:: new symbols not in the current `.scip` snapshot — the `implements::`/`verifies::` bodies resolve on the next index regen
 - **Open diff from a node.** Right-clicking a code node opens a **menu** — per `interaction.md`
   [[spec:rightclick-menu-always]], replacing this surface's old direct "open source file" binding
   (the code-graph half of `bug-graph-node-right-click-not-menu`): **Open source** (the read-only
-  code view), **Open diff vs HEAD** (enabled when the Diff overlay knows the file changed; greyed
-  with the reason otherwise), **Copy symbol**, and a **Light spec** entry per governing spec.
-  Open diff routes through the diff-summary panel's shared `open_diff_tab` into an editor tab
-  with `DiffSource::GitRef` — the graph shows *where* the change is; the click drops into hunks.
-  The menu is hosted in a popup at the latched pointer position (the engine owns its pane
-  response, so `Response::context_menu` isn't available). [code-graph-open-diff-from-node]
+  code view), **Open diff vs HEAD** (enabled when git is the vault transport; greyed with the
+  reason otherwise), **Copy symbol**, and a **Select spec** entry per governing spec (selecting it
+  glows that spec's edges, [[spec:code-graph-spec-lighting]]). Open diff routes through the
+  diff-summary panel's shared `open_diff_tab` into an editor tab with `DiffSource::GitRef` — the
+  graph shows *where* the change is; the click drops into hunks. The menu is hosted in a popup at
+  the latched pointer position (the engine owns its pane response, so `Response::context_menu`
+  isn't available). [code-graph-open-diff-from-node]
 status:: done
 implements:: [[code:hiker/panels/code_governance/node_menu]], [[code:hiker/panels/code_graph/node_menu_ui]]
-verifies:: [[code:hiker/panels/code_governance/tests/node_menu_offers_open_diff_and_light_spec]]
+verifies:: [[code:hiker/panels/code_governance/tests/node_menu_offers_open_diff_and_select_spec]]
 touches:: [[code:hiker/panels/git_diff]]
 
 ## Spec tooling (code-cli)

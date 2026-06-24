@@ -15,8 +15,9 @@
 use editor_view::autocomplete::{
     rank, CandidateSource, CompletionItem, CompletionKind, RankCandidate,
 };
-use hiker_code::GraphNode;
 use smol_str::SmolStr;
+
+use super::entity_graph::{EntityNode, SPEC_KIND};
 
 /// File basename (final `/`-segment) of a node's `file` path, for the picker
 /// detail line. Returns the whole string when there's no separator.
@@ -35,27 +36,31 @@ fn kind_to_completion(kind: &str) -> CompletionKind {
     }
 }
 
-/// A [`CandidateSource`] over a code graph's node list. Ranks by `name` and
-/// carries each node's `id` (SCIP moniker) in `insert` so the view can focus
-/// it after a pick. Borrows the node slice — built fresh per open, queried per
-/// frame while the picker is up.
-pub struct CodeNodeFindSource<'a> {
-    nodes: &'a [GraphNode],
+/// A [`CandidateSource`] over the unified entity graph's nodes (code symbols + spec slugs). Ranks
+/// by `name` and carries each node's `id` (SCIP moniker / spec slug) in `insert` so the view can
+/// focus it after a pick. Borrows the node slice — built fresh per open, queried per frame while
+/// the picker is up.
+pub(crate) struct EntityNodeFindSource<'a> {
+    nodes: &'a [EntityNode],
 }
 
-impl<'a> CodeNodeFindSource<'a> {
-    pub const fn new(nodes: &'a [GraphNode]) -> Self {
+impl<'a> EntityNodeFindSource<'a> {
+    pub(crate) const fn new(nodes: &'a [EntityNode]) -> Self {
         Self { nodes }
     }
 }
 
-impl CandidateSource for CodeNodeFindSource<'_> {
+impl CandidateSource for EntityNodeFindSource<'_> {
     fn candidates(&self, query: &str, limit: usize) -> Vec<CompletionItem> {
         let candidates = self
             .nodes
             .iter()
             .map(|n| {
-                let detail = format!("{} · {}", n.kind, file_basename(&n.file));
+                let detail = if n.kind == SPEC_KIND {
+                    "spec".to_string()
+                } else {
+                    format!("{} · {}", n.kind, file_basename(&n.file))
+                };
                 RankCandidate {
                     label: SmolStr::from(n.name.as_str()),
                     basename: None,
@@ -118,47 +123,54 @@ impl CandidateSource for VaultNodeFindSource<'_> {
 mod tests {
     use super::*;
 
-    fn node(id: &str, name: &str, kind: &str, file: &str) -> GraphNode {
-        GraphNode {
+    fn node(id: &str, name: &str, kind: &str, file: &str) -> EntityNode {
+        EntityNode {
             id: id.to_string(),
             name: name.to_string(),
             kind: kind.to_string(),
             file: file.to_string(),
             start_line: 0,
             lines: 1,
+            status: None,
             parent: None,
         }
     }
 
-    /// Code find: a prefix match ranks above an interior substring, and each
-    /// item's `insert` carries the node id (not the name).
+    /// Entity find: a prefix match ranks above an interior substring, each item's `insert`
+    /// carries the node id (not the name), and a spec node reads "spec" in its detail.
     #[test]
-    fn code_find_ranks_prefix_first_and_carries_id() {
+    fn entity_find_ranks_prefix_first_and_carries_id() {
         let nodes = vec![
             node("scip:parse_config", "parse_config", "code:function", "src/cfg.rs"),
             node("scip:Parser", "Parser", "code:type", "src/parse.rs"),
             node("scip:reparse", "reparse", "code:function", "src/parse.rs"),
+            node("parser-spec", "parser-spec", SPEC_KIND, ""),
         ];
-        let src = CodeNodeFindSource::new(&nodes);
+        let src = EntityNodeFindSource::new(&nodes);
         let items = src.candidates("par", 10);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         // `Parser` + `parse_config` (prefix) outrank `reparse` (interior).
-        assert_eq!(labels.iter().position(|l| *l == "reparse"), Some(2));
+        assert!(
+            labels.iter().position(|l| *l == "reparse")
+                > labels.iter().position(|l| *l == "Parser")
+        );
         assert!(labels.contains(&"Parser") && labels.contains(&"parse_config"));
         // `insert` is the SCIP id, not the display name.
         let parser = items.iter().find(|i| i.label.as_str() == "Parser").unwrap();
         assert_eq!(parser.insert.as_str(), "scip:Parser");
-        // Detail carries kind + file basename (not the full path).
         assert_eq!(parser.detail.as_deref(), Some("code:type · parse.rs"));
+        // A spec node carries the "spec" detail.
+        let spec = items.iter().find(|i| i.label.as_str() == "parser-spec").unwrap();
+        assert_eq!(spec.detail.as_deref(), Some("spec"));
     }
 
     /// The result list is capped to `limit`.
     #[test]
-    fn code_find_respects_limit() {
-        let nodes: Vec<GraphNode> = (0..20)
+    fn entity_find_respects_limit() {
+        let nodes: Vec<EntityNode> = (0..20)
             .map(|i| node(&format!("id{i}"), &format!("foo{i}"), "code:function", "f.rs"))
             .collect();
-        let src = CodeNodeFindSource::new(&nodes);
+        let src = EntityNodeFindSource::new(&nodes);
         assert_eq!(src.candidates("foo", 5).len(), 5);
     }
 

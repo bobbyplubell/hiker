@@ -214,7 +214,8 @@ When `vault.default` is set, the app auto-opens that path on startup instead of 
 
 ### [keymap]
 
-Stub. v1 does not load keybind overrides; [[spec:settings-section-keymap]] stays planned. The [[spec:keybind-registry]] in `editor.md` is shaped to accept overrides — the loader is the missing piece, deferred until a user actually wants to remap something. When it lands the format is `keymap.<binding-id> = "<chord>"`.
+Stub. v1 does not load keybind overrides; this stays planned. The [[spec:keybind-registry]] in `editor.md` is shaped to accept overrides — the loader is the missing piece, deferred until a user actually wants to remap something. When it lands the format is `keymap.<binding-id> = "<chord>"`. [settings-section-keymap]
+status:: planned
 
 ### [llm]
 
@@ -363,6 +364,11 @@ The cross-vault `PatchReview` singleton tab lists every pending edit across all 
 
 Click a pending row → opens the editor tab in diff mode with `DiffSource = StagingProposal(id)` (per [[spec:diff-as-mode]]). Accept → navigates to the target note as a preview tab. Reject → returns to the `PatchReview` tab. [Accept all (N)] at the top runs a confirm-then-batch-apply (stays on current surface). [staging-review-patch-review-tab]
 
+The cross-vault `PatchReview` tab lists pending edits via `op_writes::list_pending_proposals` (path resolved via `path_for_doc`, drift via `is_pending_drifted`); per-row + Accept-all/Reject-all flip through `op_writes::flip_op_status`. Accept-all skips drifted edits, Reject-all covers them; per-row Accept disabled when drifted. [staging-bulk-apply-reject]
+status:: done
+touches:: [[code:hiker/panels/patch_review]]
+note:: evidence: `app/src/panels/patch_review.rs` (`apply_bulk_flip`, per-row + bulk verbs)
+
 #### Surface 6: Queue button (combined badge)
 
 The top-strip queue button (and the `PatchReview` tab's own badge) shows the pending-review count. Click opens the relevant detail page. [staging-review-top-bar-badge]
@@ -381,12 +387,21 @@ No green/red. All Accept/Reject use the muted token system and the text-link wei
 
 The substrate is owned by `op-log.md` and `patch-review.md`, not respecified here. Pending-edit storage layout (anchored edits persisted to `.pending`), the produce → `stage_pending` → surface-refresh → accept/reject (`flip_op_status`) lifecycle, drift derivation, query filters (by `path` / `trail_id` / `surface` / `session_id` / `status`), change events, and retention/auto-reject behavior all live in `op-log.md` ([[spec:op-log-store-layout]], [[spec:op-log-op-shape]], [[spec:op-log-status-states]], [[spec:op-log-config-section]]). The only database is the regenerable search index; there is no separate staging database, and `[op-log]` owns the review config. The substrate API is `core::oplog`; producer helpers and `flip_op_status` live in `core::ops`.
 
+Per-path filtering is via `Activity::list_for_path`, per-surface/author via `author_pattern`. The pending side projects from `OpLog::all_pending_ops` (resolved to path via `path_for_doc`). [staging-review-filtering]
+status:: done
+note:: evidence: `core/src/activity.rs` (`Filter` { source, author_pattern, since_ms } + `list_for_path`)
+
 ### Config keys for review
 
 Per-surface gates live in their owning sections; substrate-level behavior (`auto_reject_on_drift`, `rejected_retention_days`) lives in `[op-log]` per [[spec:op-log-config-section]].
 
 - **`[mcp.tools].review_required`** (bool, default `true`) — extends [[spec:mcp-config-section]]. When true, every MCP tool-write stages as a pending edit instead of committing to `accepted`. Live-applied. Exposed as a bool toggle in the MCP settings UI section.
 - **`[llm.background].review_required`** (bool, default `false`) — lands with the `[llm]` section. When true, debounced background features stage pending edits instead of mutating frontmatter directly.
+
+Both surface as bool toggle rows: `[mcp.tools].review_required` in the MCP server settings section and `[llm.background].review_required` in the LLM settings section. Both keys are already in `ELIGIBLE_USER` / `ELIGIBLE_VAULT` so `set_setting` accepts writes. Live-applied (no restart). Per `mcp.md` "## Settings UI section". [agent-write-review-settings-toggles]
+status:: done
+touches:: [[code:hiker/panels/settings]]
+note:: evidence: `app/src/panels/settings/mod.rs`
 
 Batch mutations have no `review_required` flag — they always stage pending edits.
 
@@ -613,22 +628,3 @@ Real, considered, explicitly not v1.
 - **"Did you mean X?" hints on unknown keys.** The hard error already names the bad key plus file. A near-match suggester is polish-grade.
 
 **Out of scope (not deferred — never):** a web-based settings UI or remote config (Hiker is local-first); per-note settings beyond frontmatter; settings inheritance across vaults (each vault is independent); encrypted settings (no secrets in `config.toml` — cloud embedder API keys, if they land, get keychain-backed storage, not a TOML field).
-
-## Registry imports (from status.md)
-
-Entries imported from the retired status registry that had no anchor in this doc —
-re-home them into the relevant sections as the doc evolves.
-
-- **settings-section-keymap** — stub; loader for `keymap.<binding-id> = "<chord>"` deferred until first user remap [settings-section-keymap]
-  status:: planned
-- **agent-write-review-settings-toggles** — bool toggle rows for `[mcp.tools].review_required` in the MCP server settings section and `[llm.background].review_required` in the LLM settings section. Both keys are already in `ELIGIBLE_USER` / `ELIGIBLE_VAULT` (`core/src/config.rs:1418,1421,1472,1475`) so `set_setting` accepts writes. Live-applied (no restart). Per `settings.md` "## Staging review" and `mcp.md` "## Settings UI section" [agent-write-review-settings-toggles]
-  status:: done
-  touches:: [[code:hiker/panels/settings]]
-  note:: evidence: `app/src/panels/settings/mod.rs`
-- **staging-review-filtering** — per-path filtering via `Activity::list_for_path`, per-surface/author via `author_pattern`. The pending side projects from `OpLog::all_pending_ops` (resolved to path via `path_for_doc`) [staging-review-filtering]
-  status:: done
-  note:: evidence: `core/src/activity.rs` (`Filter` { source, author_pattern, since_ms } + `list_for_path`)
-- **staging-bulk-apply-reject** — the cross-vault PatchReview tab lists pending edits via `op_writes::list_pending_proposals` (path resolved via `path_for_doc`, drift via `is_pending_drifted`); per-row + Accept-all/Reject-all flip through `op_writes::flip_op_status`. Accept-all skips drifted edits, Reject-all covers them; per-row Accept disabled when drifted [staging-bulk-apply-reject]
-  status:: done
-  touches:: [[code:hiker/panels/patch_review]]
-  note:: evidence: `app/src/panels/patch_review.rs` (`apply_bulk_flip`, per-row + bulk verbs)

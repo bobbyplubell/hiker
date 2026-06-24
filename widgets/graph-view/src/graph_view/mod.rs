@@ -46,6 +46,7 @@ pub(crate) use profile_scope;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use layout::{adaptive_anchor_stiffness, build_warm_seed, change_fraction, scatter};
+use nav::Glide;
 use source::{LayoutConfig, NodeDescriptor, PreviewCache, Snapshot, Source, Toggles};
 use styling::{color_row, palette_rows, HighlightStyle, Palette, Style};
 
@@ -134,6 +135,14 @@ pub struct State {
     pub poincare_zoom: f32,
     /// In-flight click fly-to animation, if any.
     flyto: Option<FlyTo>,
+    /// In-flight affine glide-to-selection animation, if any. Set when
+    /// [`Self::selected_node`] changes; advanced once per affine frame; cleared
+    /// on a manual pan/zoom. status: code-graph
+    glide: Option<Glide>,
+    /// Last frame's [`Self::selected_node`], so the affine pane can fire a
+    /// glide exactly on the frame the selection changes to a new node.
+    /// status: code-graph
+    prev_selected: Option<usize>,
     /// Magnification at or above which a node renders at FULL detail (circle /
     /// square + label). Read clamped so `lod_marker_mag < lod_full_mag`.
     pub lod_full_mag: f32,
@@ -144,6 +153,11 @@ pub struct State {
     pub focus_mode: FocusMode,
     /// The node the lens focuses on under [`FocusMode::Selection`] — set on click.
     focus_node: Option<usize>,
+    /// Whether SPATIAL node-bundling runs on the interactive affine pane (collapse nodes within
+    /// ~`MERGE_PX` on screen into one cluster rep, splitting on zoom-in). `false` → the pane passes a
+    /// `0.0` screen scale so [`State::compute_bundles`] returns the identity (every node drawn). The
+    /// caller mirrors its `bundling` lens toggle onto this. status: code-graph-bundling
+    pub bundling: bool,
     /// Whether Poincaré/Fisheye edges bow along geodesics/the bulge. When
     /// `false`, edges draw as straight segments even under a lens.
     pub geodesic_edges: bool,
@@ -279,6 +293,51 @@ pub struct State {
     /// host can attach a context menu to non-openable nodes (e.g. cluster
     /// nodes) without giving them a misleading click affordance.
     secondary_click_node: Option<usize>,
+    /// Set for one frame when the pane was primary-clicked on EMPTY space (no node hit) — the
+    /// host's cue to clear its selection (read+cleared via
+    /// [`take_background_click`](Self::take_background_click)).
+    background_click: bool,
+    /// Last frame's drawn-label screen rects → node index, so the hit-test can resolve a hover/click
+    /// over a LABEL to its node (read this frame, rewritten by the draw). status: graph-label-hit
+    label_hits: Vec<(egui::Rect, usize)>,
+    /// The UNCLAMPED ideal fit zoom recorded the last time the interactive affine pane fitted its
+    /// view to the layout (`fit_to_positions`' return) — the genuine fitted-overview scale even when
+    /// the actual `view.zoom` was floored at `ZOOM_MIN`. The affine LOD gate divides the live
+    /// `view.zoom` by this so its thresholds are expressed as a ratio over the fitted overview
+    /// (`1.0` = overview), making node-bundling/label reveal independent of the graph's world
+    /// extent. Initialised to `1.0` (so a never-fitted view gates on absolute zoom). status: code-graph-bundling
+    last_fit_zoom: f32,
+    /// Per-node un-bundling reveal progress (indexed by positions index): `0.0` = just revealed (drawn
+    /// AT its parent/bundle position), `1.0` = fully settled at its own layout position. When a zoom-in
+    /// dissolves a bundle, the newly-revealed members are reset to `0.0` and eased toward `1.0` over
+    /// [`REVEAL_DUR`], so they "explode open" out from the bundle centre instead of popping into place.
+    /// Defaults all-`1.0` (no animation until a reveal happens). Only the interactive affine pane
+    /// advances + reads it; other panes treat every node as settled. status: code-graph-bundling
+    reveal_t: Vec<f32>,
+    /// Last interactive-affine frame's bundling visible set, to detect culled→visible transitions
+    /// (the moment a member emerges from its bundle) so its [`Self::reveal_t`] restarts at `0.0`.
+    /// status: code-graph-bundling
+    prev_bundle_visible: Vec<bool>,
+    /// Last interactive-affine frame's SPATIAL representative per node — the cell rep each node was
+    /// bundled into. When a node flips culled→visible, the value still held here (last frame's rep) is
+    /// captured as its [`Self::reveal_origin`] fly-out start. status: code-graph-bundling
+    prev_bundle_rep: Vec<usize>,
+    /// Per-node fly-out ORIGIN for the active reveal: the cell rep the node was bundled into the frame
+    /// before it became visible (≤ ~`MERGE_PX` away on screen). `effective_positions` lerps a
+    /// mid-flight node out from `reveal_origin[i]`'s position. `i` itself = no fly-out.
+    /// status: code-graph-bundling
+    reveal_origin: Vec<usize>,
+}
+
+/// Un-bundling reveal duration (seconds): the time a member takes to fly out from its dissolving
+/// bundle's centre to its own settled layout position. status: code-graph-bundling
+const REVEAL_DUR: f32 = 0.35;
+
+/// Decelerating ease-out (`1 − (1 − t)³`) for the un-bundling reveal: members leave the bundle fast
+/// and settle gently. Endpoints are exact (`0 → 0`, `1 → 1`). status: code-graph-bundling
+fn ease_out_reveal(t: f32) -> f32 {
+    let u = 1.0 - t.clamp(0.0, 1.0);
+    1.0 - u * u * u
 }
 
 /// An in-flight hover-flow transition: the two keyframes (`from` = the previously
@@ -548,10 +607,13 @@ impl State {
             nav: Mobius::identity(),
             poincare_zoom: 1.0,
             flyto: None,
+            glide: None,
+            prev_selected: None,
             lod_full_mag: 0.5,
             lod_marker_mag: 0.15,
             focus_mode: FocusMode::LockedCenter,
             focus_node: None,
+            bundling: true,
             geodesic_edges: true,
             flyto_enabled: true,
             flyto_duration: 0.6,
@@ -589,6 +651,13 @@ impl State {
             fluid_last_time: 0.0,
             secondary_click: None,
             secondary_click_node: None,
+            background_click: false,
+            label_hits: Vec::new(),
+            last_fit_zoom: 1.0,
+            reveal_t: Vec::new(),
+            prev_bundle_visible: Vec::new(),
+            prev_bundle_rep: Vec::new(),
+            reveal_origin: Vec::new(),
         }
     }
 
@@ -598,6 +667,12 @@ impl State {
     /// right-clicked.
     pub const fn take_secondary_click(&mut self) -> Option<String> {
         self.secondary_click.take()
+    }
+
+    /// Take whether the pane was primary-clicked on empty space this frame (clearing the flag) —
+    /// the host's cue to deselect.
+    pub const fn take_background_click(&mut self) -> bool {
+        std::mem::replace(&mut self.background_click, false)
     }
 
     /// Take the positions-vector index of the node RIGHT-clicked this frame
@@ -645,6 +720,55 @@ impl State {
     /// recolor would otherwise keep stale colors on the GPU path.
     pub const fn invalidate_paint_cache(&mut self) {
         self.layout_epoch = self.layout_epoch.wrapping_add(1);
+    }
+
+    /// `(min, max, count)` of the in-flight (`reveal_t < 1.0`) un-bundling progress this frame — a
+    /// harness/demo affordance to assert the fly-out is genuinely mid-animation (not already settled,
+    /// not un-started). `(1.0, 1.0, 0)` when everything is settled. Not part of the interactive flow.
+    /// status: code-graph-bundling
+    #[doc(hidden)]
+    #[must_use]
+    pub fn reveal_progress_for_demo(&self) -> (f32, f32, usize) {
+        let mut min = 1.0_f32;
+        let mut max = 0.0_f32;
+        let mut count = 0;
+        for &t in &self.reveal_t {
+            if t < 1.0 {
+                min = min.min(t);
+                max = max.max(t);
+                count += 1;
+            }
+        }
+        if count == 0 {
+            (1.0, 1.0, 0)
+        } else {
+            (min, max, count)
+        }
+    }
+
+    /// A cache-busting key for the affine GPU fill batch while the un-bundling animation runs. `0`
+    /// when every node is settled (`reveal_t >= 1.0`) — so the steady-state cache key is unchanged and
+    /// a settled graph keeps hitting the cache (no perpetual rebuild). While animating it's a coarse
+    /// quantized hash of the live `reveal_t` (each node's progress bucketed to ~64 steps), which
+    /// changes as the tween advances — forcing the moving positions to re-upload each frame — and
+    /// collapses back to `0` the moment the last node lands. status: code-graph-bundling
+    fn reveal_anim_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        // Fast path: fully settled → no perturbation (the historical cache behaviour).
+        if self.reveal_t.iter().all(|&t| t >= 1.0) {
+            return 0;
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for (i, &t) in self.reveal_t.iter().enumerate() {
+            // Quantize to ~64 buckets so the key advances with the tween yet is stable within a
+            // bucket (and a settled `1.0` hashes identically across nodes — only mid-flight nodes
+            // perturb it). Index folded in so two nodes at the same progress still distinguish.
+            ((t.clamp(0.0, 1.0) * 64.0) as u32).hash(&mut h);
+            if t < 1.0 {
+                i.hash(&mut h);
+            }
+        }
+        h.finish()
     }
 
     /// Whether the GPU instanced paint path should run this frame: the process
@@ -767,7 +891,13 @@ impl State {
                 self.edge_routes = result.edge_routes;
             }
             LayoutKind::ForceDirected => {
-                let edges = source.edges();
+                // The FORCE layout uses `layout_edges` (draw edges PLUS any
+                // non-drawn springs the source adds, e.g. the code graph's
+                // containment springs that co-locate members with their
+                // container). The DRAW path stays on `edges`. The layered (dagre)
+                // arm above keeps `edges` — it's hierarchical, containment springs
+                // don't apply. status: code-graph-containment-layout
+                let edges = source.layout_edges();
                 // Warm + anchored only when the *previous* layout was also
                 // force-directed AND we have captured history to map onto — so a
                 // kind switch or the very first build starts fresh, but a
@@ -864,6 +994,23 @@ impl State {
         // data change (→ warm + anchored) from a kind switch (→ fresh). Keep
         // `prev_positions` intact for the warm path.
         self.last_layout_kind = Some(self.layout_kind);
+        // A relayout supplies settled positions, so the un-bundling animation must NOT fire for the
+        // whole graph: reset every node to "settled" (`1.0`) and resize to the new node count. The
+        // next genuine bundle-dissolve (a zoom-in past a member's reveal threshold) restarts the
+        // affected members at `0.0`. status: code-graph-bundling
+        self.reset_reveal_anim();
+    }
+
+    /// Resize the un-bundling animation state to the current `positions` length and mark every node
+    /// settled (`reveal_t = 1.0`, no `prev_bundle_visible` history) — so a relayout never animates the
+    /// whole graph and a per-frame length sync stays cheap. status: code-graph-bundling
+    fn reset_reveal_anim(&mut self) {
+        let n = self.positions.len();
+        self.reveal_t.clear();
+        self.reveal_t.resize(n, 1.0);
+        self.prev_bundle_visible.clear();
+        self.prev_bundle_rep.clear();
+        self.reveal_origin.clear();
     }
 
     /// Snapshot the current force graph's wiring into `prev_adjacency`, keyed by
@@ -874,7 +1021,10 @@ impl State {
     /// `clear` keeps the map from accumulating keys of long-gone nodes.
     fn capture_adjacency(&mut self, source: &dyn Source, n: usize) {
         self.prev_adjacency.clear();
-        let edges = source.edges();
+        // The FORCE layout's wiring snapshot must reflect the SAME edge set the
+        // layout uses (`layout_edges`, incl. containment springs) so a containment
+        // change re-lays-out via `change_fraction`. status: code-graph-containment-layout
+        let edges = source.layout_edges();
         // Gather neighbour keys per index first, then key the whole thing by the
         // node's own key.
         let mut nbr_keys: Vec<Vec<String>> = vec![Vec::new(); n];
@@ -899,6 +1049,73 @@ impl State {
         }
     }
 
+    /// Pull one frame of the background force-layout worker into `positions`:
+    /// while the worker is still iterating toward convergence, snapshot its
+    /// latest positions, invalidate the GPU paint cache (positions moved), and
+    /// request a repaint so the next frame advances the layout. A no-op once the
+    /// worker has settled (or there is none).
+    ///
+    /// [`ui`](Self::ui) calls this internally, so a graph rendered through the
+    /// interactive pane settles automatically. A host that renders a [`State`]
+    /// only as a read-only [`Minimap`](minimap::Minimap) (never through `ui()`)
+    /// must call `pump_layout` itself each frame, or the force layout sits at its
+    /// scatter seed forever. status: spec-minimap-swap
+    pub fn pump_layout(&mut self, ctx: &egui::Context) {
+        let Some(w) = self.worker.as_ref() else { return };
+        if w.is_running() {
+            w.snapshot_into(&mut self.positions);
+            // Positions moved this frame: invalidate the GPU paint cache so the
+            // affine fast-path rebuilds against the fresh layout while settling.
+            self.layout_epoch = self.layout_epoch.wrapping_add(1);
+            ctx.request_repaint();
+        } else {
+            // The worker just finished. Take its FINAL snapshot and re-bake once: the cached
+            // GPU batch may have last rebuilt on a mid-settle frame (the worker writes positions
+            // incrementally), leaving stale/torn edge geometry until something forces a rebuild —
+            // the "lines go crazy until I pan/zoom" symptom. Capture the settled layout, bump the
+            // epoch so the batch rebuilds against it, and drop the worker so this runs once.
+            w.snapshot_into(&mut self.positions);
+            self.layout_epoch = self.layout_epoch.wrapping_add(1);
+            self.worker = None;
+            ctx.request_repaint();
+        }
+    }
+
+    /// The world-space rect currently visible in `pane_rect` under the affine
+    /// view — the minimap's viewport indicator (`viewport_world`). Affine regimes
+    /// only (the default for the code graph); meaningless under Poincaré.
+    #[must_use]
+    pub fn world_viewport(&self, pane_rect: egui::Rect) -> egui::Rect {
+        let a = self.view.screen_to_affine(pane_rect, pane_rect.min);
+        let b = self.view.screen_to_affine(pane_rect, pane_rect.max);
+        egui::Rect::from_two_pos(a.to_pos2(), b.to_pos2())
+    }
+
+    /// The screen-space centre of the drawn LABEL nearest `screen` (from last frame's placed
+    /// `label_hits`), if any labels are placed — a test/harness affordance to hover a node by its
+    /// label (which always resolves to that node through the label hit-test), since hovering a bare
+    /// node centre can miss when the densest node is culled into a bundle.
+    #[must_use]
+    pub fn nearest_label_center(&self, screen: egui::Pos2) -> Option<egui::Pos2> {
+        self.label_hits
+            .iter()
+            .map(|(rect, _)| rect.center())
+            .min_by(|a, b| {
+                (*a - screen)
+                    .length_sq()
+                    .partial_cmp(&(*b - screen).length_sq())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    }
+
+    /// Recentre the affine view on world point `w`, keeping the current zoom — the
+    /// minimap-click navigate target (`screen(w)` lands at the pane centre when
+    /// `pan = -w`). Cancels the pending auto-fit so the recentre sticks.
+    pub fn center_on(&mut self, w: egui::Vec2) {
+        self.view.pan = -w;
+        self.needs_fit = false;
+    }
+
     /// Allocate the canvas, run pan/zoom input, and draw the graph from
     /// `source`: background, edges, nodes + labels, hover ring, tooltip, and
     /// (when enabled) the hover-preview card. Returns the path of a clicked
@@ -914,25 +1131,23 @@ impl State {
         let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
         let painter = ui.painter_at(rect);
 
-        // Pull fresh positions while the force worker is still settling.
-        let worker_running = self.worker.as_ref().is_some_and(LayoutWorker::is_running);
-        if worker_running
-            && let Some(w) = self.worker.as_ref()
-        {
-            w.snapshot_into(&mut self.positions);
-            // Positions moved this frame: invalidate the GPU paint cache so the
-            // affine fast-path rebuilds against the fresh layout while settling.
-            self.layout_epoch = self.layout_epoch.wrapping_add(1);
-            ui.ctx().request_repaint();
-        }
+        // Pull fresh positions while the force worker is still settling — the one
+        // implementation, shared with the standalone-minimap host's `pump_layout`.
+        self.pump_layout(ui.ctx());
 
         // Capture the live positions keyed by stable identity so the next
-        // same-kind force rebuild can warm-seed + anchor from them. Done every
-        // frame (cheap at our graph sizes) so the latest layout is always
-        // available; a no-op when the source supplies no `node_key`s.
-        for i in 0..self.positions.len() {
-            if let Some(k) = source.node_key(i) {
-                self.prev_positions.insert(k, self.positions[i]);
+        // same-kind force rebuild can warm-seed + anchor from them — but ONLY
+        // while the worker is still settling. Once it stops, positions are static
+        // so the last capture stands; re-cloning every node's key into the map
+        // each idle/interaction frame is pure waste that scales with the node
+        // count (a real cost now the code graph lays out the whole entity
+        // universe, not a collapsed subset). A no-op when the source supplies no
+        // `node_key`s.
+        if self.worker.as_ref().is_some_and(LayoutWorker::is_running) {
+            for i in 0..self.positions.len() {
+                if let Some(k) = source.node_key(i) {
+                    self.prev_positions.insert(k, self.positions[i]);
+                }
             }
         }
 
@@ -952,9 +1167,11 @@ impl State {
 
         let nodes = source.nodes(&self.positions, &self.style);
         let inputs = PaneInputs { source, nodes: &nodes, draw_preview: &draw_preview };
-        // Cleared each frame; `paint_pane` sets them when a node is right-clicked.
+        // Cleared each frame; `paint_pane` sets them when a node is right-clicked / the pane is
+        // clicked on empty space.
         self.secondary_click = None;
         self.secondary_click_node = None;
+        self.background_click = false;
 
         // A single interactive pane. The corner overview is now a first-class,
         // standalone [`minimap::Minimap`] the host composes over this pane (so it
@@ -1206,6 +1423,9 @@ struct NodeDraw {
     clicked: Option<String>,
     hover_anchor: Option<egui::Pos2>,
     tooltip: Option<(egui::Pos2, String)>,
+    /// Screen rect → node index for each drawn label, so the pane can hit-test labels like nodes
+    /// (a label hover/click resolves to its node). Recorded in priority order. status: graph-label-hit
+    label_hits: Vec<(egui::Rect, usize)>,
 }
 
 /// Nearest node within its (scaled) radius of the cursor, if any.
@@ -1222,12 +1442,28 @@ fn hit_test(
     hover: egui::Pos2,
     node_scale: f32,
     zoom: f32,
+    bundles: &edges::BundleState,
+    eff_pos: &[egui::Vec2],
 ) -> Option<usize> {
     let mut best = f32::INFINITY;
     let mut hit = None;
     for d in nodes {
-        let p = to_screen(d.world_pos);
-        let r = d.radius * node_scale * zoom.max(0.4) * lens.magnification(d.world_pos);
+        // A culled (bundled) node isn't drawn, so it can't be hovered — its bundle is. status: code-graph-bundling
+        if !bundles.is_visible(d.index) {
+            continue;
+        }
+        // Hit-test against the EFFECTIVE (animating) position so a hover lands where the node is
+        // DRAWN mid-fly-out, not at its settled spot. Equal to `world_pos` when nothing animates.
+        // status: code-graph-bundling
+        let wpos = eff_pos.get(d.index).copied().unwrap_or(d.world_pos);
+        let p = to_screen(wpos);
+        // Match the draw's radius, INCLUDING the live bundle inflation, so a hovered bundle square is
+        // hoverable across its drawn extent (not just its small un-inflated circle). status: code-graph-bundling
+        let r = d.radius
+            * node_scale
+            * zoom.max(0.4)
+            * lens.magnification(wpos)
+            * bundles.radius_mult(d.index);
         let d2 = (p - hover).length_sq();
         if d2 <= (r + 4.0).powi(2) && d2 < best {
             best = d2;
@@ -1235,6 +1471,13 @@ fn hit_test(
         }
     }
     hit
+}
+
+/// Hit-test the previous frame's drawn LABEL rects: a hover/click over a label resolves to its node
+/// (the user treats a label as part of its node). Priority-ordered, so the first containing rect —
+/// the most prominent label at that spot — wins. status: graph-label-hit
+fn label_hit(hover: egui::Pos2, label_hits: &[(egui::Rect, usize)]) -> Option<usize> {
+    label_hits.iter().find(|(rect, _)| rect.contains(hover)).map(|&(_, idx)| idx)
 }
 
 /// White-background name tooltip (cluster graph). Mirrors the box the

@@ -11,7 +11,7 @@ use hiker_theme as theme;
 use super::gpu::{FlowParams, GpuBatch, GpuCacheKey, GraphPaintCallback, ViewXform};
 use super::source::Source;
 use super::{
-    draw_tooltip, hit_test, poincare_disk, EdgeMap, FocusMode, HoverFlow, Lens, NodeDraw,
+    draw_tooltip, hit_test, label_hit, poincare_disk, EdgeMap, FocusMode, HoverFlow, Lens, NodeDraw,
     NodePaint, PaneInputs, State, ZOOM_MAX, ZOOM_MIN,
 };
 
@@ -83,6 +83,7 @@ impl State {
         lens_active: bool,
         slot: usize,
         source: &dyn Source,
+        bundle_fp: u64,
     ) -> Option<(GpuBatch, egui::layers::ShapeIdx, ViewXform)> {
         if lens_active {
             // Fisheye: positions are final screen-points (lens-warped), rebuilt
@@ -90,7 +91,10 @@ impl State {
             let xform = ViewXform::screen(self.style.edge_width, self.flow_params());
             self.gpu_batch_start(clipped).map(|(b, i)| (b, i, xform))
         } else {
-            let content = self.gpu_content_key(source);
+            // Fold the bundling visible-set fingerprint into the content key so a zoom that crosses a
+            // bundle threshold rebuilds the cached fills (a pure pan at fixed zoom still hits).
+            // status: code-graph-bundling
+            let content = self.gpu_content_key(source) ^ bundle_fp;
             self.gpu_affine_batch_start(clipped, pane_rect, view, slot, content)
         }
     }
@@ -207,21 +211,32 @@ impl State {
                 self.positions.iter().map(|&p| lens.world_to_lensed(p)).collect();
             let mut view = View::default();
             // Generous bounds so small/large graphs both frame well in any slot.
-            view.fit_to_positions(&lensed, pane_rect, (0.001, 50.0));
+            // Capture THIS local view's ideal fit into a local (NOT `self.last_fit_zoom`, which the
+            // interactive pane owns) so the read-only pane's LOD gate is fit-relative too.
+            let fit_zoom = view.fit_to_positions(&lensed, pane_rect, (0.001, 50.0)).max(1e-6);
             let affine = view.screen_mapper(pane_rect);
             let to_screen = |w: egui::Vec2| affine(lens.world_to_lensed(w));
             let disk_to_screen = |z: Complex| affine(lens.disk_to_world(z));
+            // Fit-relative LOD zoom: `1.0` at the fitted overview regardless of world extent (drives
+            // the LABEL gate). Spatial node bundling is disabled on the read-only overview pane (pass
+            // a `0.0` screen scale → identity), so the corner overview shows every node.
+            let lod_zoom = view.zoom / fit_zoom;
+            let bundles = self.compute_bundles(nodes, &lens, 0.0);
             let started =
-                self.gpu_start_affine_regime(clipped, pane_rect, view, lens.active(), slot, source);
+                self.gpu_start_affine_regime(clipped, pane_rect, view, lens.active(), slot, source, bundles.fingerprint());
             let (mut batch, xform) = Self::split_started(started, self.style.edge_width);
+            // Read-only pane: no animation, so pass an empty `eff_pos` — every node maps to its own
+            // settled `world_pos` (byte-identical to before). status: code-graph-bundling
             if self.toggles.show_edges {
-                self.draw_edges(clipped, source, &EdgeMap { to_screen: &to_screen, disk_to_screen: &disk_to_screen }, &lens, batch.as_mut().map(|(b, _)| b));
+                self.draw_edges(clipped, source, &EdgeMap { to_screen: &to_screen, disk_to_screen: &disk_to_screen }, &lens, &bundles, &[], batch.as_mut().map(|(b, _)| b));
             }
             self.draw_nodes(
                 clipped,
                 nodes,
                 &to_screen,
-                &NodePaint { lens: &lens, zoom: view.zoom, label_zoom: view.zoom, hovered: None, response_clicked: false, label_dim: None },
+                &NodePaint { lens: &lens, zoom: view.zoom, label_zoom: lod_zoom, hovered: None, response_clicked: false, label_dim: None },
+                &bundles,
+                &[],
                 batch.as_mut().map(|(b, _)| b),
             );
             self.gpu_batch_emit(clipped, pane_rect, slot, batch, xform);
@@ -237,6 +252,9 @@ impl State {
                 && ui.input(|i| i.smooth_scroll_delta.y != 0.0 || i.zoom_delta() != 1.0);
             if zoom_gesture || response.dragged() {
                 self.needs_fit = false;
+                // A manual pan/zoom cancels an in-flight glide-to-selection so the
+                // user's gesture isn't fought (mirrors `flyto` cancel-on-drag).
+                self.glide = None;
             }
         }
 
@@ -244,13 +262,17 @@ impl State {
         // re-fits the view; the focus-mode warp pans within that frame.
         let lens = Lens::centred(cfg, self.nav, &self.positions);
         if self.needs_fit && !self.positions.is_empty() {
-            if lens.active() {
+            // Record the UNCLAMPED ideal fit as the LOD baseline (the true fitted-overview scale,
+            // even when `view.zoom` floors at `ZOOM_MIN` for a wide-extent graph). The gate below
+            // divides `view.zoom` by this, so its thresholds read in "multiples of the overview".
+            let ideal = if lens.active() {
                 let lensed: Vec<egui::Vec2> =
                     self.positions.iter().map(|&p| lens.world_to_lensed(p)).collect();
-                self.view.fit_to_positions(&lensed, pane_rect, (ZOOM_MIN, ZOOM_MAX));
+                self.view.fit_to_positions(&lensed, pane_rect, (ZOOM_MIN, ZOOM_MAX))
             } else {
-                self.view.fit_to_positions(&self.positions, pane_rect, (ZOOM_MIN, ZOOM_MAX));
-            }
+                self.view.fit_to_positions(&self.positions, pane_rect, (ZOOM_MIN, ZOOM_MAX))
+            };
+            self.last_fit_zoom = ideal.max(1e-6);
             let worker_running = self.worker.as_ref().is_some_and(LayoutWorker::is_running);
             if !worker_running {
                 self.needs_fit = false;
@@ -266,6 +288,25 @@ impl State {
                 true,
             );
         }
+        // Glide-to-selection: when the host's `selected_node` changes to a new
+        // in-range node and we're NOT mid-(re)fit (a fresh build / scope-drill
+        // owns the framing then, and a glide would fight its fit), smoothly pan
+        // that node to the pane centre. Tracked against `prev_selected` so it
+        // fires exactly on the change frame. Advanced here (before `screen_mapper`)
+        // so the eased pan applies to THIS frame's draw. status: code-graph
+        if self.selected_node != self.prev_selected {
+            if let Some(i) = self.selected_node {
+                if i < self.positions.len() && !self.needs_fit {
+                    self.glide_to(self.positions[i]);
+                }
+            }
+            self.prev_selected = self.selected_node;
+        }
+        let glide_dt = ui.ctx().input(|i| i.stable_dt).min(0.1);
+        if self.advance_glide(glide_dt) {
+            ui.ctx().request_repaint();
+        }
+
         // Resolve the focus per focus-mode (after input so Cursor reads the
         // freshly-zoomed view). Lens scale stays the centroid extent.
         let focus = self.interactive_focus(pane_rect, response);
@@ -275,10 +316,41 @@ impl State {
         let disk_to_screen = |z: Complex| affine(lens.disk_to_world(z));
         let zoom = self.view.zoom;
         let node_scale = self.style.node_scale;
+        // Fit-relative LOD zoom: the live zoom over the fitted-overview zoom (`1.0` = overview), so
+        // the LABEL gate reads in "multiples of the overview" and behaves the same across graphs of
+        // any world extent. status: code-graph-bundling
+        let lod_zoom = zoom / self.last_fit_zoom;
+        // This frame's SPATIAL bundling, keyed on the REAL world→screen pixel scale (`view.zoom`, no
+        // lens factor) so nodes within ~MERGE_PX on screen collapse to one cluster rep. Disabled under
+        // an active lens (Fisheye warps screen positions, so the world-fixed grid wouldn't match
+        // on-screen proximity): pass a `0.0` screen scale → identity (every node shown). Used for the
+        // hit-test cull, edge rollup, and the node draw cull. status: code-graph-bundling
+        let screen_scale = if self.bundling && !lens.active() { zoom } else { 0.0 };
+        let bundles = self.compute_bundles(nodes, &lens, screen_scale);
 
-        let hovered = response
-            .and_then(egui::Response::hover_pos)
-            .and_then(|hp| hit_test(nodes, &to_screen, &lens, hp, node_scale, zoom));
+        // Un-bundling reveal: advance the per-node fly-out tween for this interactive frame (a member
+        // that just emerged from its dissolving bundle restarts at the bundle centre and eases out to
+        // its own spot). Only this pane drives it; the read-only / Poincaré paths render settled.
+        // status: code-graph-bundling
+        let dt = ui.ctx().input(|i| i.stable_dt).min(0.1);
+        let animating = self.advance_reveal(&bundles, dt);
+        if animating {
+            // Keep stepping the tween until every node settles.
+            ui.ctx().request_repaint();
+        }
+        // The effective draw position per node this frame (== `self.positions` byte-for-byte when
+        // nothing is animating), shared by nodes / labels / edges / hit-test so they all track the
+        // fly-out. status: code-graph-bundling
+        let eff_pos = self.effective_positions(nodes);
+
+        let hovered = response.and_then(egui::Response::hover_pos).and_then(|hp| {
+            // Labels are painted ON TOP of nodes, so hit-testing must match that z-order: a label
+            // (last frame's rect) wins over any node occluded behind it — otherwise hovering a
+            // label tries to grab the small nodes the label text covers. Hovering a label counts
+            // as hovering its own node. status: graph-label-hit
+            label_hit(hp, &self.label_hits)
+                .or_else(|| hit_test(nodes, &to_screen, &lens, hp, node_scale, zoom, &bundles, &eff_pos))
+        });
 
         // A click in Selection focus sets the focus node (the lens recentres on
         // it). Fly-to is Poincaré-only, so there's nothing else to do here.
@@ -298,12 +370,30 @@ impl State {
                 nodes.iter().find(|d| d.index == idx).and_then(|d| d.click_path.clone());
             self.secondary_click_node = Some(idx);
         }
+        // Primary click on empty space (no node hit) → the host's deselect cue.
+        if response.is_some_and(egui::Response::clicked) && hovered.is_none() {
+            self.background_click = true;
+        }
 
-        let started =
-            self.gpu_start_affine_regime(clipped, pane_rect, self.view, lens.active(), slot, source);
+        // While the un-bundling animation runs, positions move every frame at a FIXED visible set, so
+        // the affine fill cache (keyed on layout-epoch + content) would otherwise serve frozen
+        // positions and the fly-out wouldn't render. Fold a coarse hash of the live `reveal_t` into
+        // the content key: it changes as the tween progresses (forcing a rebuild + re-upload each
+        // frame) and returns to `0` once every node settles, so the cache resumes hitting.
+        // status: code-graph-bundling
+        let anim_key = self.reveal_anim_key();
+        let started = self.gpu_start_affine_regime(
+            clipped,
+            pane_rect,
+            self.view,
+            lens.active(),
+            slot,
+            source,
+            bundles.fingerprint() ^ anim_key,
+        );
         let (mut batch, xform) = Self::split_started(started, self.style.edge_width);
         if self.toggles.show_edges {
-            self.draw_edges(clipped, source, &EdgeMap { to_screen: &to_screen, disk_to_screen: &disk_to_screen }, &lens, batch.as_mut().map(|(b, _)| b));
+            self.draw_edges(clipped, source, &EdgeMap { to_screen: &to_screen, disk_to_screen: &disk_to_screen }, &lens, &bundles, &eff_pos, batch.as_mut().map(|(b, _)| b));
         }
         // Reserve the highlight overlay's slot AFTER the base edges (and the GPU
         // callback's slot) but BEFORE the nodes/labels paint: the glow renders
@@ -326,15 +416,18 @@ impl State {
         // status: graph-label-dim
         let label_dim = self.label_dim_factors(source);
         let clicked_this_frame = response.is_some_and(egui::Response::clicked);
-        let draw = self.draw_nodes(
+        let mut draw = self.draw_nodes(
             clipped,
             nodes,
             &to_screen,
-            &NodePaint { lens: &lens, zoom, label_zoom: zoom, hovered, response_clicked: clicked_this_frame, label_dim: label_dim.as_deref() },
+            &NodePaint { lens: &lens, zoom, label_zoom: lod_zoom, hovered, response_clicked: clicked_this_frame, label_dim: label_dim.as_deref() },
+            &bundles,
+            &eff_pos,
             batch.as_mut().map(|(b, _)| b),
         );
         self.gpu_batch_emit(clipped, pane_rect, slot, batch, xform);
         self.finish_pane(clipped, source, pane_rect, &draw, hovered, draw_preview);
+        self.label_hits = std::mem::take(&mut draw.label_hits);
         draw.clicked
     }
 
@@ -367,9 +460,12 @@ impl State {
             // A centred overview with an identity nav.
             let lens = Lens::centred(cfg, Mobius::identity(), &self.positions);
             let to_screen = |w: egui::Vec2| disk_to_screen(lens.disk(w));
+            // Spatial bundling is affine-only; the disk shows every node (0.0 → identity).
+            let bundles = self.compute_bundles(nodes, &lens, 0.0);
             let mut batch = self.gpu_batch_start(clipped);
+            // Poincaré renders settled positions (no un-bundling animation): empty `eff_pos`.
             if self.toggles.show_edges {
-                self.draw_edges(clipped, source, &EdgeMap { to_screen: &to_screen, disk_to_screen: &disk_to_screen }, &lens, batch.as_mut().map(|(b, _)| b));
+                self.draw_edges(clipped, source, &EdgeMap { to_screen: &to_screen, disk_to_screen: &disk_to_screen }, &lens, &bundles, &[], batch.as_mut().map(|(b, _)| b));
             }
             if self.show_boundary {
                 self.stroke_disk_boundary(clipped, disk_center, disk_radius);
@@ -379,6 +475,8 @@ impl State {
                 nodes,
                 &to_screen,
                 &NodePaint { lens: &lens, zoom: 1.0, label_zoom: 1.0, hovered: None, response_clicked: false, label_dim: None },
+                &bundles,
+                &[],
                 batch.as_mut().map(|(b, _)| b),
             );
             self.gpu_batch_emit(clipped, pane_rect, slot, batch, ViewXform::screen(self.style.edge_width, self.flow_params()));
@@ -425,10 +523,16 @@ impl State {
         let lens = Lens::new(cfg, self.nav, focus, &self.positions);
         let to_screen = |w: egui::Vec2| disk_to_screen(lens.disk(w));
         let node_scale = self.style.node_scale;
+        // Spatial bundling is affine-only — the Poincaré disk warps positions, so it shows every node
+        // (0.0 → identity); only the label-LOD gate below uses `poincare_zoom`. status: code-graph-bundling
+        let bundles = self.compute_bundles(nodes, &lens, 0.0);
 
-        let hovered = response
-            .and_then(egui::Response::hover_pos)
-            .and_then(|hp| hit_test(nodes, &to_screen, &lens, hp, node_scale, 1.0));
+        let hovered = response.and_then(egui::Response::hover_pos).and_then(|hp| {
+            // Labels paint on top of nodes — hit-test them first so a label wins over an occluded
+            // node behind it; hovering a label counts as hovering its node. status: graph-label-hit
+            label_hit(hp, &self.label_hits)
+                .or_else(|| hit_test(nodes, &to_screen, &lens, hp, node_scale, 1.0, &bundles, &[]))
+        });
 
         // Node click: Selection focus recentres the lens on the clicked node;
         // otherwise fly-to glides it to the fixed disk centre (when enabled).
@@ -452,10 +556,14 @@ impl State {
                 nodes.iter().find(|d| d.index == idx).and_then(|d| d.click_path.clone());
             self.secondary_click_node = Some(idx);
         }
+        // Primary click on empty space (no node hit) → the host's deselect cue.
+        if response.is_some_and(egui::Response::clicked) && hovered.is_none() {
+            self.background_click = true;
+        }
 
         let mut batch = self.gpu_batch_start(clipped);
         if self.toggles.show_edges {
-            self.draw_edges(clipped, source, &EdgeMap { to_screen: &to_screen, disk_to_screen: &disk_to_screen }, &lens, batch.as_mut().map(|(b, _)| b));
+            self.draw_edges(clipped, source, &EdgeMap { to_screen: &to_screen, disk_to_screen: &disk_to_screen }, &lens, &bundles, &[], batch.as_mut().map(|(b, _)| b));
         }
         // Above the base edges, below nodes/labels — see the affine regime.
         // status: graph-hover-highlight
@@ -477,15 +585,18 @@ impl State {
         // status: graph-label-dim
         let label_dim = self.label_dim_factors(source);
         let clicked_this_frame = response.is_some_and(egui::Response::clicked);
-        let draw = self.draw_nodes(
+        let mut draw = self.draw_nodes(
             clipped,
             nodes,
             &to_screen,
             &NodePaint { lens: &lens, zoom: 1.0, label_zoom: self.poincare_zoom, hovered, response_clicked: clicked_this_frame, label_dim: label_dim.as_deref() },
+            &bundles,
+            &[],
             batch.as_mut().map(|(b, _)| b),
         );
         self.gpu_batch_emit(clipped, pane_rect, slot, batch, ViewXform::screen(self.style.edge_width, self.flow_params()));
         self.finish_pane(clipped, source, pane_rect, &draw, hovered, draw_preview);
+        self.label_hits = std::mem::take(&mut draw.label_hits);
         draw.clicked
     }
 

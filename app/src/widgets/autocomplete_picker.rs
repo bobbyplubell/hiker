@@ -92,6 +92,7 @@ pub fn show(
     ui: &mut egui::Ui,
     state: &mut PickerState,
     source: &dyn CandidateSource,
+    title: &str,
 ) -> PickerOutcome {
     if !state.open {
         return PickerOutcome::Open;
@@ -104,7 +105,7 @@ pub fn show(
     let mut items = items;
     let mut outcome = Outcome::None;
     let mut open = true;
-    egui::Window::new("Insert from vault")
+    egui::Window::new(title)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 80.0))

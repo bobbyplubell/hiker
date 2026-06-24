@@ -106,13 +106,22 @@ status:: done
 touches:: [[code:hiker/panels/buffer]]
 note:: silent reload via `read_file_with_hash` when fresh hash differs · evidence: `app/src/panels/buffer/mod.rs` (watcher file events handling, modified+clean branch)
 
-**Deferred (not built)** — `bug-watcher-editor-conflict-matrix-unbuilt`. The fuller editor-conflict matrix was specced but none of it is wired:
+The fuller editor-conflict matrix is now wired:
 
-- modified + dirty → conflict modal (Keep mine / Take theirs / Cancel)
-- deleted + clean → close the buffer + "file removed externally" toast
-- deleted + dirty → keep the buffer + "file removed; save to recreate" toast
-- renamed → silent path follow-up (buffer follows the new path)
-- an `Overflow` "watcher fell behind, scanning" toast
+- **Modified + dirty → conflict modal.** A proactive Keep / Take / Cancel modal; Keep and Cancel leave the buffer alone (the next save re-prompts via [[spec:pre-write-drift-check]]); a re-entry guard prevents stacked modals. [watcher-editor-conflict-dirty]
+status:: done
+touches:: [[code:hiker/panels/buffer]]
+note:: evidence: `app/src/panels/buffer/mod.rs` (watcher conflict handling)
+- **Deleted → toast.** A clean buffer closes with a "removed externally" toast; a dirty buffer is kept with a "save to recreate" toast. [watcher-editor-deleted-buffer]
+status:: done
+touches:: [[code:hiker/panels/buffer]]
+note:: evidence: `app/src/panels/buffer/mod.rs` (watcher file events handling, deleted branch)
+- **Renamed → silent path follow-up.** The buffer's path is updated silently to follow the new path; the tree row stays stale until a manual refresh / [[spec:tree-refresh-watcher]]. [watcher-editor-renamed-followup]
+status:: done
+touches:: [[code:hiker/panels/buffer]]
+note:: evidence: `app/src/panels/buffer/mod.rs` (watcher file events handling, renamed branch)
+
+**Still deferred (not built)** — `bug-watcher-editor-conflict-matrix-unbuilt`. An `Overflow` "watcher fell behind, scanning" toast.
 
 
 ## Indexer integration
@@ -155,21 +164,3 @@ note:: events whose path has a symlink ancestor under the canonical vault root a
 - Polling fallback for network filesystems
 - User-configurable ignore file
 - Cross-vault event routing (multi-vault support is a v3+ concern)
-
-## Registry imports (from status.md)
-
-Entries imported from the retired status registry that had no anchor in this doc —
-re-home them into the relevant sections as the doc evolves.
-
-- **watcher-editor-conflict-dirty** — proactive Keep/Take/Cancel modal; Keep+Cancel leave buffer alone (next save re-prompts via [[spec:pre-write-drift-check]]); re-entry guard prevents stacked modals [watcher-editor-conflict-dirty]
-  status:: done
-  touches:: [[code:hiker/panels/buffer]]
-  note:: evidence: `app/src/panels/buffer/mod.rs` (watcher conflict handling)
-- **watcher-editor-deleted-buffer** — clean → close buffer + "removed externally" toast; dirty → keep buffer + "save to recreate" toast [watcher-editor-deleted-buffer]
-  status:: done
-  touches:: [[code:hiker/panels/buffer]]
-  note:: evidence: `app/src/panels/buffer/mod.rs` (watcher file events handling, deleted branch)
-- **watcher-editor-renamed-followup** — silently updates the buffer path; tree row stays stale until manual refresh / [[spec:tree-refresh-watcher]] [watcher-editor-renamed-followup]
-  status:: done
-  touches:: [[code:hiker/panels/buffer]]
-  note:: evidence: `app/src/panels/buffer/mod.rs` (watcher file events handling, renamed branch)

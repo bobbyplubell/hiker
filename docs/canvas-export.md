@@ -12,7 +12,9 @@ Export only — canvas→trail / canvas→tree are out of scope (a canvas has no
 
 ## What gets built
 
-The builder is a pure function from a source structure to a `hiker_canvas::Canvas`; it reads the source, never mutates it, and emits canonical JSON the output file is seeded with. It is a **snapshot, not a synced projection** ([[spec:canvas-export-snapshot]]): the *structure* (which waypoints/clusters, order, nesting) is frozen at export time — later trail/tree edits never propagate and canvas edits never write back; only content stays live, because file nodes are *pointers* ([[spec:canvas-insert-from-vault]]). Re-exporting makes a new file. [canvas-export-builder]
+The builder is a pure function from a source structure to a `hiker_canvas::Canvas`; it reads the source, never mutates it, and emits canonical JSON the output file is seeded with. It is a **snapshot, not a synced projection**: the *structure* (which waypoints/clusters, order, nesting) is frozen at export time — later trail/tree edits never propagate and canvas edits never write back; only content stays live, because file nodes are *pointers* ([[spec:canvas-insert-from-vault]]). Re-exporting makes a new file; there is no back-sync to the source trail/tree. [canvas-export-snapshot]
+status:: planned
+touches:: [[code:hiker/canvas/export]]
 
 ### Trail → canvas
 
@@ -99,12 +101,3 @@ note:: deferred: right-click a single cluster → export just that subtree, same
 - **MCP export verb.** A headless `canvas_export(source)` tool so an agent can snapshot a trail/tree it assembled, riding the deferred [[spec:canvas-mcp-tools]] surface. [canvas-export-mcp]
 status:: planned
 note:: deferred: headless `canvas_export(source)` MCP tool, riding the [[spec:canvas-mcp-tools]] surface
-
-## Registry imports (from status.md)
-
-Entries imported from the retired status registry that had no anchor in this doc —
-re-home them into the relevant sections as the doc evolves.
-
-- **canvas-export-snapshot** — one-way snapshot semantics: fresh `.canvas` doc, frozen structure, live file-pointer content; re-export makes a new file; no back-sync to the source trail/tree [canvas-export-snapshot]
-  status:: planned
-  touches:: [[code:hiker/canvas/export]]

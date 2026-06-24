@@ -164,8 +164,9 @@ own typed code links inline — [[spec:tracker-relation-links]]).
 - **MCP** — the vault exposed as an MCP server for external agents. Spec: [mcp.md](mcp.md).
   [sys-mcp]
 - **Code intelligence** — reading and reasoning about external code repos alongside notes: the
-  spec engine, SCIP adapters, and the code graph view. Specs: [code.md](code.md),
-  [projects.md](projects.md). [sys-code-intel]
+  spec engine, SCIP adapters, the code graph view, and the spec graph (specs + the code they
+  govern as a node-link surface). Specs: [code.md](code.md), [projects.md](projects.md),
+  [spec-graph.md](spec-graph.md). [sys-code-intel]
   touches:: [[code:hiker/panels/code_graph]]
 
 ### PM

@@ -52,6 +52,8 @@ pub(crate) mod bootstrap;
 pub(crate) mod canvas_activity;
 #[path = "src/projects_activity/mod.rs"]
 pub(crate) mod projects_activity;
+#[path = "src/spec_panel.rs"]
+pub(crate) mod spec_panel;
 #[path = "src/code_sources.rs"]
 pub(crate) mod code_sources;
 #[path = "src/charts.rs"]

@@ -5,7 +5,9 @@ Vault-wide retrieval over note content. Lexical (full-text) and semantic (embedd
 
 ## Discovery panel
 
-The right-hand panel is one column with a fixed input row at the top and a stack of collapsible sections below. v2 ships with two sections; the shape is built so adding more is mechanical.
+The right-hand panel is one column with a fixed input row at the top and a stack of collapsible sections below. v2 ships with two sections; the shape is built so adding more is mechanical. The right panel is renamed to Discovery, with the input plus collapsible search/related sections; [[spec:panel-toggle-buttons]] (existing) still flips the panel as a whole. [search-discovery-panel]
+status:: done
+note:: `app/src/panels/search.rs` (`show()`) + `app/src/panels/related.rs` — right panel renamed to Discovery with input + collapsible search/related sections; [[spec:panel-toggle-buttons]] (existing) still flips the panel as a whole
 
 ```
 ┌─ Discovery ─────────────────────┐
@@ -37,7 +39,12 @@ note:: `app/src/panels/search.rs` (section visibility) — non-empty query revea
 - **Non-empty query** — both sections visible, both expanded by default. Chevron collapses either; state persists per-vault via [[spec:settings-write-back]] ([[spec:settings-section-vault]]). [search-section-collapsible]
 status:: superseded
 note:: superseded by [[spec:feature-panel-single-accordion]]: Search/Related/Backlinks render directly under the workbench accordion header with no inner collapsible. The `search.sections.*_expanded` settings are inert
-- **Section headers carry live counts.** "Search results (8)" updates as type-ahead returns; "Related notes (5)" updates on active-file change. Subtle in-section spinner while a query is in flight. [search-section-counts, search-loading-shimmer]
+- **Section headers carry live counts.** "Search results (8)" updates as type-ahead returns; "Related notes (5)" updates on active-file change. [search-section-counts]
+status:: done
+note:: `app/src/panels/search.rs` + `app/src/panels/related.rs` — each section header shows its result count
+- **In-flight spinner.** A subtle in-section spinner shows while a debounced query is in flight. [search-loading-shimmer]
+status:: done
+note:: `app/src/panels/search.rs` — minimal "…" spinner shown while a debounced query is in flight; styling can be upgraded later
 - **Related stays bound to the active editor file** even when search is active. [search-related-stays-bound]
 status:: done
 note:: `app/src/panels/related.rs` — search wiring leaves the related-refresh path untouched; the related section still updates only on file-open and debounced-save
@@ -47,13 +54,20 @@ The toggle button on the editor toolbar still flips the panel open/closed (exist
 
 ## The search input + mode toggles
 
-Text input pinned at panel top. To its right, two icon-only toggle buttons matching the editor toolbar's treatment (sidebar wheel, discovery magnifying glass, view eye): [search-bar-input, search-mode-toggles]
-implements:: [[code:hiker/search/search_input_and_run]], [[code:hiker/search/input_row]], [[code:hiker/search/mode_toggles]]
+Text input pinned at panel top. [search-bar-input]
+status:: done
+note:: `app/src/panels/search.rs` (search input) — text input pinned at panel top
+implements:: [[code:hiker/search/search_input_and_run]], [[code:hiker/search/input_row]]
+
+To its right, two icon-only toggle buttons matching the editor toolbar's treatment (sidebar wheel, discovery magnifying glass, view eye):
 
 - **Semantic toggle** — brain glyph. Tooltip "Semantic search."
 - **Lexical toggle** — `Aa` glyph (typographic, signaling "match these letters"). Tooltip "Lexical search."
 
-Pressed states show which modes are active.
+Pressed states show which modes are active. [search-mode-toggles]
+status:: done
+note:: `app/src/panels/search.rs` (semantic/lexical toggles) — S/L pills next to the input; pressed state same as existing toolbar buttons
+implements:: [[code:hiker/search/mode_toggles]]
 
 Mode rules:
 
@@ -243,6 +257,10 @@ note:: `core/src/store.rs` (`ensure_schema`) — contentless `chunks_fts` + sync
 
 Writes ride alongside the existing chunk upsert in `core::store` — wherever an [[spec:ingest-tx-upsert]] transaction touches `chunks`, it also writes `chunks_fts` (same transaction, same atomicity). Deletes via [[spec:ingest-delete-cascade]] similarly extend to clear the FTS rows.
 
+The `Fts5LexicalEngine` in `core/src/search.rs` is the concrete `LexicalEngine` impl over this table. [search-fts5-lexical]
+status:: done
+note:: `core/src/search.rs` (`Fts5LexicalEngine`)
+
 Ranking and snippeting:
 
 - **BM25** is the default ranking — `ORDER BY bm25(chunks_fts)` returns the standard FTS5 score. [search-fts5-bm25-snippet]
@@ -323,14 +341,33 @@ The same `core::search::query` is what the MCP server's `search_notes` tool will
 
 Slugs registered as `planned` so future work plugs in cleanly:
 
-- **[[spec:search-folder-scope]]** — restrict search to a vault subtree. FTS5 side `MATCH ... AND path GLOB ?`; semantic side path-prefix filter on the joined notes row.
-- **[[spec:search-lifecycle-filters]]** — exclude/include archived, redacted, retired notes. Lands when the `design.md` lifecycle slugs (`hiker.archived` / `hiker.redacted` / `hiker.retired`) exist.
-- **[[spec:search-tag-scope]]** — filter by frontmatter tag. Lands with the auto-tag enrichment stage (`design.md` enrichment pipeline).
-- **[[spec:search-tantivy-swap]]** — implement `LexicalEngine` over tantivy as an alternate backend; a single config key picks between FTS5 and tantivy.
-- **[[spec:search-history]]** — recent queries dropdown under the input.
-- **[[spec:search-result-snippet-context]]** — expand a result row to show surrounding chunks (neighbors already addressable via [[spec:chunker-heading-path]] / chunk index; needs a UI affordance).
-- **[[spec:search-multi-vault]]** — `design.md`'s vault-level routing axis. Out of scope until multi-vault open is itself a feature.
-- **[[spec:search-result-pin-as-collection]]** — promote a result set to a saved collection (`design.md` collections); the search panel is the natural entry point.
+- **Quickfind by name/metadata** — a lightweight name/title/frontmatter lookup mode, a separate toggle from lexical/semantic; rides the wikilink picker's basename ranking + the structured index ([[spec:store-note-query]]), not the content path. [search-quickfind-names-metadata]
+status:: planned
+note:: lightweight name/title/frontmatter lookup mode, a separate toggle from lexical/semantic; rides the wikilink picker's basename ranking + the structured index ([[spec:store-note-query]]), not the content path
+- **Folder scope** — restrict search to a vault subtree. FTS5 side `MATCH ... AND path GLOB ?`; semantic side path-prefix filter on the joined notes row. [search-folder-scope]
+status:: planned
+note:: restrict to vault subtree; deferred
+- **Lifecycle filters** — exclude/include archived, redacted, retired notes. Lands when the `design.md` lifecycle slugs (`hiker.archived` / `hiker.redacted` / `hiker.retired`) exist. [search-lifecycle-filters]
+status:: planned
+note:: exclude/include archived/redacted/retired; waits on `design.md` lifecycle slugs
+- **Tag scope** — filter by frontmatter tag. Lands with the auto-tag enrichment stage (`design.md` enrichment pipeline). [search-tag-scope]
+status:: planned
+note:: filter by frontmatter tag; waits on auto-tag enrichment
+- **Tantivy swap** — implement `LexicalEngine` over tantivy as an alternate backend; a single config key picks between FTS5 and tantivy. [search-tantivy-swap]
+status:: planned
+note:: `LexicalEngine` impl over tantivy; triggered by ranking-quality complaints
+- **Search history** — recent queries dropdown under the input. [search-history]
+status:: planned
+note:: recent queries dropdown under input
+- **Result snippet context** — expand a result row to show surrounding chunks (neighbors already addressable via [[spec:chunker-heading-path]] / chunk index; needs a UI affordance). [search-result-snippet-context]
+status:: planned
+note:: expand row to show surrounding chunks
+- **Multi-vault** — `design.md`'s vault-level routing axis. Out of scope until multi-vault open is itself a feature. [search-multi-vault]
+status:: planned
+note:: vault-level routing axis from `design.md`; needs multi-vault open first
+- **Pin as collection** — promote a result set to a saved collection (`design.md` collections); the search panel is the natural entry point. [search-result-pin-as-collection]
+status:: planned
+note:: promote result set to a saved collection (`design.md` collections)
 - **[[spec:search-result-multi-select]]** — checkbox selection on result rows + a select-all in the section header. Backs the bulk-action slugs below. Selection state is per-query — clearing the input or running a new query drops it. [search-result-multi-select]
 status:: planned
 note:: checkbox selection on result rows + select-all in section header; per-query state
@@ -356,39 +393,3 @@ note:: include/exclude results by provenance (hand-written vs imported web/pdf/�
 - **Highlighting matches inside the open editor.** Different surface (editor view), different cognitive model. Possibly later — not a v2 concern.
 - **Query syntax** beyond what FTS5 natively understands. v2 passes input straight to FTS5's `MATCH` (already handles `"phrase queries"`, `term1 OR term2`, `NEAR()`); no hiker-specific DSL.
 - **Single-row context-menu mutations** (right-click a result → delete this note). The tree's context menu is the canonical place for per-note destructive actions. *Bulk* actions are explicitly *deferred*, not out of scope — see [[spec:search-bulk-action-tag]] / [[spec:search-bulk-action-move]].
-
-## Registry imports (from status.md)
-
-Entries imported from the retired status registry that had no anchor in this doc —
-re-home them into the relevant sections as the doc evolves.
-
-- **search-quickfind-names-metadata** — lightweight name/title/frontmatter lookup mode, a separate toggle from lexical/semantic; rides the wikilink picker's basename ranking + the structured index ([[spec:store-note-query]]), not the content path [search-quickfind-names-metadata]
-  status:: planned
-- **search-discovery-panel** — `app/src/panels/search.rs` (`show()`) + `app/src/panels/related.rs` — right panel renamed to Discovery with input + collapsible search/related sections; [[spec:panel-toggle-buttons]] (existing) still flips the panel as a whole [search-discovery-panel]
-  status:: done
-- **search-bar-input** — `app/src/panels/search.rs` (search input) [search-bar-input]
-  status:: done
-- **search-mode-toggles** — `app/src/panels/search.rs` (semantic/lexical toggles) — S/L pills next to the input; pressed state same as existing toolbar buttons [search-mode-toggles]
-  status:: done
-- **search-section-counts** — `app/src/panels/search.rs` + `app/src/panels/related.rs` — each section header shows its result count [search-section-counts]
-  status:: done
-- **search-loading-shimmer** — `app/src/panels/search.rs` (in-flight spinner) — minimal "…" spinner shown while a debounced query is in flight; styling can be upgraded later [search-loading-shimmer]
-  status:: done
-- **search-fts5-lexical** — `core/src/search.rs` (`Fts5LexicalEngine`) [search-fts5-lexical]
-  status:: done
-- **search-folder-scope** — restrict to vault subtree; deferred [search-folder-scope]
-  status:: planned
-- **search-lifecycle-filters** — exclude/include archived/redacted/retired; waits on `design.md` lifecycle slugs [search-lifecycle-filters]
-  status:: planned
-- **search-tag-scope** — filter by frontmatter tag; waits on auto-tag enrichment [search-tag-scope]
-  status:: planned
-- **search-tantivy-swap** — `LexicalEngine` impl over tantivy; triggered by ranking-quality complaints [search-tantivy-swap]
-  status:: planned
-- **search-history** — recent queries dropdown under input [search-history]
-  status:: planned
-- **search-result-snippet-context** — expand row to show surrounding chunks [search-result-snippet-context]
-  status:: planned
-- **search-multi-vault** — vault-level routing axis from `design.md`; needs multi-vault open first [search-multi-vault]
-  status:: planned
-- **search-result-pin-as-collection** — promote result set to a saved collection (`design.md` collections) [search-result-pin-as-collection]
-  status:: planned

@@ -2,7 +2,10 @@
 
 In-editor surface for reviewing an agent session's pending edits on the active buffer. Built on the layered document model (per `op-log.md`) and the `DiffLayer` primitive (per `diff.md`): the buffer renders the user's own text (`materialize(accepted + working)`); the agent's pending edits render on top as a read-only diff overlay; per-hunk accept folds a hunk into `working`, reject drops it from the pending set.
 
-The buffer's `current` is `materialize(accepted + working)` — the user's own text, edited directly, with cursor and edits in one coordinate space. The agent's `pending` edits are *not* in the buffer text; the review is a `DiffLayer { base: agent_base = materialize(accepted + working), current = materialize(accepted + working + pending(session)), owner: Agent }`, rendering pending hunks as a suggestion overlay — additions as phantom blocks, deletions struck through (per [[spec:op-log-layered-model]]). Same primitive that powers snapshot and history diff; no anchor tracker — both ropes are recomputed each frame and the diff *is* the state. [patch-review-buffer-state, patch-review-diff-layer]
+The buffer's `current` is `materialize(accepted + working)` — the user's own text, edited directly, with cursor and edits in one coordinate space. The agent's `pending` edits are *not* in the buffer text; the review is a `DiffLayer { base: agent_base = materialize(accepted + working), current = materialize(accepted + working + pending(session)), owner: Agent }`, rendering pending hunks as a suggestion overlay — additions as phantom blocks, deletions struck through (per [[spec:op-log-layered-model]]). Same primitive that powers snapshot and history diff; no anchor tracker — both ropes are recomputed each frame and the diff *is* the state. [patch-review-diff-layer]
+status:: done
+note:: `app/src/panels/buffer/diff_overlay.rs::compute` builds `DiffLayer { base: agent_base, current, owner: Agent }` and pushes decorations onto the editor's decoration stack. Same primitive powers diff toggle and snapshot/history viewer
+touches:: [[code:hiker/panels/buffer/diff_overlay]]
 
 
 ## Buffer state
@@ -18,7 +21,10 @@ pub struct Buffer {
 }
 ```
 
-`agent_base` is the `base` side of the inline `DiffLayer`; the `current` side is `materialize(accepted + working + pending(session))`, derived by splicing the active session's anchored ranges over `current`. `agent_base` clears when every pending hunk is resolved or when the buffer's active session changes. `loaded_content` retains its role as the save-path drift baseline — the editor's existing [[spec:pre-write-drift-check]] keys off it, not off `agent_base`.
+`agent_base` is the `base` side of the inline `DiffLayer`; the `current` side is `materialize(accepted + working + pending(session))`, derived by splicing the active session's anchored ranges over `current`. `agent_base` clears when every pending hunk is resolved or when the buffer's active session changes. `loaded_content` retains its role as the save-path drift baseline — the editor's existing [[spec:pre-write-drift-check]] keys off it, not off `agent_base`. [patch-review-buffer-state]
+status:: done
+note:: `app/src/panels/buffer/editor_binding.rs` runs `log.materialize_review(rel)` off `op_writes::review_materializations` → sets `buffer.agent_proposal = review` and `agent_base = accepted`; clears `agent_base` to `None` when the two are equal (no pending ops in scope). Re-runs each frame the buffer is shown and after every flip. The `Buffer` carries `active_session` to scope the overlay
+touches:: [[code:hiker/panels/buffer/editor_binding]]
 
 The buffer is a view; the durable state is the `.md` plus the un-accepted `.pending` edits. Pending edits persist in `.hiker/pending/<session>/<path>.pending` regardless of whether a tab is open; opening a tab materializes and renders, closing discards the buffer rope but leaves the pending set untouched, re-opening rehydrates fresh. [patch-review-buffer-is-view]
 status:: done
@@ -33,7 +39,8 @@ note:: user typing produces accepted ops; the diff `base` vs `current` excludes/
 
 When `agent_base.is_some()` and the active tab is the buffer:
 
-- The editor pushes a `DiffLayer { base: agent_base, current, owner: Agent }` onto the buffer's decoration stack. Pale-red line backgrounds for `base`-only lines, pale-green for `current`-only, intraline marks if the View toggle is on (per [[spec:diff-viewer-intraline]]).
+- The editor pushes a `DiffLayer { base: agent_base, current, owner: Agent }` onto the buffer's decoration stack. Pale-red line backgrounds for `base`-only lines, pale-green for `current`-only, intraline marks if the View toggle is on (per [[spec:diff-viewer-intraline]]). This is the umbrella for the inline rendering of pending edits; the implementation rides [[spec:patch-review-diff-layer]] rather than a custom decoration provider. [patch-review-decorations]
+status:: planned
 - The buffer remains fully editable. Typing lands as a `working` edit at byte offsets; the diff recomputes; pending hunks shift their `current_range` to track the user's typing as their anchored ranges remap through the user's `ChangeSet` via `map_pos`.
 - Each hunk's overlay widget carries `Accept ✓` and `Reject ✗` icon buttons. Same primitive snapshot diff uses (per [[spec:diff-layer-hunk-widgets]]).
 - Hunks contributed by edits sharing a `metadata.batch_id` (a single `edit_note` call's multiple replacements, say) are connected by a thin gutter marker. No coupled behavior — each is independently accept/rejectable. [patch-review-batch-grouping]
@@ -89,6 +96,8 @@ A pending hunk can become inconsistent with the current accepted state — e.g.,
 - **Drifted hunks** surface in the file pill's `(M drifted)` suffix. Click expands a popover listing each with `[Reject]` and `View` (opens the hunk's proposed content in diff mode against `Empty`). [patch-review-conflicted-hunk-display]
 status:: planned
 note:: conflicted proposals (hydration-time apply failures, or disk-side state from `staging-drift-eager-recheck` before hydration) surface via the file-pill's `(M conflicted)` suffix. They don't render as hunks in the inline view
+- **Conflicted-list popover.** Clicking the `(M conflicted)` suffix on the file pill opens a popover listing each conflicted proposal with `[Reject]` and `View` (opens the proposal in diff mode against `Empty`). [patch-review-conflicted-list-popover]
+status:: planned
 - **In the file pill popover** and the activity-detail page, Accept is greyed for drifted hunks with the drift reason as tooltip. Reject stays active. [patch-review-conflicted-accept-disabled]
 status:: partial
 note:: inline hunk overlay: `diff_overlay.rs::attach_agent_hunk_widgets` greys the per-hunk Accept button (`enabled: false`) and labels the row `Hunk N (drifted)` when any contributing op is drifted (`OpLog::is_pending_drifted`); Reject stays active. The file pill surfaces the `(M drifted)` count. Gap: the file-pill popover + `Changes`-tab drift-reason tooltip are still planned
@@ -125,7 +134,9 @@ These open the editor tab in diff mode: the buffer holds the proposed content re
 status:: planned
 note:: label reads `Review rewrite` (target path exists on disk) vs. `Review new note` (target path doesn't), with muted origin suffix (`· chat` / `· batch` / `· trail`)
 
-- **Accept** folds the proposal into `working` (preserving the rest of `working` like the inline path), committed on the next Save. A whole-body rewrite replaces the body region; where it overlaps uncommitted `working` edits, the overlap surfaces as a conflict hunk with **Keep mine / Keep theirs / Keep both** (per [[spec:op-log-merge-conflict]]); disjoint `working` edits merge automatically. Then navigates to the target note as a preview tab. [write-note-review-blocks-on-dirty, staging-accept-navigates-to-preview]
+- **Accept** folds the proposal into `working` (preserving the rest of `working` like the inline path), committed on the next Save. A whole-body rewrite replaces the body region; where it overlaps uncommitted `working` edits, the overlap surfaces as a conflict hunk with **Keep mine / Keep theirs / Keep both** (per [[spec:op-log-merge-conflict]]); disjoint `working` edits merge automatically. Accept refuses with a modal when the live buffer for the target path is dirty; Reject works regardless. [write-note-review-blocks-on-dirty]
+status:: planned
+  - Then navigates to the target note as a preview tab. [staging-accept-navigates-to-preview]
 - **Drifted whole-file proposals.** Accept disabled with reason as tooltip; proposed content still renders. Reject works. [write-note-review-conflicted-display]
 status:: done
 note:: drift is read off the op log (`OpLog::is_pending_drifted`, surfaced on `WholeFileProposal.drifted`). Accept is disabled with a drift reason in the tooltip on both the whole-file review toolbar (`render_readonly_source_toolbar`) and the pending-rewrite banner (`pending_rewrite_banner`); proposed content still renders; Reject + View stay active
@@ -159,6 +170,12 @@ note:: thin amber strip above the editor when a buffer tab is in plain editing a
 - The editor exposes its change sets (per [[spec:editor-transactions-out]]): each user `Transaction`'s `ChangeSet` is what `map_pos` remaps the session's anchored ranges through, and is what the editor-native overlay (per [[spec:op-log-three-way-overlay]]) consumes to recompute the diff. The overlay is editor-native, not CRDT.
 - `DiffLayer` decorations are pushed onto the same decoration stack as markdown styling, wikilinks, etc. View-zone insertions for removed lines participate in line-height calculation via the existing `DecorationLayers::push_with_heights` path.
 - Hunk overlay widgets use the existing clickable-widget primitive (`ClickAction::WidgetClick`); widget ids namespaced from `WIDGET_ID_BASE`.
+  - The hunk's button row rides a pure-data action-row primitive: `BlockKind::ActionRow { label, glyph, tone, buttons }` in `editor-core::decoration` with `ActionButton`, `ActionButtonStyle` (Primary/Danger/Neutral), `ActionTone` (Normal/Warning/Conflicted). Rendered by `paint_action_row` in `editor-egui`; each enabled button registers a per-rect `ClickZone` with `ClickAction::WidgetClick(button.id)`. Used by [[spec:diff-layer-hunk-widgets]]. [editor-action-row-primitive]
+status:: done
+  - Inline phantom segments render through the `InlineWidget` trait's `fn display() -> Option<InlineWidgetDisplay>`. When `Some`, the egui painter renders the supplied `{ text, bg, fg, strikethrough }` as the segment galley + bg fill instead of the bordered placeholder. [editor-inline-widget-display]
+status:: done
+  - `build_line_layout` collects `InlineWidget` decorations whose `range.start == line_byte_end` into a trailing-segment list rather than clipping them to zero width. [editor-end-of-line-widget]
+status:: done
 - Cursor and selection are unaffected by diff recomputation. Frame-level diff cost is bounded by `editor_core::diff::lines(agent_base, current)` over the in-memory ropes — cheap for note-sized files; no incremental diff cache required.
 
 
@@ -206,27 +223,3 @@ note:: global keybind for next/previous hunk in the active buffer; the file pill
 - `editor.md` ([[spec:tab-kinds]], [[spec:editor-toolbar-mode-controls]], [[spec:editor-show-changes-menu]], [[spec:status-bar-version-dropdown]]) — tab kinds, toolbar slot, status-bar dropdown.
 - `op-log.md` "History" ([[spec:changes-query-api]], `activity-feed-*`) — the projection layer pending edits surface through.
 - `settings.md` — the `[op-log]` config section (per [[spec:op-log-config-section]]).
-
-## Registry imports (from status.md)
-
-Entries imported from the retired status registry that had no anchor in this doc —
-re-home them into the relevant sections as the doc evolves.
-
-- **patch-review-buffer-state** — `app/src/panels/buffer/editor_binding.rs` runs `log.materialize_review(rel)` off `op_writes::review_materializations` → sets `buffer.agent_proposal = review` and `agent_base = accepted`; clears `agent_base` to `None` when the two are equal (no pending ops in scope). Re-runs each frame the buffer is shown and after every flip. The `Buffer` carries `active_session` to scope the overlay [patch-review-buffer-state]
-  status:: done
-  touches:: [[code:hiker/panels/buffer/editor_binding]]
-- **patch-review-diff-layer** — `app/src/panels/buffer/diff_overlay.rs::compute` builds `DiffLayer { base: agent_base, current, owner: Agent }` and pushes decorations onto the editor's decoration stack. Same primitive powers diff toggle and snapshot/history viewer [patch-review-diff-layer]
-  status:: done
-  touches:: [[code:hiker/panels/buffer/diff_overlay]]
-- **patch-review-conflicted-list-popover** — clicking the `(M conflicted)` suffix on the file pill opens a popover listing each conflicted proposal with `[Reject]` and `View` (opens the proposal in diff mode against `Empty`) [patch-review-conflicted-list-popover]
-  status:: planned
-- **patch-review-decorations** — umbrella slug for the inline rendering of pending edits. Implementation now rides [[spec:patch-review-diff-layer]] rather than a custom decoration provider [patch-review-decorations]
-  status:: planned
-- **write-note-review-blocks-on-dirty** — Accept refuses with modal when the live buffer for the target path is dirty. Reject works regardless [write-note-review-blocks-on-dirty]
-  status:: planned
-- **editor-action-row-primitive** — `BlockKind::ActionRow { label, glyph, tone, buttons }` in `editor-core::decoration` with `ActionButton`, `ActionButtonStyle` (Primary/Danger/Neutral), `ActionTone` (Normal/Warning/Conflicted). Rendered by `paint_action_row` in `editor-egui`; each enabled button registers a per-rect `ClickZone` with `ClickAction::WidgetClick(button.id)`. Pure-data primitive used by [[spec:diff-layer-hunk-widgets]] [editor-action-row-primitive]
-  status:: done
-- **editor-inline-widget-display** — `InlineWidget` trait carries `fn display() -> Option<InlineWidgetDisplay>`. When `Some`, the egui painter renders the supplied `{ text, bg, fg, strikethrough }` as the segment galley + bg fill instead of the bordered placeholder [editor-inline-widget-display]
-  status:: done
-- **editor-end-of-line-widget** — `build_line_layout` collects `InlineWidget` decorations whose `range.start == line_byte_end` into a trailing-segment list rather than clipping them to zero width [editor-end-of-line-widget]
-  status:: done

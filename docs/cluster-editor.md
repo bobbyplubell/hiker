@@ -15,6 +15,11 @@ Sidebar body when the mode is Cluster trees. Header carries the mode-specific ac
 status:: done
 note:: `app/src/sidebar/clusters/mod.rs` reads `cluster_trees_list` (host command) and renders one collapsible section per row with name + state pill (`draft` / `applied` / `saved-as-triage`). The first tree opens by default; subsequent ones collapse so the sidebar stays scannable. Each tree carries its own selection + expanded sets
 
+The open-trees list renders inline hierarchical rows (chevron + name + summary preview + member count + policy chip + row menu), expand/collapse per cluster, and click-a-leaf to open the note in the editor pane; new-tree and the actions menu anchor off the panel header. [cluster-editor-sidebar-mode]
+status:: done
+touches:: [[code:hiker/clusters/sidebar]]
+note:: `app/src/clusters/sidebar/mod.rs` (+ `tree.rs`) renders the open-trees list with inline hierarchical rows (chevron + name + summary preview + member count + policy chip + row menu), expand/collapse per cluster, click a leaf to open the note in the editor pane. New-tree modal + actions menu anchor off the panel header. Refreshes on vault open. (The former sidebar mode-switcher framing is superseded by the egui-workbench multi-region sidebar — Clusters is now an independent dockable panel; see [[spec:sidebar-mode-switcher]])
+
 ```
 ┌─ Sidebar ─────────────────────────────────┐
 │ Cluster trees                       [...] │  ← panel header
@@ -37,8 +42,30 @@ The `[⤢]` icon on each tree's row is the Expand button — flips that tree int
 
 Header actions:
 
-- **New tree** — the primary affordance, the Clusters accordion-header `+` split-button (the shared [[spec:split-add-button]]). The primary `+` opens a `cluster-review` app-page tab with default params; the caret dropdown lists tree-creation presets that prefill the tab. There, the user configures scope/method/params, runs the structural clustering pass, reviews the result, and confirms (firing the LLM naming pass and persisting the tree as `draft`). The cluster editor is the review surface. Lifecycle (**Sapling** / **Evergreen**) is one of the form fields — a hint that sets the post-confirm default action, not a hard mode. Full detail in the "Clustering review tab" section below. [cluster-editor-new-tree-action, cluster-editor-sapling-evergreen-lifecycle]
-- **Tree-creation presets.** A preset is a reusable set of tree-creation params (algorithm, source-type filter, post-confirm LLM-naming toggle) — the review form's config minus the per-tree name. Built-in presets (e.g. Leiden / HDBSCAN / From folders) are virtual (in-code) and always appear. A user preset is an **ordinary vault note** carrying `hiker.kind: cluster-preset` frontmatter (the params in a `cluster_preset` block); the `+` dropdown finds them through the store's frontmatter query ([[spec:store-note-query]]), so a note the user hand-typed or imported with that frontmatter is a preset exactly like one hiker saved — nothing lives under `.hiker/`, per [[spec:subsystem-notes-visible]]. "Save preset" in the review tab writes such a note (default location `cluster-presets/<slug>.md`; the user can move it anywhere — discovery is by frontmatter, not path). The caret lists built-ins first, then user presets. [cluster-preset, cluster-preset-defaults, cluster-preset-save]
+- **New tree** — the primary affordance, the Clusters accordion-header `+` split-button (the shared [[spec:split-add-button]]). The primary `+` opens a `cluster-review` app-page tab with default params; the caret dropdown lists tree-creation presets that prefill the tab. There, the user configures scope/method/params, runs the structural clustering pass, reviews the result, and confirms (firing the LLM naming pass and persisting the tree as `draft`). The cluster editor is the review surface. Full detail in the "Clustering review tab" section below. [cluster-editor-new-tree-action]
+status:: done
+implements:: [[code:hiker/workbench_host/impl#[`HikerWbBehavior<'a>`][`Host<HikerWbTab, _>`]side_bar_action_buttons]]
+touches:: [[code:hiker/clusters/panel]]
+note:: Clusters accordion-header `+` split-button ([[spec:split-add-button]]): primary opens the review tab with default params; caret dropdown lists tree-creation presets. The panel body's old "Cluster trees" label + `+ New tree` button were removed. Algorithm choice happens inside the review tab. `cluster_tree_create` backend command preserved for tests / CLI · evidence: `app/src/workbench_host.rs` (`side_bar_action_buttons`, clusters branch), `app/src/clusters/panel/mod.rs` (`ReviewConfig::open`)
+
+  Lifecycle (**Sapling** / **Evergreen**) is one of the form fields — a hint that sets the post-confirm default action, not a hard mode. [cluster-editor-sapling-evergreen-lifecycle]
+status:: done
+note:: Sapling's once-and-done path (Sprint C) plus the Evergreen path (Sprint D). Save-as-triage button in `app/src/panels/cluster_review/mod.rs` flips the tree's `state` to `saved-as-triage` via `cluster_tree_set_state`; the watcher subscription in the host then runs `core::suggest::triage_all_saved_trees` on every Modified/Created/Renamed event whose path is inside the triage scope, emitting `surface = "triage"` staging rows per matched policy
+- **Tree-creation presets.** A preset is a reusable set of tree-creation params (algorithm, source-type filter, post-confirm LLM-naming toggle) — the review form's config minus the per-tree name. A user preset is an **ordinary vault note** carrying `hiker.kind: cluster-preset` frontmatter (the params in a `cluster_preset` block); the `+` dropdown finds them through the store's frontmatter query ([[spec:store-note-query]]), so a note the user hand-typed or imported with that frontmatter is a preset exactly like one hiker saved — nothing lives under `.hiker/`, per [[spec:subsystem-notes-visible]]. The caret lists built-ins first, then user presets. [cluster-preset]
+status:: done
+implements:: [[code:hiker/clusters/preset/Params]]
+touches:: [[code:hiker/workbench_host]]
+note:: tree-creation presets (algorithm + source-type filter + post-confirm naming toggle) listed in the Clusters `+` caret; a pick opens the review tab prefilled. User presets are ordinary vault notes found by the frontmatter query ([[spec:store-note-query]]) — not under `.hiker/`; built-ins first, then user presets · evidence: `app/src/clusters/preset.rs` (`load` via `Store::query_notes` on `hiker.kind: cluster-preset`), `app/src/workbench_host.rs` (clusters `+` dropdown, cached in `clusters_state.preset_cache`)
+
+  Built-in presets (Leiden / HDBSCAN / From folders) are virtual (in-code) and always appear. [cluster-preset-defaults]
+status:: done
+implements:: [[code:hiker/clusters/preset/builtins]]
+note:: in-code default presets always shown: Semantic — Leiden / Semantic — HDBSCAN / From folders · evidence: `app/src/clusters/preset.rs` (`builtins`)
+
+  "Save preset" in the review tab writes such a note (default location `cluster-presets/<slug>.md`; the user can move it anywhere — discovery is by frontmatter, not path). [cluster-preset-save]
+status:: done
+implements:: [[code:hiker/clusters/panel/impl#[`Review<'_>`]show]], [[code:hiker/clusters/preset/save]]
+note:: "Save preset" in the review tab writes an ordinary vault note (`hiker.kind: cluster-preset` + a `cluster_preset` params block, default `cluster-presets/<slug>.md`) + indexes it; the frontmatter query reloads it into the `+` dropdown. Discovery is by frontmatter, not path · evidence: `app/src/clusters/preset.rs` (`save`), `app/src/clusters/panel/mod.rs` (review-tab "Save preset")
 - **`…` menu** — mode-specific overflow: "Open saved triage tree" (no-op when already open), "Import tree from file" (load a `cluster-tree.json` from elsewhere — useful for sharing trees), "Discard all drafts," "Tree settings" (per-node policy defaults, etc.). [cluster-editor-mode-menu]
 status:: partial
 note:: `app/src/sidebar/clusters/mod.rs` (the `…` actions menu, clusters mode only). Entries: New tree… / Discard all drafts / Refresh. **Partial:** the spec's "Open saved triage tree" / "Import tree from file" / "Tree settings" entries are not yet wired — they hinge on the triage-tree distinction ([[spec:cluster-editor-save-as-triage]], Sprint C) and on an import pathway that lands later
@@ -69,7 +96,10 @@ note:: `app/src/sidebar/clusters/mod.rs` — renders an "Outliers (N)" virtual n
 
 ## Expanded mode (center pane)
 
-Clicking the Expand button on a tree row sends that tree to the center pane, replacing the editor (mirrors [[spec:chat-panel-expand-to-editor]]). This is the surface tuned for heavy graphical reshaping — wider rows, larger drag targets, multi-pane "before/after" preview, more screen real estate for visualizing N-level trees. [cluster-editor-sidebar-mode, cluster-editor-pane-expand]
+Clicking the Expand button on a tree row sends that tree to the center pane, replacing the editor (mirrors [[spec:chat-panel-expand-to-editor]]). This is the surface tuned for heavy graphical reshaping — wider rows, larger drag targets, multi-pane "before/after" preview, more screen real estate for visualizing N-level trees. [cluster-editor-pane-expand]
+status:: partial
+touches:: [[code:hiker/clusters/sidebar]]
+note:: the cluster-batch-review pane opens via the row menu's "Open in pane"; it starts in `cluster-tree` sub-mode and flips to `cluster-batch-review` after Apply. **Partial**: the spec'd `[⤢]` icon button on each tree row isn't wired yet (`app/src/clusters/sidebar/mod.rs:74`). Evidence: `app/src/clusters/sidebar/mod.rs` (row-menu "Open in pane"), `app/src/panels/cluster_review/mod.rs` (the pane)
 
 The expanded mode is a new editor-pane sub-mode, joining the existing list (editor / vault-home-overview / vault-home-detail / settings / chat-expanded). The sidebar's cluster trees mode keeps showing the same tree (in its docked form) so the user can switch back by collapsing the expanded view. [cluster-editor-pane-mode]
 status:: done
@@ -99,7 +129,13 @@ Layout (sketch):
 
 Behavior:
 
-- **Click a leaf note row → open the note in the editor.** This *replaces* the expanded tree view in the center pane with the regular editor on the clicked note. The existing navigation history ([[spec:navigation-history-stack]]) records the expanded-tree state; the back button returns to it. From the user's perspective the loop is: "expanded tree → click note → read/edit → back → expanded tree." No special "back to tree" affordance needs adding; it's the same nav-stack back the rest of hiker uses. [cluster-editor-pane-leaf-click-opens-note, cluster-editor-pane-back-to-tree]
+- **Click a leaf note row → open the note in the editor.** This *replaces* the expanded tree view in the center pane with the regular editor on the clicked note. [cluster-editor-pane-leaf-click-opens-note]
+status:: done
+note:: `app/src/sidebar/clusters/mod.rs` (sidebar) + `app/src/panels/cluster_review/mod.rs` (expanded pane) both route leaf-row clicks through the host-supplied open-note path
+
+  The existing navigation history ([[spec:navigation-history-stack]]) records the expanded-tree state; the back button returns to it. From the user's perspective the loop is: "expanded tree → click note → read/edit → back → expanded tree." No special "back to tree" affordance needs adding; it's the same nav-stack back the rest of hiker uses. [cluster-editor-pane-back-to-tree]
+status:: done
+note:: `app/src/panels/cluster_review/mod.rs` paints a `← Back to tree` button that flips the pane's sub-state back to `cluster-tree` without closing pending staging rows; activation stays on the same tab so the existing nav stack remains coherent
 - **Click a cluster row → expand/collapse** as in the sidebar form. No navigation hop. Pane-local `expanded: Set<NodeId>` is per-tree and survives refreshes (queue-event-driven re-fetch after a `raptor_summarize` task lands doesn't collapse the user's expansion state).
 - **Full row UX parity with the sidebar.** The shared row primitive ([[spec:cluster-editor-row-primitive]]) gives the pane the same chevron / click-to-edit name + summary / right-click context menu / policy chip popover / staleness badge / multi-select behavior as the sidebar. Right-click verbs are identical: cluster rows expose Move to… / Split / Subcluster… / Merge children up / Drop cluster; leaf rows expose Move to… / Promote out of outliers… (under the outlier bucket) / Send to outliers; the outlier bucket exposes Move to… / Drop cluster.
 - **Multi-select via Shift/Cmd-click** picks rows across levels (selecting a cluster includes its subtree implicitly for purposes of the bulk-action toolbar). The multi-select toolbar surfaces in the pane header alongside the existing Apply / Save-as-triage cluster when `selection.size > 0`, with verbs Merge siblings / Drop / Stage move to… / Stage tag with… / Clear. Pane-local selection state also survives queue-event refreshes.
@@ -132,9 +168,20 @@ status:: planned
 touches:: [[code:hiker/trees/types]]
 note:: All outline parse/serialize + metadata-frontmatter (de)serialization stays behind the `core::trees` boundary; outside callers consume `TreeRow` / `EditableNode` / `NodeKind` / `NodePolicy` — plain serde Rust in `core/src/trees/types.rs`. Mirrors `core::trails` (markdown, no on-disk-shape leakage): the visible-note write path suppresses the watcher + enqueues an `Upsert` around its op-log save, same as trail-docs. No SQLite, no schema-version file. One legacy-location migration ([[spec:cluster-tree-migration]]). Submodule layout: `mod.rs`, `types.rs` (DTOs + `Db` handle), `store.rs` (frontmatter parse/serialize + op-log writes + migration), `ops/{edit,move_node,merge,drop,folder_rename,split,rollup}.rs`
 
+The migration is one-time and idempotent — it relocates each legacy `.hiker/trees/<id>.md` tree to the visible default on vault open. [cluster-tree-migration]
+status:: done
+touches:: [[code:hiker/trees/store]]
+note:: one-time, idempotent relocation of legacy `.hiker/trees/<id>.md` trees to the visible default on vault open. Per tree: repoint the op-log doc to the new path (`oplog::writes::rename`, preserving its history) **before** moving the file bytes — the ordering that prevents a forked history; legacy files never op-log-seeded just have their bytes moved (the full-scan seeds them fresh). Skips a tree whose new path already exists; removes the empty `.hiker/trees/` shell; no-ops when `.hiker/trees/` is absent. Indexing is deferred to the indexer's initial full-scan (runs after `Db::new`), so no `Upsert`/suppression is needed in the migration · evidence: `core/src/trees/store.rs` (`migrate_legacy_trees`, run from `Db::new`)
+
 ### Document shape
 
-Frontmatter carries tree-level metadata only; the body carries the structure as an outline. [trees-md-frontmatter, tree-md-outline-body]
+Frontmatter carries tree-level metadata only. [trees-md-frontmatter]
+status:: planned
+note:: Frontmatter carries tree metadata only: `hiker.{kind,id,name,source,state,scope,method,created_at}`. No `nodes` list — the structure lives in the body outline (see [[spec:tree-md-outline-body]]). Unknown frontmatter keys preserved on round-trip. Centroids are NOT stored in the doc (see [[spec:trees-centroids-index]])
+
+The body carries the structure as an outline. [tree-md-outline-body]
+status:: planned
+note:: The tree's structure is the editable outline in the `.md` body (not frontmatter): headings = clusters (depth = heading level), nested bullets = deeper clusters + leaves, leaf = a bullet wikilink, summary = the paragraph under a heading. Frontmatter holds tree metadata only
 
 ````markdown
 ---
@@ -191,9 +238,11 @@ note:: Lenient body parse: resolvable wikilink bullet → leaf; plain-text bulle
 
 Prose the user interleaves between clusters is preserved verbatim on round-trip, as are unknown frontmatter keys.
 
-**Path identity, rename, broken leaves.** A leaf is a path, exactly as a board card is ([[spec:board-card-references]]); the consequences mirror boards: [tree-leaf-path-ref, tree-broken-leaf]
+**Path identity, rename, broken leaves.** A leaf is a path, exactly as a board card is ([[spec:board-card-references]]); the consequences mirror boards: [tree-leaf-path-ref]
 
-- A leaf whose path doesn't resolve renders greyed with a broken-reference pill and stays in its cluster so the user repoints or removes it. The path is the only pointer, so the broken-leaf surface is the integrity net.
+- A leaf whose path doesn't resolve renders greyed with a broken-reference pill and stays in its cluster so the user repoints or removes it. The path is the only pointer, so the broken-leaf surface is the integrity net. [tree-broken-leaf]
+status:: planned
+note:: A leaf whose path doesn't resolve renders greyed with a broken-reference pill and stays in its cluster for the user to repoint or remove — same safety net as a broken board card
 - When a referenced note moves, `core::trees::on_note_moved` rewrites every affected leaf path in the same transaction as the move, riding the shared [[spec:wikilink-rename-rewrite]] pass alongside boards, trails, and wikilink bodies. [tree-leaf-rename-rewrite]
 status:: planned
 note:: `core::trees::on_note_moved` rewrites affected leaf paths in the same transaction as a note move, riding the shared [[spec:wikilink-rename-rewrite]] pass alongside boards / trails / wikilink bodies
@@ -294,9 +343,21 @@ note:: Default strict partition (a note appears once). The user may manually pla
 
 ## Clustering review tab
 
-Building a new tree and reclustering a subtree both go through a `cluster-review` app-page tab, not a modal. The tab is the configuration surface, the runner, and the structural-result reviewer; nothing about the structural result is written to disk until a single Confirm action persists it as a `draft` `.md` with placeholder names and flips the tab to the cluster editor pane. [cluster-review-tab] Entry points: the Clusters accordion-header `+` split-button ([[spec:cluster-editor-new-tree-action]]) opens a fresh tab — its primary click with default params, its caret-dropdown presets prefilling the form ([[spec:cluster-preset]]); the row-menu's "Recluster subtree…" entry on a cluster row ([[spec:cluster-editor-recluster-subtree]]) opens a tab pre-bound to that `(tree_id, node_id)`; the mode menu's "Rebuild" entry on an Evergreen tree opens a tab prefilled with the tree's saved scope/method/params. [cluster-review-tab-from-new-tree-action, cluster-review-tab-from-recluster-action, cluster-review-tab-rebuild-prefill]
+Building a new tree and reclustering a subtree both go through a `cluster-review` app-page tab, not a modal. The tab is the configuration surface, the runner, and the structural-result reviewer; nothing about the structural result is written to disk until a single Confirm action persists it as a `draft` `.md` with placeholder names and flips the tab to the cluster editor pane. [cluster-review-tab]
 status:: done
 note:: New `cluster-review` app-page tab kind; full configure → run → review → confirm flow lives in `app/src/panels/cluster_review/mod.rs`. Backend commands `cluster_run_structural` + `cluster_persist_built_tree` + `cluster_op_recluster_subtree_from_built` in the host
+
+Entry points:
+
+- The Clusters accordion-header `+` split-button ([[spec:cluster-editor-new-tree-action]]) opens a fresh tab — its primary click with default params, its caret-dropdown presets prefilling the form ([[spec:cluster-preset]]). [cluster-review-tab-from-new-tree-action]
+status:: done
+note:: Header `+ Suggest reorganization` button (`app/src/sidebar/clusters/mod.rs`), the sidebar `+`-button (clusters mode), and the mode-menu "New tree…" entry all open the `cluster-review` tab
+- The row-menu's "Recluster subtree…" entry on a cluster row ([[spec:cluster-editor-recluster-subtree]]) opens a tab pre-bound to that `(tree_id, node_id)`. [cluster-review-tab-from-recluster-action]
+status:: done
+note:: The cluster-row menu's "Recluster subtree…" entry (`app/src/sidebar/clusters/mod.rs`) opens the `cluster-review` tab in recluster-subtree mode. Backend `cluster_op_recluster_subtree` command is preserved for tests / CLI
+- The mode menu's "Rebuild" entry on an Evergreen tree opens a tab prefilled with the tree's saved scope/method/params. [cluster-review-tab-rebuild-prefill]
+status:: partial
+note:: `clusterReviewTab::open({ kind: "rebuild", treeId })` fetches the tree row via `cluster_trees_list` and pre-populates name + scope + method + cluster params from the saved JSON. **Gap:** the host doesn't yet wire a "Rebuild" entry point on the mode menu / Evergreen tree-row menu, so the tab is only reachable programmatically (e.g. from a future menu entry). The mechanism lands here; the surface entry is the follow-up
 
 ### Tab kind
 
@@ -374,7 +435,20 @@ note:: The Recursion group sets `ClusterParams.recursion` to Flat (default) / Ma
 
 ### Run clustering
 
-The `Run clustering` button kicks off the structural-only pass on a background task: the Split step of [[spec:cluster-build-recipe]] in the configured recursion mode (Flat by default), with naming deferred to Confirm so the pass runs without any summarizer. The UI is non-blocking — the user can scroll the Result panel, edit other tabs, or tweak un-locked configuration fields while the pass runs. The result is a `BuiltClusterTree` whose clusters have placeholder names (default: `"Cluster N"` numbered in member-count-descending order at the end of the pass) and empty summaries. The result lives in the tab's in-memory state — no `.md` file is written. Subsequent Run clicks discard the prior result and progress, then restart the pass with the current form values. [cluster-review-tab-run-clustering, cluster-review-tab-iterate]
+The `Run clustering` button kicks off the structural-only pass on a background task: the Split step of [[spec:cluster-build-recipe]] in the configured recursion mode (Flat by default), with naming deferred to Confirm so the pass runs without any summarizer. The UI is non-blocking — the user can scroll the Result panel, edit other tabs, or tweak un-locked configuration fields while the pass runs. The result is a `BuiltClusterTree` whose clusters have placeholder names (default: `"Cluster N"` numbered in member-count-descending order at the end of the pass) and empty summaries. The result lives in the tab's in-memory state — no `.md` file is written. [cluster-review-tab-run-clustering]
+status:: done
+implements:: [[code:hiker/cluster/build/tree_structural]]
+note:: Run button in `app/src/panels/cluster_review/mod.rs` calls `cluster_run_structural` which in turn calls `core::cluster::build_tree_structural` (forces `SummarizeMode::None` on the method's params and post-processes leaf-level cluster names to `"Cluster N"` member-count-descending). Result lives on the tab's in-memory state; no tree `.md` is written
+
+The pass runs asynchronously so the UI stays live while it streams. [cluster-review-tab-async-pass]
+status:: done
+implements:: [[code:hiker/clusters/panel/impl#[`Review<'_>`]show]], [[code:hiker/clusters/panel/impl#[`Review<'_>`]run_structural_streaming]]
+touches:: [[code:hiker/clusters/panel]]
+note:: `app/src/panels/cluster_review/mod.rs::run_structural_streaming` kicks off `core::cluster::build_tree_structural_streaming` on a background tokio `spawn_blocking` worker (the egui frame loop enters the host runtime each tick so `Handle::current()` is live at call time). The pane stows the `tokio::sync::mpsc::Receiver<BuildEvent>` in an `Arc<Mutex<>>`; `drain_events` pulls events via `try_recv` at the top of each `show()` call and `ui.ctx().request_repaint()` keeps the frame loop ticking while the build is alive. The blocking `build_tree_structural` shim stays for tests
+
+Subsequent Run clicks discard the prior result and progress, then restart the pass with the current form values. [cluster-review-tab-iterate]
+status:: done
+note:: Subsequent Run clicks clear `result` + `userRenamed` (`app/src/panels/cluster_review/mod.rs`) and re-run with the form's current values. No LLM cost per iteration since the structural pass doesn't invoke a summarizer
 
 The build pipeline supports a `summarize: SummarizeMode::None` short-circuit path that skips the `Summarizer` call entirely so the structural pass runs end-to-end without an LLM. [cluster-review-tab-structural-pass-no-llm]
 status:: done
@@ -400,9 +474,23 @@ note:: `render_progress_row` paints between Configuration and Result while `pane
 
 ### Result panel
 
-Renders the in-memory `BuiltClusterTree`. Two view variants are available via a Tree / Graph toggle in the panel's toolbar; markdown view is not surfaced here (no LLM names yet). View options — current variant (Tree vs. Graph), per-cluster expand chevron state, and any per-view layout state — persist across re-runs within the same tab session: the user keeps the layout they were working in even after pressing Run again. Stale node ids in the expand set from a prior run are harmless (lookups against the new run's ids just return false). [cluster-review-tab-result-view-toggle, cluster-review-tab-view-state-survives-rerun]
+Renders the in-memory `BuiltClusterTree`. Two view variants are available via a Tree / Graph toggle in the panel's toolbar; markdown view is not surfaced here (no LLM names yet). [cluster-review-tab-result-view-toggle]
+status:: done
+implements:: [[code:hiker/clusters/panel/result/impl#[`Review<'_>`]render_result_panel]]
+note:: View toggle row above the result body in `render_result_panel` (`Tree` / `Graph` selectable_value pair). State lives on `ReviewPane.view` so it survives within the tab session. Markdown view not surfaced
 
-**Tree view (default).** Hierarchical row layout reusing [[spec:cluster-editor-row-primitive]] minus the affordances that don't apply pre-persistence (no policy chip — policies don't exist on un-persisted trees; no drag-handle — structural results are immutable from this surface; no staleness badge — `summary_membership_churn` doesn't apply). Per-cluster row shows: placeholder name (`"Cluster 1"`, `"Cluster 2"`, …), member count, centroid radius / confidence indicator, and an expand chevron when the cluster has children (nested sub-clusters or leaf members). Expanding a cluster reveals its members inline — nested sub-cluster rows + leaf-note rows, both using the row primitive at deeper indent. Leaves are click-to-open same as the sidebar form. Outliers render as a sibling row at the bottom of the root level with the distinct outlier glyph. Pane-local `expanded: Set<NodeId>` keyed by the in-memory build run's node ids; switching to graph view and back restores the expansion state. [cluster-review-tab-structure-preview, cluster-review-tab-result-expand]
+View options — current variant (Tree vs. Graph), per-cluster expand chevron state, and any per-view layout state — persist across re-runs within the same tab session: the user keeps the layout they were working in even after pressing Run again. Stale node ids in the expand set from a prior run are harmless (lookups against the new run's ids just return false). [cluster-review-tab-view-state-survives-rerun]
+status:: done
+note:: The Run reset path in `app/src/panels/cluster_review/mod.rs` leaves `pane.view` (Tree/Graph) and `pane.expanded` (chevron set) intact across re-runs — only the in-flight build state (`result`, `live_top`, `live_pending_children`, `phase`, `counters`, `started_at`, `user_renamed`, `editing`) is cleared. Stale node ids in `expanded` from a prior run are harmless: lookups against the new run's fresh ids return false
+
+**Tree view (default).** Hierarchical row layout reusing [[spec:cluster-editor-row-primitive]] minus the affordances that don't apply pre-persistence (no policy chip — policies don't exist on un-persisted trees; no drag-handle — structural results are immutable from this surface; no staleness badge — `summary_membership_churn` doesn't apply). Per-cluster row shows: placeholder name (`"Cluster 1"`, `"Cluster 2"`, …), member count, centroid radius / confidence indicator, and an expand chevron when the cluster has children (nested sub-clusters or leaf members). Outliers render as a sibling row at the bottom of the root level with the distinct outlier glyph. [cluster-review-tab-structure-preview]
+status:: done
+note:: `renderResult` paints leaf clusters in member-count-descending order with placeholder name, member count, radius indicator, and a first-3-titles sample (resolved via `note_titles` map returned alongside the build DTO). Outliers render as a sibling block with the dashed border. **Gap:** does not reuse [[spec:cluster-editor-row-primitive]] (`renderNode`) — instead carries a thin variant in-module; the spec's row-primitive extraction note already flagged the extraction as deferred
+
+Expanding a cluster reveals its members inline — nested sub-cluster rows + leaf-note rows, both using the row primitive at deeper indent. Leaves are click-to-open same as the sidebar form. Pane-local `expanded: Set<NodeId>` keyed by the in-memory build run's node ids; switching to graph view and back restores the expansion state. [cluster-review-tab-result-expand]
+status:: done
+implements:: [[code:hiker/clusters/panel/result/impl#[`Review<'_>`]render_cluster_row]]
+note:: Each cluster row carries a `▶`/`▼` chevron. `ReviewPane.expanded: HashSet<NodeId>` tracks which rows are expanded; toggling switches between graph and tree views preserves the set. Expanded branch clusters render their sub-clusters inline via recursive `render_cluster_row` at deeper indent; leaf clusters render their note members (capped at 50 rows before a "and N more" footer). The expand affordance replaces the legacy flat first-3-titles sample
 
 **Graph view.** Node-link rendering of the built tree via the shared egui force-graph widget (per [[spec:cluster-editor-renderer-reuse]]). Same size-by-members and label-style encoding as [[spec:cluster-editor-graph-view]], minus the policy color (no policies) and staleness tint (no churn). Layout default is radial; layout selection rides through the cluster editor's view-menu pattern when the panel is in graph mode. Pan / zoom / hover-detail / click-to-pin-preview behavior is shared with the cluster editor's graph view. Useful at the build-review stage for spotting structural pathologies at a glance — single giant cluster, fragmented outliers, depth imbalance — that the row view buries under expand chevrons. The result graph's view/eye menu also carries the review tab's **Live preview** toggle ([[spec:cluster-review-tab-live-preview]]) — a display control over the debounced live re-cluster, kept here rather than in the clustering-config knobs because those knobs hold only clustering-engine params (HDBSCAN / Leiden tunables) while the view menu owns display controls. The companion display control **Anchor stiffness** ([[spec:force-cfg-anchor-stiffness]], how strongly retained nodes hold their prior spot across a force re-layout) lives in the same view menu. [cluster-review-tab-result-graph-view]
 status:: done
@@ -422,7 +510,9 @@ note:: Click a placeholder cluster name in the result panel to open an inline ed
 
 ### Confirm
 
-A single **Confirm** button (disabled until a Run has produced a complete result) persists the structural tree and lands the user on the cluster editor pane. Clustering ends here. LLM naming is **not** part of the Confirm flow by default.
+A single **Confirm** button (disabled until a Run has produced a complete result) persists the structural tree and lands the user on the cluster editor pane. Clustering ends here. LLM naming is **not** part of the Confirm flow by default. Nothing is written to disk until this Confirm. [cluster-review-tab-no-persistence-until-confirm]
+status:: done
+note:: `cluster_run_structural` returns a DTO that lives only in the cluster-review module's per-tab state. no tree `.md` is written until Confirm. Closing the tab drops the pane state via `clusterReviewTab.dropTab`; autosave only persists `(kind, path-key)`, not the form or result
 
 Steps:
 
@@ -430,7 +520,15 @@ Steps:
 2. Applies the configuration's **Naming** mode (per [[spec:cluster-review-tab-confirm-with-naming-toggle]]): **Deterministic** names placeholder clusters extractively on-device; **LLM** submits one `TaskKind::RaptorSummarize { tree_id, cluster_node_id, level }` task per placeholder cluster at `Priority::Normal` (same queue path as [[spec:cluster-editor-regenerate-via-task-queue]]); **None** leaves placeholders. Already-named clusters are skipped either way.
 3. Flips the tab's kind from `cluster-review` to `cluster-batch-review` for the new tree, with sub-mode `cluster-tree`. The user lands inside the cluster editor pane ([[spec:cluster-editor-pane-mode]]); the sidebar's Cluster trees mode picks up the new tree on its next refresh.
 
-The Confirm button itself is never gated on `[llm].enabled` — the structural tree persists regardless. The naming toggle is greyed out when LLM is disabled. [cluster-review-tab-confirm-single-path, cluster-review-tab-transition-to-pane]
+The Confirm button itself is never gated on `[llm].enabled` — the structural tree persists regardless. The naming toggle is greyed out when LLM is disabled. [cluster-review-tab-confirm-single-path]
+status:: done
+implements:: [[code:hiker/trees/build_adapter/node_inserts]], [[code:hiker/clusters/panel/impl#[`Review<'_>`]show]], [[code:hiker/clusters/panel/impl#[`Review<'_>`]confirm]]
+note:: Single `Confirm` button in `app/src/panels/cluster_review/mod.rs` replaces the old dual Confirm-and-name / Confirm-no-naming pair. Always persists the structural tree (placeholder names intact unless inline-renamed) and lands on the cluster sidebar via `app.clusters.selected_tree` (egui port has no separate cluster-pane tab kind yet). Never gated on `[llm].enabled`. Naming branch is opt-in via the new toggle (see [[spec:cluster-review-tab-confirm-with-naming-toggle]]) — when unchecked, Confirm skips the LLM step entirely
+
+On Confirm the tab transitions to the cluster editor pane for the newly-persisted tree (step 3 above). [cluster-review-tab-transition-to-pane]
+status:: done
+implements:: [[code:hiker/clusters/panel/impl#[`Review<'_>`]confirm]]
+note:: On Confirm the tab is closed and a `cluster-pane` tab opens for the new tree id (transition handled in `app/src/panels/cluster_review/mod.rs`). User stays on the same visible tab; the chrome swaps to the cluster editor pane for the newly-persisted tree. **Note:** implemented as close-and-open rather than literal in-place kind flip — the two tabs are keyed differently so a flip would conflict with the cluster-pane's per-tree dedup
 
 The cluster editor pane is the canonical surface for the (optional) naming follow-up: its toolbar's **Name clusters with LLM** button (a contextual rename of the existing Regenerate names verb when the tree's clusters still carry placeholder names) is the primary affordance. Same task-queue path as [[spec:cluster-editor-regenerate-via-task-queue]]. The user is free to skip naming entirely — live with placeholder names, edit them by hand from the cluster pane's inline-edit, etc. [cluster-editor-pane-name-clusters-cta]
 status:: planned
@@ -496,7 +594,19 @@ note:: `core/src/trees/ops/move_node.rs::promote_outlier` + `cluster_op_promote_
 - **Set / clear policy.** Click the policy chip on any node → policy editor (radio: `Tag` / `Move` / `Freeze` / `None` + the action's parameter for `Tag` (slug) or `Move` (folder) + a "Require review for new matches" checkbox available on `Tag` and `Move`). Setting a policy on an ancestor automatically becomes the resolved policy for descendants without their own. [cluster-editor-set-policy]
 status:: done
 note:: `app/src/sidebar/clusters/mod.rs` paints the policy chip popover for every cluster (and outlier-bucket) row with entries Tag… / Move to folder… / Freeze / Clear policy. Each writes through `cluster_node_set_policy` → `core::trees::set_policy` which appends a `set-policy` history row. Tag + Move policies prompt for the action parameter (slug / folder) + a `require_review` confirm
-- **Stage move / Stage tag (one-off, multi-select).** With N leaf rows selected, the bulk-action toolbar exposes "Stage move to…" and "Stage tag with…". Each verb writes N rows directly into the op log (one per selected leaf) with `surface = "cluster-editor"`, `action = "move_note"` or `"apply_tag"`, and `metadata.tree_id` for traceability. No node policies are mutated. Distinct from setting an `auto-move` / `auto-tag` policy and clicking Apply: the policy path is the saved-tree mechanism that fires on future matches; "Stage move/tag" is a one-shot batch against exactly the selected leaves. Useful when the user wants to act on an arbitrary subset of a tree without committing to a forever-rule. The proposals flow through the standard staging surfaces (activity-detail Pending filter, tree row indicators, editor toolbar pill) — the cluster editor doesn't gain a private review queue. [cluster-editor-multi-select-stage-move, cluster-editor-multi-select-stage-tag]
+- **Stage move / Stage tag (one-off, multi-select).** With N leaf rows selected, the bulk-action toolbar exposes "Stage move to…" and "Stage tag with…". Each verb writes N rows directly into the op log (one per selected leaf) with `surface = "cluster-editor"`, `action = "move_note"` or `"apply_tag"`, and `metadata.tree_id` for traceability. No node policies are mutated. Distinct from setting an `auto-move` / `auto-tag` policy and clicking Apply: the policy path is the saved-tree mechanism that fires on future matches; "Stage move/tag" is a one-shot batch against exactly the selected leaves. Useful when the user wants to act on an arbitrary subset of a tree without committing to a forever-rule. The proposals flow through the standard staging surfaces (activity-detail Pending filter, tree row indicators, editor toolbar pill) — the cluster editor doesn't gain a private review queue.
+
+  "Stage move to…" stages one pending `Rename` op per selected leaf. [cluster-editor-multi-select-stage-move]
+status:: done
+implements:: [[code:hiker/suggest/stage_moves]], [[code:hiker/clusters/sidebar/impl#[`ClusterCtx<'_, '_>`]stage_forms_inline]]
+touches:: [[code:hiker/suggest]]
+note:: `core::suggest::stage_moves` (per [[spec:op-log-reorg-batch]]) + `app/src/sidebar/clusters/mod.rs` multi-select toolbar's "Stage move to…" verb. Stages one pending `Rename` op per selected leaf via `core::ops::op_writes::stage_reorg_batch`, all sharing one cross-document `batch_id`, authored `auto:cluster` with `surface = "cluster-editor"`. Accept/reject flow through the op-log review surfaces (`flip_op_status` / batch `flip_batch_status`); partial apply allowed (a target collision skips that move, not the rest). No-op moves (target == source) skipped
+
+  "Stage tag with…" stages one pending content op per selected leaf. [cluster-editor-multi-select-stage-tag]
+status:: done
+implements:: [[code:hiker/suggest/stage_tags]], [[code:hiker/clusters/sidebar/impl#[`ClusterCtx<'_, '_>`]stage_forms_inline]]
+touches:: [[code:hiker/suggest]]
+note:: `core::suggest::stage_tags` + multi-select toolbar's "Stage tag with…" verb. Pre-computes the file content with the tag merged into the configured `tag_field` (default `hiker.suggested_tags`) via `merge_tag_into_frontmatter`, then stages it as one pending `SetFrontmatter`-shaped op via `core::ops::op_writes::stage_auto_content` authored `auto:cluster`
 - **Summarize this cluster.** Cluster-row right-click verb. Calls `Trees::summarize` with `scope = Subset { ids: [node_id] }`, `recursive = false`; skips a cluster that already has a non-placeholder name. No-op when the node's name + summary are filled and `summary_membership_churn == 0`. [cluster-editor-summarize-verb]
 status:: done
 note:: `app/src/sidebar/clusters/mod.rs` (+ `tree.rs`) calls `cluster_summarize` natively with `scope = subset`, `recursive = false`, `summarize_mode = llm`, `overwrite_user_edited = false`. The cluster-row context menu adds a "Summarize" entry (next to Split / Subcluster / Merge children up / Drop cluster); the multi-select toolbar renders a "Summarize" button when the current selection contains at least one cluster row — leaf rows are filtered out before the call, the button is hidden entirely when only leaves are selected. Both surface a toast keyed off `SummarizeSweepOutcome.enqueued` / `skipped_fresh` / `skipped_user_edited`: "Enqueued N cluster summaries — watch the queue for progress" when work was queued, "All N already fresh — nothing to do" when the backend's `StaleOrUnfilled` predicate skipped everything (`skipped_fresh` count is reported). Queue rows fan out per [[spec:cluster-op-summarize-sweep]]
@@ -548,7 +658,9 @@ The visual feedback layer is rendered by the shared row primitive ([[spec:cluste
 
 ### Multi-select range (shift-click)
 
-The row primitive's selection handler splits the three modifier gestures (plain / Cmd-Ctrl / Shift) per file-manager convention.
+The row primitive's selection handler splits the three modifier gestures (plain / Cmd-Ctrl / Shift) per file-manager convention; selection survives expand/collapse, and when 1+ nodes are selected the tree header surfaces the bulk-action toolbar (Merge siblings / Drop / Stage move to… / Stage tag with… / Clear). [cluster-editor-multi-select]
+status:: partial
+note:: `app/src/sidebar/clusters/mod.rs` (+ `tree.rs`) — Shift / Cmd / Ctrl-click distinctions (split out from the old single "any modifier toggles" path by [[spec:cluster-editor-multi-select-shift-range]]). Cmd/Ctrl-click toggles a single row in the tree's selection set and re-anchors; Shift-click extends from anchor through clicked id in current display order; plain click clears any prior multi-selection and re-anchors. Selection survives expand/collapse. When 1+ nodes are selected, the tree header surfaces Merge siblings / Drop / Stage move to… / Stage tag with… / Clear. Stage move/tag (`-stage-move`, `-stage-tag`) land via Sprint C's `core::suggest::stage_*` path. **Partial:** "selecting a cluster includes its subtree implicitly for bulk-action purposes" isn't yet wired — the toolbar reads exactly the selected ids, no descendant expansion. Bulk policy-apply across the selection set is still a follow-up
 
 - **Plain click.** Clears any existing multi-selection and re-anchors on the clicked row. The row's primary affordance (open leaf, inline-edit cluster name, expand cluster) still fires — clicking a row isn't a "select this row" gesture on its own; it's a "use this row" gesture.
 - **Cmd-click / Ctrl-click.** Toggles the clicked row in the selection set and re-anchors on it (so subsequent shift-clicks pivot off the just-toggled row).
@@ -574,7 +686,15 @@ note:: the op is structural only — it never stages a pending edit and never in
 
 ## Per-node automation policy
 
-A policy can attach to a leaf, a mid-tree cluster, the root, or the outlier bucket — a saved tree is a *policy program*, not a single classifier with a knob. A note's effective policy at triage time is determined by walking from the note's leaf up the tree, taking the first ancestor with an explicit policy. No policy anywhere = no automation, the note is left alone (matches the existing "low confidence" tier behavior). [cluster-editor-policy-any-level, cluster-editor-policy-resolution-walk-up]
+A policy can attach to a leaf, a mid-tree cluster, the root, or the outlier bucket — a saved tree is a *policy program*, not a single classifier with a knob. [cluster-editor-policy-any-level]
+status:: done
+implements:: [[code:hiker/suggest/resolve_effective_policy]]
+note:: `core::trees::set_policy` already accepts policies on any node kind (cluster / leaf / outlier-bucket) — the table column carries an opaque `policy` JSON regardless of `kind`. `core::suggest::resolve_effective_policy` walks up via the parent chain, treating a leaf's own explicit policy as authoritative if set
+
+A note's effective policy at triage time is determined by walking from the note's leaf up the tree, taking the first ancestor with an explicit policy. No policy anywhere = no automation, the note is left alone (matches the existing "low confidence" tier behavior). [cluster-editor-policy-resolution-walk-up]
+status:: done
+implements:: [[code:hiker/suggest/resolve_effective_policy]]
+note:: `core/src/suggest.rs::resolve_effective_policy(by_id, node_id)` walks the parent chain returning the first node with `Some(NodePolicy)`; `None` means "no policy anywhere up to root" and the leaf is left alone (counted into `ApplyOutcome.unpolicied`)
 
 The outlier bucket gets its own policy slot for the canonical "send unsorted notes to `inbox/unsorted/`" or "tag them `unsorted`" flow. Setting a `Move` or `Tag` policy on the outlier bucket applies that policy to every note the placement classifier labels as outlier — no walk-up needed because outliers don't have a parent in the cluster sense. `Freeze` on the outlier bucket is a valid choice for "leave outliers in inbox; I'll triage them by hand." [cluster-editor-outlier-policy]
 status:: done
@@ -586,7 +706,15 @@ Three policy shapes — `Tag`, `Move`, and `Freeze` — covering the four meanin
 - **Tag(slug, require_review)** — produce an `apply_tag` row that writes the tag to the note's frontmatter (per [[spec:suggestions-mode-tag]]). When `require_review = false`, the row auto-accepts (subject to the global flag); when `true`, the row stays pending. Idempotent on accept. The slug-ified cluster name is written to the note's frontmatter: a cluster named `"Embedding research"` writes `embedding-research`. The default field is `hiker.suggested_tags` — a list of strings kept separate from the user's own `tags:` field — and is configurable via `[suggestions] tag_field` (in `vault/.hiker/config.toml`). A dedicated default field is greppable (`rg "suggested_tags:"`), mass-wipeable without touching the user's own tags, and namespaced away from the auto-tag enrichment system's constrained vocabulary at `.hiker/vocabulary.yaml` — two distinct systems. Setting `tag_field = "tags"` writes cluster tags into the user's main tag list instead; slug-ification applies regardless. [suggestions-tag-field-configurable]
 status:: planned
 note:: `[suggestions] tag_field` config; default `hiker.suggested_tags`, can be set to `tags` to use the regular list
-- **Move(folder, require_review)** — produce a `move_note` row that moves the file into the target folder (per [[spec:suggestions-mode-move]]). Same auto-accept / pending semantics. Subject to the scope-safety rule: triage never produces a `move_note` whose `source_path` is outside the configured triage scope (default `inbox/`). A tree saved over `research/` whose triage scope is `inbox/` only auto-moves notes currently under `inbox/`; notes the user placed elsewhere are off-limits to triage — moving them is an explicit user action (drag-drop or `hiker mv`). The worst case for an over-eager classifier is "wrong subfolder under inbox," never "your note moved out from under you."
+
+  The `apply_tag` row's content-merge mechanic. [suggestions-mode-tag]
+status:: done
+implements:: [[code:hiker/suggest/ACTION_APPLY_TAG]]
+note:: `core/src/suggest.rs::merge_tag_into_frontmatter` pre-computes the file content with the tag appended (idempotent — skipped if already present) under the configured `tag_field` (default `hiker.suggested_tags` per spec). The proposal carries `action = "apply_tag"`, the new content, `source_hash` for drift safety, and `metadata.tag_slug` / `tag_field`. Accept path is the existing content-write path (no new code)
+- **Move(folder, require_review)** — produce a `move_note` row that moves the file into the target folder (per [[spec:suggestions-mode-move]]). Same auto-accept / pending semantics. Subject to the scope-safety rule: triage never produces a `move_note` whose `source_path` is outside the configured triage scope (default `inbox/`). A tree saved over `research/` whose triage scope is `inbox/` only auto-moves notes currently under `inbox/`; notes the user placed elsewhere are off-limits to triage — moving them is an explicit user action (drag-drop or `hiker mv`). The worst case for an over-eager classifier is "wrong subfolder under inbox," never "your note moved out from under you." [suggestions-mode-move]
+status:: done
+touches:: [[code:hiker/suggest]]
+note:: `core/src/suggest.rs` stages a pending `Rename` op per move (`target_path = <folder>/<basename>`), authored `auto:cluster`, as part of a reorg batch. Skips no-op moves (target == source). Accept applies the `Rename` through the op log (`op_writes::flip_batch_status`), repointing the document's path; the filesystem move stays the caller's concern downstream of `core::vault::move_note`
 - **Freeze** — match is explicitly ignored. No staging row is produced. Useful for marking a subtree as "this is well-organized already, leave it alone."
 
 [cluster-editor-policy-types]
@@ -595,6 +723,12 @@ touches:: [[code:hiker/trees/types]]
 note:: `core/src/trees/types.rs::NodePolicy` — `Tag { slug, require_review }` / `Move { folder, require_review }` / `Freeze`, serialized as JSON tagged on `kind`. Apply pipeline (`core::suggest::apply_tree`) drives behavior off this enum
 
 `require_review` composes with the global `[triage].review_required` flag (default `true`) — a row auto-accepts only when *both* `policy.require_review == false` AND `config.review_required == false`. Either set to `true` forces the row to stay pending in the activity-detail Pending filter. The global flag is "force review on every triage match"; the per-node flag is "force review on this specific subtree" — useful for "I trust the saved tree's `research/` placements, but `inbox/projects/*` matches should always pause for me."
+
+The note's author class is a third input to this composition: an `Agent` classification reliably forces pending. [triage-author-class]
+status:: partial
+implements:: [[code:hiker/suggest/NoteAuthorClass]]
+touches:: [[code:hiker/suggest]]
+note:: evidence: Engine supports User vs Agent: `core/src/suggest.rs::NoteAuthorClass { User, Agent }` + `TriageInput.author_class` flow into `effective_requires_review = policy.require_review || author_class == Agent`, so an Agent classification reliably forces pending. **Gap:** no caller in Sprint D actually emits `Agent` against a real agent write. The on-save watcher spawn (the host ~line 1242) hardcodes `User`; `cluster_triage_run` accepts a string override but the only frontend caller passes nothing; `cluster_triage_enqueue` doesn't even carry the hint on its `RaptorTriageMatch` payload (consumer in `DirectWorkerHandlers::try_handle` also passes `User`). The agent-author detection mechanism (watcher event source vs staging-history recent-agent-write lookup vs an explicit producer-side hint on the task variant) lands with the auto-accept worker / cancellable queue. The `AUTHOR_AUTO_TRIAGE` constant ("auto:triage") is reserved on the auto-accept path; the user-accept path keeps `author = "user"` per `op-log.md`
 
 Confidence still flows through the matching engine — the descent classifier returns a target node and a confidence — but the **action** taken is driven by the matched node's resolved policy, not by a global threshold. A node's policy can carry an optional `min_confidence` parameter for users who want "auto-move this cluster only when match confidence ≥ 0.85"; that's a per-policy threshold, not a global one. [cluster-editor-policy-require-review]
 status:: done
@@ -613,6 +747,10 @@ note:: The watcher-subscriber spawn in the host (after `spawn_staging_recheck`) 
 - **Scheduled rerun** (opt-in) — `[triage] scheduled_rerun = "0 3 * * *"` (cron-shape per the existing settings model) re-runs triage over a configurable scope. The schedule fires submissions to `core::tasks` for each affected note, batched at `Low` priority so it doesn't block foreground work. [cluster-editor-triage-scheduled-rerun]
 status:: partial
 note:: the host — `parse_rerun_interval` parses a duration-string grammar (`30m`, `1h`, `6h`, `24h`, `7d`) and a tokio task ticks at the parsed interval, enqueueing one `RaptorTriageMatch` at `Priority::Low` per (saved-as-triage tree × note in scope), driven by the existing `[suggestions.triage].scope` prefix filter. Settings UI row already exists from Sprint D. **Partial:** the spec's grammar is cron-shape (e.g. the spec example `"0 3 * * *"`); the runtime accepts only the duration grammar above and silently logs + disables anything else — a user copy-pasting the documented cron example gets no scheduled rerun. Cron-shape support is tracked as [[spec:cluster-editor-triage-scheduled-rerun-cron-syntax]]
+
+  Accepting the documented cron-shape grammar so the spec's example actually schedules is the remaining sub-task. [cluster-editor-triage-scheduled-rerun-cron-syntax]
+status:: planned
+note:: accept the cron-shape grammar from the spec (`docs/cluster-editor.md` — `scheduled_rerun = "0 3 * * *"`) in `parse_rerun_interval` so the spec's documented example actually schedules. Likely pulls in a cron crate (or hand-rolled 5-field parser) and adapts the tokio ticker to fire on next-occurrence rather than fixed interval
 - **Modified-note rerun** (opt-in) — separate from scheduled: when an existing note (already placed or already in inbox) is meaningfully edited (defined as "embedding changed by more than X cosine distance from prior"), triage re-evaluates. Distinct from on-save because most saves don't change embeddings significantly; the cosine guard avoids re-triaging on every keystroke save. [cluster-editor-triage-modified-rerun]
 status:: partial
 implements:: [[code:hiker/config/patch/ELIGIBLE_VAULT]], [[code:hiker/config/patch/ELIGIBLE_USER]]
@@ -630,6 +768,26 @@ Triage outputs flow through the op log rather than mutating the vault directly. 
 status:: done
 implements:: [[code:hiker/suggest/triage_match]]
 note:: `core/src/suggest.rs::triage_match` stages one op-log op per match with `surface = "triage"`, author `auto:triage` — a `Move` policy stages a one-move reorg batch (pending `Rename`), a `Tag` policy stages a pending content op. When `effective_requires_review == false` the op is applied immediately (`op_writes::flip_batch_status(accept)`), matching the spec's `status = accepted` direct-apply path; otherwise it stays pending for review. `Freeze` policies and out-of-scope sources skip without emitting an op
+
+The op shape a triage match produces is the staging proposal. [triage-staging-proposals]
+status:: done
+implements:: [[code:hiker/config/sections/SuggestionsConfig]], [[code:hiker/suggest/SURFACE_TRIAGE]]
+touches:: [[code:hiker/suggest]]
+note:: `core::suggest::triage_match` stages a pending `Rename` (Move policy) or pending content op (Tag policy) authored `auto:triage` via `op_writes`, applied immediately when no review is required. `Freeze` policies and no-op (target == source) moves skip without emitting an op. Out-of-scope sources (per `[triage].scope`) also skip pre-emission
+
+The accept path is the shared apply mechanic — the same `core::suggest::apply_tree` that drives one-shot Apply. [suggestions-apply-cmd]
+status:: done
+implements:: [[code:hiker/suggest/apply_tree]]
+verifies:: [[code:hiker/suggest/tests/apply_tree_stages_tag_and_move_pending_ops]]
+note:: `core/src/suggest.rs::apply_tree(trees, tree_id, vault, store, log, history)` is the shared apply mechanic: `Move` leaves stage one cross-document reorg batch of pending `Rename` ops ([[spec:op-log-reorg-batch]], author `auto:cluster`), `Tag` leaves stage one pending content op each via `op_writes::stage_auto_content`. Nothing reaches disk until the user accepts in the batch-review pane. The UI path satisfies the slug per `docs/cluster-editor.md`'s Apply flow; the CLI binary lands as the sub-slug [[spec:suggestions-apply-cmd-cli]]
+
+The `hiker suggest apply` CLI surface is the sub-slug of the shared apply mechanic. [suggestions-apply-cmd-cli]
+status:: planned
+note:: sub-slug of [[spec:suggestions-apply-cmd]] — `hiker suggest apply <tree-id>` CLI surface with `--interactive` / `--accept-all` / `--dry-run`. `cli/src/main.rs` is currently a 3-line stub; this slug covers wiring it onto `core::suggest::apply_tree`
+
+An auto-accepted triage match surfaces a toast with a 10s Undo. [triage-auto-undo-toast]
+status:: planned
+note:: toast + 10s Undo fires from the auto-accept path; Undo logs to rejection history
 
 ### `[triage]` config
 
@@ -652,7 +810,10 @@ note:: | opts.review_required |  | author_class == Agent` and stamps it on `meta
 
 ## Batch-review pane (one-shot Apply)
 
-Clicking Apply on a draft tree runs the policy walk, emits one pending op per leaf whose resolved policy is `Tag` or `Move` (per [[spec:cluster-editor-apply-action]]), and opens the batch-review pane in place of the expanded tree view. The pane is the tree-scoped view of pending ops where `metadata.tree_id = <this tree>`.
+Clicking Apply on a draft tree runs the policy walk, emits one pending op per leaf whose resolved policy is `Tag` or `Move`, and opens the batch-review pane in place of the expanded tree view. The pane is the tree-scoped view of pending ops where `metadata.tree_id = <this tree>`. [cluster-editor-apply-action]
+status:: done
+verifies:: [[code:hiker/suggest/tests]]
+note:: `core/src/suggest.rs::apply_tree` walks the tree, runs `resolve_effective_policy` per leaf, and stages one pending edit per `Tag` / `Move` leaf — `surface = "cluster-editor"`, `metadata.tree_id`, `metadata.matched_node_id`, `metadata.policy_kind`, `metadata.require_review`, `metadata.tree_member_fingerprint`. Move rows carry `source_path`; Tag rows carry the pre-merged content + `source_hash` for drift safety. Skipped leaves (frozen / unpolicied / missing-note) are counted onto `ApplyOutcome`. `cluster_apply` command + UI [[spec:cluster-editor-pane-mode]] Apply button + auto-flip of tree `state` → `applied` once every emitted row resolves
 
 Layout (sketch):
 
@@ -678,7 +839,11 @@ status:: partial
 note:: `app/src/panels/cluster_review/mod.rs` filters op-log pending edits by `surface = "cluster-editor"` + `metadata.tree_id`, groups by action (Move / Tag), and paints per-row Accept / Reject (`op_writes::flip_op_status`, plus `cluster_record_rejection`) buttons plus Accept-all / Reject-all batch verbs (with confirm gate for N > 5 / always for reject-all). Conflicted rows show a `⚠` glyph + reason and disable Accept; the pane auto-flips the tree's `state` to `applied` once every row resolves. **Partial:** inline target-path edit (spec line 329) is deferred — Sprint C surfaces a Reject + re-Apply flow for adjustments instead
 
 - **Rows are grouped by `action`.** Move rows together, Tag rows together. Each group collapsible. Row order within a group: by `target_path` (Moves) or `slug` (Tags) so related items sit adjacent.
-- **Per-row Accept / Reject.** Same `core::ops::flip_op_status(op_id, Accepted | Rejected)` calls the activity-detail page uses; clicking accepts/rejects exactly that op.
+- **Per-row Accept / Reject.** Same `core::ops::flip_op_status(op_id, Accepted | Rejected)` calls the activity-detail page uses; clicking accepts/rejects exactly that op. A reject is recorded in the rejection history so a re-Apply skips the row. [suggestions-rejection-history]
+status:: partial
+implements:: [[code:hiker/suggest/compute_fingerprint]]
+touches:: [[code:hiker/suggest]]
+note:: `core/src/suggest.rs::RejectionHistory` owns `.hiker/suggestion-history.json` — per-`(fingerprint, note_path, action)` rows with a 90-day TTL (GC on every write). Cluster-editor batch-review pane calls `cluster_record_rejection` alongside the op-log reject (`op_writes::flip_op_status`) so the log is populated on every user reject; `apply_tree` consults the log and skips already-rejected rows. **Partial:** the fingerprint is Sprint C's coarse form (`hash(parent_cluster_name + note_path + action)`); the spec's member-set Jaccard recovery is a follow-up. TTL configurability is also deferred
 - **Inline edit of the target.** Click the `→ <path>` (or `+ <slug>`) to edit it in place — saves a new `target_path` / tag value on the staging row (re-using the in-flight `staging-amend`-shaped mechanic; if amend isn't wired yet, falls back to "reject this row + propose a new one with the edited target"). Useful for "the cluster name is right but the folder needs to be `research/embeddings-v2/` not `research/embeddings/`."
 - **Conflicted rows highlighted.** When a row's state is `conflicted` (per `staging-proposal-state`), the row gets a `⚠` glyph and the reason tooltip; Accept is disabled, Reject still works. Same display rules as the activity-detail page.
 - **Accept-all / Reject-all** are batch verbs over the visible (non-conflicted) rows. Confirm dialog when N > 5 for Accept-all; always confirm for Reject-all (rejecting agent/automation work is destructive).
@@ -779,6 +944,10 @@ A single eye-icon button lives on the **pane's pinned toolbar**, always visible 
 status:: done
 note:: Single eye-icon button on the pane's pinned toolbar (`app/src/panels/cluster_review/mod.rs`, always visible — not gated on the active variant) opens a unified popover with: (a) a "View as" radio (Tree / Graph / Markdown — replaces the prior 3-button toggle strip on the toolbar); (b) in tree mode, **Expand all** / **Collapse all** verbs over the pane-local expanded set (every cluster / outlier-bucket node added on expand-all; cleared on collapse-all); (c) in graph mode, the graph-specific items (leaves / layout radios + show-outliers / fit / reset / note-preview toggle) folded in. Glyph matches the editor toolbar's view-options icon. The view-mode radio refreshes the menu in place. Same menu primitive as the editor's view-options menu
 
+The "View as" radio is a sub-sub-mode of `cluster-tree`, not a new `BufferMode`. [cluster-editor-graph-view-toggle]
+status:: done
+note:: View-mode selector lives inside the unified eye-icon "View options" menu on the pane toolbar ([[spec:cluster-editor-graph-view-view-menu]]) — a "View as" radio with Tree / Graph / Markdown options, replacing the prior dedicated 3-button toggle strip. Sub-sub-mode of `cluster-tree`, not a new `BufferMode`. Switching destroys+remounts the canvas (no orphan WebGL refs); selection survives
+
 - **Leaf visibility.** Three modes: `Hide leaves` (only cluster nodes render), `Auto (LOD)` (leaves hidden when zoomed out below a threshold, fade in as the user zooms in — default), `Show all leaves` (every leaf node is always present in the canvas). [cluster-editor-graph-view-leaf-visibility]
 status:: done
 note:: View-menu radio: `Hide leaves` / `Auto (LOD)` (default — hidden when camera ratio ≥ 1.2) / `Show all leaves`. Persisted in saved view state
@@ -827,7 +996,9 @@ The row component (chevron + icon + name + summary preview + members count + pol
 status:: done
 note:: The shared row primitive lives in `app/src/sidebar/clusters/tree.rs`; both the sidebar (`app/src/sidebar/clusters/mod.rs`) and the expanded pane (`app/src/panels/cluster_review/mod.rs`) consume it. It carries: chevron + name (click-to-edit on clusters / click-to-open on leaves) + summary preview (click-to-edit) + members count + ↻ staleness badge + policy chip (popover: Tag/Move/Freeze/Clear) + outlier virtual node + Shift/Cmd/Ctrl-click selection (incl. shift-range via display-order anchor) + right-click context menu (Move to… / Split / Subcluster… / Merge children up / Summarize / Drop cluster / Send to outliers / Promote out of outliers…) + multi-select toolbar (Merge siblings / Drop / Summarize / Stage move to / Stage tag with / Clear) + drag-and-drop reparent with promote-to-top drop band and floating drag chip
 
-Trails and the vault-wide graph/map view (per `design.md`) deliberately do *not* reuse this row primitive — trails are sequential not hierarchical, and the vault graph's edge-rendering needs are fundamentally different from a tree's. The reuse is at the row-primitive level only.
+Trails and the vault-wide graph/map view (per `design.md`) deliberately do *not* reuse this row primitive — trails are sequential not hierarchical, and the vault graph's edge-rendering needs are fundamentally different from a tree's. The reuse is at the row-primitive level only. [cluster-editor-not-for-trails-or-graph]
+status:: planned
+note:: the row primitive isn't reused by trails or the vault graph view (different data models)
 
 The cluster editor *does* reuse the **graph renderer** (the egui force-graph widget per `design.md`'s graph-view bullet) for its own tree-shaped graph view (next section). The exclusion is about data models and surfaces, not about the underlying rendering primitive — the renderer pattern in `design.md` exists precisely so multiple surfaces can ride the same widget with their own data. [cluster-editor-renderer-reuse]
 status:: done
@@ -863,135 +1034,3 @@ note:: deferred — diff between two cluster trees (e.g. fresh build vs. saved t
 - `editor.md` — sidebar mode switcher lives in the editor's domain; this spec defines the cluster-trees mode body, the editor.md mode-switcher entry is owned there.
 - `settings.md` / `op-log.md` — pending ops carry their action in `OpKind` (`Rename` for moves, `SetFrontmatter` for tags); `surface = "triage"` and `surface = "cluster-editor"` in op metadata are produced by this doc's flows.
 - [[spec:keybind-registry]] — chord ids reserved: `cluster-editor.toggle-expand`, `cluster-editor.merge-siblings`, `cluster-editor.merge-up`, `cluster-editor.split`, `cluster-editor.regenerate`. Chords TBD; land when each action is wired.
-
-## Registry imports (from status.md)
-
-Entries imported from the retired status registry that had no anchor in this doc —
-re-home them into the relevant sections as the doc evolves.
-
-- **cluster-editor-sidebar-mode** — `app/src/clusters/sidebar/mod.rs` (+ `tree.rs`) renders the open-trees list with inline hierarchical rows (chevron + name + summary preview + member count + policy chip + row menu), expand/collapse per cluster, click a leaf to open the note in the editor pane. New-tree modal + actions menu anchor off the panel header. Refreshes on vault open. (The former sidebar mode-switcher framing is superseded by the egui-workbench multi-region sidebar — Clusters is now an independent dockable panel; see [[spec:sidebar-mode-switcher]]) [cluster-editor-sidebar-mode]
-  status:: done
-  touches:: [[code:hiker/clusters/sidebar]]
-- **cluster-editor-pane-expand** — the cluster-batch-review pane opens via the row menu's "Open in pane"; it starts in `cluster-tree` sub-mode and flips to `cluster-batch-review` after Apply. **Partial**: the spec'd `[⤢]` icon button on each tree row isn't wired yet (`app/src/clusters/sidebar/mod.rs:74`) [cluster-editor-pane-expand]
-  status:: partial
-  touches:: [[code:hiker/clusters/sidebar]]
-  note:: evidence: `app/src/clusters/sidebar/mod.rs` (row-menu "Open in pane"), `app/src/panels/cluster_review/mod.rs` (the pane)
-- **cluster-editor-pane-leaf-click-opens-note** — `app/src/sidebar/clusters/mod.rs` (sidebar) + `app/src/panels/cluster_review/mod.rs` (expanded pane) both route leaf-row clicks through the host-supplied open-note path [cluster-editor-pane-leaf-click-opens-note]
-  status:: done
-- **cluster-editor-pane-back-to-tree** — `app/src/panels/cluster_review/mod.rs` paints a `← Back to tree` button that flips the pane's sub-state back to `cluster-tree` without closing pending staging rows; activation stays on the same tab so the existing nav stack remains coherent [cluster-editor-pane-back-to-tree]
-  status:: done
-- **cluster-editor-new-tree-action** — Clusters accordion-header `+` split-button ([[spec:split-add-button]]): primary opens the review tab with default params; caret dropdown lists tree-creation presets. The panel body's old "Cluster trees" label + `+ New tree` button were removed. Algorithm choice happens inside the review tab. `cluster_tree_create` backend command preserved for tests / CLI [cluster-editor-new-tree-action]
-  status:: done
-  implements:: [[code:hiker/workbench_host/impl#[`HikerWbBehavior<'a>`][`Host<HikerWbTab, _>`]side_bar_action_buttons]]
-  touches:: [[code:hiker/clusters/panel]]
-  note:: evidence: `app/src/workbench_host.rs` (`side_bar_action_buttons`, clusters branch), `app/src/clusters/panel/mod.rs` (`ReviewConfig::open`)
-- **cluster-preset** — tree-creation presets (algorithm + source-type filter + post-confirm naming toggle) listed in the Clusters `+` caret; a pick opens the review tab prefilled. User presets are ordinary vault notes found by the frontmatter query ([[spec:store-note-query]]) — not under `.hiker/`; built-ins first, then user presets [cluster-preset]
-  status:: done
-  implements:: [[code:hiker/clusters/preset/Params]]
-  touches:: [[code:hiker/workbench_host]]
-  note:: evidence: `app/src/clusters/preset.rs` (`load` via `Store::query_notes` on `hiker.kind: cluster-preset`), `app/src/workbench_host.rs` (clusters `+` dropdown, cached in `clusters_state.preset_cache`)
-- **cluster-preset-defaults** — in-code default presets always shown: Semantic — Leiden / Semantic — HDBSCAN / From folders [cluster-preset-defaults]
-  status:: done
-  implements:: [[code:hiker/clusters/preset/builtins]]
-  note:: evidence: `app/src/clusters/preset.rs` (`builtins`)
-- **cluster-preset-save** — "Save preset" in the review tab writes an ordinary vault note (`hiker.kind: cluster-preset` + a `cluster_preset` params block, default `cluster-presets/<slug>.md`) + indexes it; the frontmatter query reloads it into the `+` dropdown. Discovery is by frontmatter, not path [cluster-preset-save]
-  status:: done
-  implements:: [[code:hiker/clusters/panel/impl#[`Review<'_>`]show]], [[code:hiker/clusters/preset/save]]
-  note:: evidence: `app/src/clusters/preset.rs` (`save`), `app/src/clusters/panel/mod.rs` (review-tab "Save preset")
-- **cluster-tree-migration** — one-time, idempotent relocation of legacy `.hiker/trees/<id>.md` trees to the visible default on vault open. Per tree: repoint the op-log doc to the new path (`oplog::writes::rename`, preserving its history) **before** moving the file bytes — the ordering that prevents a forked history; legacy files never op-log-seeded just have their bytes moved (the full-scan seeds them fresh). Skips a tree whose new path already exists; removes the empty `.hiker/trees/` shell; no-ops when `.hiker/trees/` is absent. Indexing is deferred to the indexer's initial full-scan (runs after `Db::new`), so no `Upsert`/suppression is needed in the migration [cluster-tree-migration]
-  status:: done
-  touches:: [[code:hiker/trees/store]]
-  note:: evidence: `core/src/trees/store.rs` (`migrate_legacy_trees`, run from `Db::new`)
-- **cluster-review-tab-from-new-tree-action** — Header `+ Suggest reorganization` button (`app/src/sidebar/clusters/mod.rs`), the sidebar `+`-button (clusters mode), and the mode-menu "New tree…" entry all open the `cluster-review` tab [cluster-review-tab-from-new-tree-action]
-  status:: done
-- **cluster-review-tab-from-recluster-action** — The cluster-row menu's "Recluster subtree…" entry (`app/src/sidebar/clusters/mod.rs`) opens the `cluster-review` tab in recluster-subtree mode. Backend `cluster_op_recluster_subtree` command is preserved for tests / CLI [cluster-review-tab-from-recluster-action]
-  status:: done
-- **cluster-review-tab-rebuild-prefill** — `clusterReviewTab::open({ kind: "rebuild", treeId })` fetches the tree row via `cluster_trees_list` and pre-populates name + scope + method + cluster params from the saved JSON. **Gap:** the host doesn't yet wire a "Rebuild" entry point on the mode menu / Evergreen tree-row menu, so the tab is only reachable programmatically (e.g. from a future menu entry). The mechanism lands here; the surface entry is the follow-up [cluster-review-tab-rebuild-prefill]
-  status:: partial
-- **cluster-review-tab-run-clustering** — Run button in `app/src/panels/cluster_review/mod.rs` calls `cluster_run_structural` which in turn calls `core::cluster::build_tree_structural` (forces `SummarizeMode::None` on the method's params and post-processes leaf-level cluster names to `"Cluster N"` member-count-descending). Result lives on the tab's in-memory state; no tree `.md` is written [cluster-review-tab-run-clustering]
-  status:: done
-  implements:: [[code:hiker/cluster/build/tree_structural]]
-- **cluster-review-tab-iterate** — Subsequent Run clicks clear `result` + `userRenamed` (`app/src/panels/cluster_review/mod.rs`) and re-run with the form's current values. No LLM cost per iteration since the structural pass doesn't invoke a summarizer [cluster-review-tab-iterate]
-  status:: done
-- **cluster-review-tab-structure-preview** — `renderResult` paints leaf clusters in member-count-descending order with placeholder name, member count, radius indicator, and a first-3-titles sample (resolved via `note_titles` map returned alongside the build DTO). Outliers render as a sibling block with the dashed border. **Gap:** does not reuse [[spec:cluster-editor-row-primitive]] (`renderNode`) — instead carries a thin variant in-module; the spec's row-primitive extraction note already flagged the extraction as deferred [cluster-review-tab-structure-preview]
-  status:: done
-- **cluster-review-tab-confirm-single-path** — Single `Confirm` button in `app/src/panels/cluster_review/mod.rs` replaces the old dual Confirm-and-name / Confirm-no-naming pair. Always persists the structural tree (placeholder names intact unless inline-renamed) and lands on the cluster sidebar via `app.clusters.selected_tree` (egui port has no separate cluster-pane tab kind yet). Never gated on `[llm].enabled`. Naming branch is opt-in via the new toggle (see [[spec:cluster-review-tab-confirm-with-naming-toggle]]) — when unchecked, Confirm skips the LLM step entirely [cluster-review-tab-confirm-single-path]
-  status:: done
-  implements:: [[code:hiker/trees/build_adapter/node_inserts]], [[code:hiker/clusters/panel/impl#[`Review<'_>`]show]], [[code:hiker/clusters/panel/impl#[`Review<'_>`]confirm]]
-- **cluster-review-tab-async-pass** — `app/src/panels/cluster_review/mod.rs::run_structural_streaming` kicks off `core::cluster::build_tree_structural_streaming` on a background tokio `spawn_blocking` worker (the egui frame loop enters the host runtime each tick so `Handle::current()` is live at call time). The pane stows the `tokio::sync::mpsc::Receiver<BuildEvent>` in an `Arc<Mutex<>>`; `drain_events` pulls events via `try_recv` at the top of each `show()` call and `ui.ctx().request_repaint()` keeps the frame loop ticking while the build is alive. The blocking `build_tree_structural` shim stays for tests [cluster-review-tab-async-pass]
-  status:: done
-  implements:: [[code:hiker/clusters/panel/impl#[`Review<'_>`]show]], [[code:hiker/clusters/panel/impl#[`Review<'_>`]run_structural_streaming]]
-  touches:: [[code:hiker/clusters/panel]]
-- **cluster-review-tab-result-view-toggle** — View toggle row above the result body in `render_result_panel` (`Tree` / `Graph` selectable_value pair). State lives on `ReviewPane.view` so it survives within the tab session. Markdown view not surfaced [cluster-review-tab-result-view-toggle]
-  status:: done
-  implements:: [[code:hiker/clusters/panel/result/impl#[`Review<'_>`]render_result_panel]]
-- **cluster-review-tab-view-state-survives-rerun** — The Run reset path in `app/src/panels/cluster_review/mod.rs` leaves `pane.view` (Tree/Graph) and `pane.expanded` (chevron set) intact across re-runs — only the in-flight build state (`result`, `live_top`, `live_pending_children`, `phase`, `counters`, `started_at`, `user_renamed`, `editing`) is cleared. Stale node ids in `expanded` from a prior run are harmless: lookups against the new run's fresh ids return false [cluster-review-tab-view-state-survives-rerun]
-  status:: done
-- **cluster-review-tab-result-expand** — Each cluster row carries a `▶`/`▼` chevron. `ReviewPane.expanded: HashSet<NodeId>` tracks which rows are expanded; toggling switches between graph and tree views preserves the set. Expanded branch clusters render their sub-clusters inline via recursive `render_cluster_row` at deeper indent; leaf clusters render their note members (capped at 50 rows before a "and N more" footer). The expand affordance replaces the legacy flat first-3-titles sample [cluster-review-tab-result-expand]
-  status:: done
-  implements:: [[code:hiker/clusters/panel/result/impl#[`Review<'_>`]render_cluster_row]]
-- **cluster-review-tab-transition-to-pane** — On Confirm the tab is closed and a `cluster-pane` tab opens for the new tree id (transition handled in `app/src/panels/cluster_review/mod.rs`). User stays on the same visible tab; the chrome swaps to the cluster editor pane for the newly-persisted tree. **Note:** implemented as close-and-open rather than literal in-place kind flip — the two tabs are keyed differently so a flip would conflict with the cluster-pane's per-tree dedup [cluster-review-tab-transition-to-pane]
-  status:: done
-  implements:: [[code:hiker/clusters/panel/impl#[`Review<'_>`]confirm]]
-- **cluster-review-tab-no-persistence-until-confirm** — `cluster_run_structural` returns a DTO that lives only in the cluster-review module's per-tab state. no tree `.md` is written until Confirm. Closing the tab drops the pane state via `clusterReviewTab.dropTab`; autosave only persists `(kind, path-key)`, not the form or result [cluster-review-tab-no-persistence-until-confirm]
-  status:: done
-- **cluster-editor-sapling-evergreen-lifecycle** — Sapling's once-and-done path (Sprint C) plus the Evergreen path (Sprint D). Save-as-triage button in `app/src/panels/cluster_review/mod.rs` flips the tree's `state` to `saved-as-triage` via `cluster_tree_set_state`; the watcher subscription in the host then runs `core::suggest::triage_all_saved_trees` on every Modified/Created/Renamed event whose path is inside the triage scope, emitting `surface = "triage"` staging rows per matched policy [cluster-editor-sapling-evergreen-lifecycle]
-  status:: done
-- **cluster-editor-multi-select-stage-move** — `core::suggest::stage_moves` (per [[spec:op-log-reorg-batch]]) + `app/src/sidebar/clusters/mod.rs` multi-select toolbar's "Stage move to…" verb. Stages one pending `Rename` op per selected leaf via `core::ops::op_writes::stage_reorg_batch`, all sharing one cross-document `batch_id`, authored `auto:cluster` with `surface = "cluster-editor"`. Accept/reject flow through the op-log review surfaces (`flip_op_status` / batch `flip_batch_status`); partial apply allowed (a target collision skips that move, not the rest). No-op moves (target == source) skipped [cluster-editor-multi-select-stage-move]
-  status:: done
-  implements:: [[code:hiker/suggest/stage_moves]], [[code:hiker/clusters/sidebar/impl#[`ClusterCtx<'_, '_>`]stage_forms_inline]]
-  touches:: [[code:hiker/suggest]]
-- **cluster-editor-multi-select-stage-tag** — `core::suggest::stage_tags` + multi-select toolbar's "Stage tag with…" verb. Pre-computes the file content with the tag merged into the configured `tag_field` (default `hiker.suggested_tags`) via `merge_tag_into_frontmatter`, then stages it as one pending `SetFrontmatter`-shaped op via `core::ops::op_writes::stage_auto_content` authored `auto:cluster` [cluster-editor-multi-select-stage-tag]
-  status:: done
-  implements:: [[code:hiker/suggest/stage_tags]], [[code:hiker/clusters/sidebar/impl#[`ClusterCtx<'_, '_>`]stage_forms_inline]]
-  touches:: [[code:hiker/suggest]]
-- **cluster-editor-multi-select** — `app/src/sidebar/clusters/mod.rs` (+ `tree.rs`) — Shift / Cmd / Ctrl-click distinctions (split out from the old single "any modifier toggles" path by [[spec:cluster-editor-multi-select-shift-range]]). Cmd/Ctrl-click toggles a single row in the tree's selection set and re-anchors; Shift-click extends from anchor through clicked id in current display order; plain click clears any prior multi-selection and re-anchors. Selection survives expand/collapse. When 1+ nodes are selected, the tree header surfaces Merge siblings / Drop / Stage move to… / Stage tag with… / Clear. Stage move/tag (`-stage-move`, `-stage-tag`) land via Sprint C's `core::suggest::stage_*` path. **Partial:** "selecting a cluster includes its subtree implicitly for bulk-action purposes" isn't yet wired — the toolbar reads exactly the selected ids, no descendant expansion. Bulk policy-apply across the selection set is still a follow-up [cluster-editor-multi-select]
-  status:: partial
-- **cluster-editor-policy-any-level** — `core::trees::set_policy` already accepts policies on any node kind (cluster / leaf / outlier-bucket) — the table column carries an opaque `policy` JSON regardless of `kind`. `core::suggest::resolve_effective_policy` walks up via the parent chain, treating a leaf's own explicit policy as authoritative if set [cluster-editor-policy-any-level]
-  status:: done
-  implements:: [[code:hiker/suggest/resolve_effective_policy]]
-- **cluster-editor-policy-resolution-walk-up** — `core/src/suggest.rs::resolve_effective_policy(by_id, node_id)` walks the parent chain returning the first node with `Some(NodePolicy)`; `None` means "no policy anywhere up to root" and the leaf is left alone (counted into `ApplyOutcome.unpolicied`) [cluster-editor-policy-resolution-walk-up]
-  status:: done
-  implements:: [[code:hiker/suggest/resolve_effective_policy]]
-- **trees-md-frontmatter** — Frontmatter carries tree metadata only: `hiker.{kind,id,name,source,state,scope,method,created_at}`. No `nodes` list — the structure lives in the body outline (see [[spec:tree-md-outline-body]]). Unknown frontmatter keys preserved on round-trip. Centroids are NOT stored in the doc (see [[spec:trees-centroids-index]]) [trees-md-frontmatter]
-  status:: planned
-- **tree-md-outline-body** — The tree's structure is the editable outline in the `.md` body (not frontmatter): headings = clusters (depth = heading level), nested bullets = deeper clusters + leaves, leaf = a bullet wikilink, summary = the paragraph under a heading. Frontmatter holds tree metadata only [tree-md-outline-body]
-  status:: planned
-- **tree-broken-leaf** — A leaf whose path doesn't resolve renders greyed with a broken-reference pill and stays in its cluster for the user to repoint or remove — same safety net as a broken board card [tree-broken-leaf]
-  status:: planned
-- **cluster-editor-apply-action** — `core/src/suggest.rs::apply_tree` walks the tree, runs `resolve_effective_policy` per leaf, and stages one pending edit per `Tag` / `Move` leaf — `surface = "cluster-editor"`, `metadata.tree_id`, `metadata.matched_node_id`, `metadata.policy_kind`, `metadata.require_review`, `metadata.tree_member_fingerprint`. Move rows carry `source_path`; Tag rows carry the pre-merged content + `source_hash` for drift safety. Skipped leaves (frozen / unpolicied / missing-note) are counted onto `ApplyOutcome`. `cluster_apply` command + UI [[spec:cluster-editor-pane-mode]] Apply button + auto-flip of tree `state` → `applied` once every emitted row resolves [cluster-editor-apply-action]
-  status:: done
-  verifies:: [[code:hiker/suggest/tests]]
-- **cluster-editor-triage-scheduled-rerun-cron-syntax** — accept the cron-shape grammar from the spec (`docs/cluster-editor.md` — `scheduled_rerun = "0 3 * * *"`) in `parse_rerun_interval` so the spec's documented example actually schedules. Likely pulls in a cron crate (or hand-rolled 5-field parser) and adapts the tokio ticker to fire on next-occurrence rather than fixed interval [cluster-editor-triage-scheduled-rerun-cron-syntax]
-  status:: planned
-- **cluster-editor-not-for-trails-or-graph** — the row primitive isn't reused by trails or the vault graph view (different data models) [cluster-editor-not-for-trails-or-graph]
-  status:: planned
-- **cluster-editor-graph-view-toggle** — View-mode selector lives inside the unified eye-icon "View options" menu on the pane toolbar ([[spec:cluster-editor-graph-view-view-menu]]) — a "View as" radio with Tree / Graph / Markdown options, replacing the prior dedicated 3-button toggle strip. Sub-sub-mode of `cluster-tree`, not a new `BufferMode`. Switching destroys+remounts the canvas (no orphan WebGL refs); selection survives [cluster-editor-graph-view-toggle]
-  status:: done
-- **suggestions-apply-cmd** — `core/src/suggest.rs::apply_tree(trees, tree_id, vault, store, log, history)` is the shared apply mechanic: `Move` leaves stage one cross-document reorg batch of pending `Rename` ops ([[spec:op-log-reorg-batch]], author `auto:cluster`), `Tag` leaves stage one pending content op each via `op_writes::stage_auto_content`. Nothing reaches disk until the user accepts in the batch-review pane. The UI path satisfies the slug per `docs/cluster-editor.md`'s Apply flow; the CLI binary lands as the sub-slug [[spec:suggestions-apply-cmd-cli]] [suggestions-apply-cmd]
-  status:: done
-  implements:: [[code:hiker/suggest/apply_tree]]
-  verifies:: [[code:hiker/suggest/tests/apply_tree_stages_tag_and_move_pending_ops]]
-- **suggestions-apply-cmd-cli** — sub-slug of [[spec:suggestions-apply-cmd]] — `hiker suggest apply <tree-id>` CLI surface with `--interactive` / `--accept-all` / `--dry-run`. `cli/src/main.rs` is currently a 3-line stub; this slug covers wiring it onto `core::suggest::apply_tree` [suggestions-apply-cmd-cli]
-  status:: planned
-- **suggestions-rejection-history** — `core/src/suggest.rs::RejectionHistory` owns `.hiker/suggestion-history.json` — per-`(fingerprint, note_path, action)` rows with a 90-day TTL (GC on every write). Cluster-editor batch-review pane calls `cluster_record_rejection` alongside the op-log reject (`op_writes::flip_op_status`) so the log is populated on every user reject; `apply_tree` consults the log and skips already-rejected rows. **Partial:** the fingerprint is Sprint C's coarse form (`hash(parent_cluster_name + note_path + action)`); the spec's member-set Jaccard recovery is a follow-up. TTL configurability is also deferred [suggestions-rejection-history]
-  status:: partial
-  implements:: [[code:hiker/suggest/compute_fingerprint]]
-  touches:: [[code:hiker/suggest]]
-- **suggestions-mode-move** — `core/src/suggest.rs` stages a pending `Rename` op per move (`target_path = <folder>/<basename>`), authored `auto:cluster`, as part of a reorg batch. Skips no-op moves (target == source). Accept applies the `Rename` through the op log (`op_writes::flip_batch_status`), repointing the document's path; the filesystem move stays the caller's concern downstream of `core::vault::move_note` [suggestions-mode-move]
-  status:: done
-  touches:: [[code:hiker/suggest]]
-- **suggestions-mode-tag** — `core/src/suggest.rs::merge_tag_into_frontmatter` pre-computes the file content with the tag appended (idempotent — skipped if already present) under the configured `tag_field` (default `hiker.suggested_tags` per spec). The proposal carries `action = "apply_tag"`, the new content, `source_hash` for drift safety, and `metadata.tag_slug` / `tag_field`. Accept path is the existing content-write path (no new code) [suggestions-mode-tag]
-  status:: done
-  implements:: [[code:hiker/suggest/ACTION_APPLY_TAG]]
-- **triage-staging-proposals** — `core::suggest::triage_match` stages a pending `Rename` (Move policy) or pending content op (Tag policy) authored `auto:triage` via `op_writes`, applied immediately when no review is required. `Freeze` policies and no-op (target == source) moves skip without emitting an op. Out-of-scope sources (per `[triage].scope`) also skip pre-emission [triage-staging-proposals]
-  status:: done
-  implements:: [[code:hiker/config/sections/SuggestionsConfig]], [[code:hiker/suggest/SURFACE_TRIAGE]]
-  touches:: [[code:hiker/suggest]]
-- **triage-author-class** — | opts.review_required |  | author_class == Agent`, so an Agent classification reliably forces pending. **Gap:** no caller in Sprint D actually emits `Agent` against a real agent write. The on-save watcher spawn (the host ~line 1242) hardcodes `User`; `cluster_triage_run` accepts a string override but the only frontend caller passes nothing; `cluster_triage_enqueue` doesn't even carry the hint on its `RaptorTriageMatch` payload (consumer in `DirectWorkerHandlers::try_handle` also passes `User`). The agent-author detection mechanism (watcher event source vs staging-history recent-agent-write lookup vs an explicit producer-side hint on the task variant) lands with the auto-accept worker / cancellable queue. The `AUTHOR_AUTO_TRIAGE` constant ("auto:triage") is reserved on the auto-accept path; the user-accept path keeps `author = "user"` per `op-log.md` [triage-author-class]
-  status:: partial
-  implements:: [[code:hiker/suggest/NoteAuthorClass]]
-  touches:: [[code:hiker/suggest]]
-  note:: evidence: Engine supports User vs Agent: `core/src/suggest.rs::NoteAuthorClass { User, Agent }` + `TriageInput.author_class` flow into `effective_requires_review = policy.require_review
-- **triage-auto-undo-toast** — toast + 10s Undo fires from the auto-accept path; Undo logs to rejection history [triage-auto-undo-toast]
-  status:: planned

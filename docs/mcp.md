@@ -32,7 +32,9 @@ Hiker exposes its vault as an MCP server so external agents (Claude Code, Goose,
 - A read `Store` clone (for read tools — shares the existing `read_store` pool from the arch cleanup).
 - The vault's `Vault` for path resolution + abs-path translation when needed.
 
-Tokio task lifecycle: spawned at vault open *only when `[mcp] enabled`*, dropped at vault close. The HTTP listener binds an ephemeral port; the bound address is written to `vault/.hiker/mcp.json` for agents to discover. Listener task drains gracefully on close. Toggling `enabled` at runtime binds/unbinds in place (below).
+Tokio task lifecycle: spawned at vault open *only when `[mcp] enabled`*, dropped at vault close. The HTTP listener binds an ephemeral port; the bound address is written to `vault/.hiker/mcp.json` for agents to discover. Listener task drains gracefully on close. Toggling `enabled` at runtime binds/unbinds in place (below). [mcp-server-crate]
+status:: done
+note:: `mcp-server/` is now a library crate; `hiker_mcp::start(McpDeps) -> McpServerHandle` spawns an axum task wrapping `rmcp::StreamableHttpService`. the host (`open_vault_at_inner` → `start_mcp`) brings it up on vault open; the handle drops on session swap, cancelling the task and removing the discovery file. `mcp-server/tests/smoke.rs` exercises the full HTTP path
 
 
 ## Tool surface
@@ -45,7 +47,10 @@ Read + write tools, covering the cases with concrete value today and leaving roo
 status:: done
 touches:: [[code:hiker/handler]]
 note:: `mcp-server/src/handler.rs::HikerHandler::search_notes` wraps `core::search::query`; returns lexical_hits + semantic_hits + fused. `top_k` clamps the fused bucket to `[mcp] max_top_k`. Embedder unavailability surfaces as `1005 indexer_unavailable`
-- **`get_note(rel_path: string, detail?: 'digest'|'snippet'|'full')`** — fetch a single note. `digest` returns id + title + (when summary enrichment lands) cached summary. `snippet` returns top-1 chunk + heading_path. `full` returns the entire body. Default for explicit `get_note` calls is `full`; multi-hit search responses default to `digest`. [mcp-tool-get-note, mcp-progressive-disclosure]
+- **`get_note(rel_path: string, detail?: 'digest'|'snippet'|'full')`** — fetch a single note. `digest` returns id + title + (when summary enrichment lands) cached summary. `snippet` returns top-1 chunk + heading_path (chunk 0 from the store when available, fallback head-of-file otherwise). `full` returns the entire body. Missing files return `1002 note_not_found`. [mcp-tool-get-note]
+status:: done
+note:: evidence: `HikerHandler::get_note`; `detail = digest
+  Default for explicit `get_note` calls is `full`; multi-hit search responses default to `digest`. [mcp-progressive-disclosure]
 - **`related_notes(rel_path: string, top_k?: number)`** — wraps the existing [[spec:related-notes-query]]. Returns the same `RelatedHit` shape the UI's related panel already consumes. [mcp-tool-related-notes]
 status:: done
 note:: `HikerHandler::related_notes` calls `Store::related_notes`; `top_k` capped by `[mcp] max_top_k`. Unindexed source returns an empty vec rather than erroring
@@ -79,7 +84,11 @@ When `review_required` is on (per [[spec:agent-write-review-mode]]), an agent's 
 - **`list_pending_proposals(filter?)`** — list pending edits visible to MCP (default scope `surface = "mcp-tool-call"`); returns `{ proposal_id, target_path, action, surface, session_id, created_at, content_hash }` per proposal, no body. [mcp-tool-list-pending-proposals]
 status:: planned
 note:: wraps the op-log pending query (`op_writes::list_pending_proposals`) with default `surface = "mcp-tool-call"` so the agent sees only MCP-originated proposals. Returns id + target_path + action + surface + session_id + created_at + content_hash; no body. Read-only; honors per-tool toggle. Lets an agent confirm its staged write landed when `get_note` returns 1002
-- **`get_pending_proposal(proposal_id)`** — one pending edit's metadata + proposed `content`; read-only (accept/reject is human-only). For `edit_note`-shaped proposals it adds an `anchors` array (one per `Replace` in the batch, resolved by shared `batch_id`) recomputed against `materialize(accepted)`, each `{ edit_index, anchor_status, old_str_preview }` where `anchor_status` is `holds` (matches once) / `drifted` (zero matches) / `ambiguous` (>1 match, edit wasn't `replace_all`). Racy by construction. Whole-document proposals omit `anchors` (treat absence as "n/a"). [mcp-tool-get-pending-proposal, mcp-pending-proposal-anchor-status]
+- **`get_pending_proposal(proposal_id)`** — one pending edit's metadata + proposed `content`; read-only (accept/reject is human-only). Wraps the op-log pending lookup by id; returns full metadata + proposed body. A `1002`-style error when the id is unknown (accepted / rejected / never existed). Agents cannot accept or reject from MCP — that stays a human-in-the-loop action. [mcp-tool-get-pending-proposal]
+status:: planned
+
+  For `edit_note`-shaped proposals it adds an `anchors` array (one per `Replace` in the batch, resolved by shared `batch_id`) recomputed against buffer-if-open-else-disk, each `{ edit_index, anchor_status, old_str_preview }` where `anchor_status` is `holds` (matches once) / `drifted` (zero matches) / `ambiguous` (>1 match, edit wasn't `replace_all`), plus `target: "buffer"|"disk"`. Per-edit, joint-batch (resolved via shared `batch_id`); omitted entirely for whole-document shapes (treat absence as "n/a"). Racy by construction (true at read time only). Lets the agent detect doomed staged edits in a concurrent-edit workflow and amend before the user clicks Accept, instead of finding out via drift-at-apply. [mcp-pending-proposal-anchor-status]
+status:: planned
 - **`amend_pending_proposal(proposal_id, new_content)`** — replace a pending edit's payload in place (same `metadata.client_id` only; whole-document shapes only — `edit_note` batches re-issue after accept/reject). Recomputes `content_hash`, stamps `amended_at_ms`, increments `amend_count`, discards the prior payload (no version history), fires the op-log pending-change events so an open review surface re-renders. If the user has already accepted, the proposal has left the queue and the call returns `1002` — "amend works until the user takes action," so the human still gets exactly one gate per accepted change. [mcp-tool-amend-pending-proposal]
 status:: planned
 note:: new MCP write tool letting an agent revise its own pending proposal in place before the user reviews. Same-client only; whole-file shapes only (`write_note` / `set_frontmatter` / `apply_tag`); `edit_note` batch-shape amend deferred. No version history — overwrites the stored body, bumps `metadata.amended_at_ms` + `metadata.amend_count`, recomputes `content_hash`. Fires op-log change events so an open review surface re-renders. User-accept races resolve in the pending store's transaction (last-write to the amend). Per-tool toggle `[mcp.tools].amend_pending_proposal_enabled`. Unblocks the "agent realized its first attempt was wrong" workflow without breaking the one-human-gate-per-change model
@@ -94,6 +103,9 @@ All writes route through `core::ops`. Every agent write carries the `Author::Age
 status:: partial
 touches:: [[code:hiker/handler/dispatch]]
 note:: `mcp-server/src/handler/dispatch.rs::save_note` / `merge_frontmatter` / `update_tag` stage an op-log pending edit (via `op_writes::stage_agent_edits`) when `[mcp.tools].review_required` is on and return `status: "staged"` + `proposal_id`. Tool description strings call out the staged behavior so agents don't read a staged write as a failed write. **Partial**: (a) the agent-facing introspection tools ([[spec:mcp-tool-list-pending-proposals]], [[spec:mcp-tool-get-pending-proposal]]) are specced but not implemented; (b) [[spec:mcp-tool-edit-note]] adds `propose_batch` and per-edit proposals per `staging-per-edit-proposals`
+
+The disk-vs-staging boundary is explicit: `HikerHandler::get_note` resolves `vault.abs_path(rel_path)` and returns `1002 note_not_found` when the file doesn't exist on disk; pending proposals are not transparently surfaced. Agents discover staged content via the introspection tools, keeping the boundary explicit. [mcp-staging-read-disk-only]
+status:: done
 
 - **`write_note(rel_path: string, content: string, expected_hash?: string)`** — create or replace a note's body. If `expected_hash` is provided, the write is drift-aware (checks against `materialize(accepted)`); without it, an unconditional write. Refuses paths under `.hiker/`. Stamps `hiker.author: agent-authored` on the resulting frontmatter *only when the target path did not previously exist* (per [[spec:mcp-author-stamp-on-create-only]]). When the target path already exists, the call requires the agent to have read the note in the current session via `get_note` first (`1008 read_required`); see [[spec:mcp-read-before-write]]. Creates are exempt. Returns the new content hash. [mcp-tool-write-note]
 status:: done
@@ -122,6 +134,9 @@ status:: done
 implements:: [[code:hiker/frontmatter/DELIMITER]], [[code:hiker/ops/agent/set_frontmatter]]
 note:: new `core/src/frontmatter.rs` (split/merge/assemble); `core::ops::agent_set_frontmatter` reads existing, deep-merges patch via `merge_agent_patch`, stamps `hiker.author: agent-authored`, routes through `agent_write_note`. Errors `invalid_params` if `fields` isn't a JSON object
 - **`apply_tag(rel_path: string, tag: string)`** / **`remove_tag(rel_path: string, tag: string)`** — convenience wrappers over `set_frontmatter` for the most common case. [mcp-tool-apply-tag]
+- `core::ops::agent_apply_tag` / `agent_remove_tag` are thin wrappers over `agent_set_frontmatter` operating on the `tags` list; idempotent (no-op when the tag is already present / absent). [mcp-tool-apply-tag-remove-tag]
+status:: done
+implements:: [[code:hiker/ops/agent/apply_tag]], [[code:hiker/ops/agent/read_existing_tags]]
 
 ### Trail tools
 
@@ -180,7 +195,20 @@ note:: `mcp-server/src/handler/{router,dispatch}.rs` (`board_set_card_text` → 
 - **`board_remove_card(board_rel_path, card_id)`** — drop a card from the board (the referenced note is untouched). Wraps `core::boards::ops::remove_card`. [mcp-tool-board-remove-card]
 status:: done
 note:: `mcp-server/src/handler/{router,dispatch}.rs` (`board_remove_card` → `remove_board_card`) drives `core::boards::ops::preview_edit(BoardEdit::RemoveCard)`; referenced note untouched; review stages, direct commits; toggle `mcp.tools.board_remove_card_enabled`
-- **`board_add_column(board_rel_path, name)`** / **`board_rename_column(board_rel_path, old_name, new_name)`** / **`board_reorder_column(board_rel_path, name, to_index)`** / **`board_delete_column(board_rel_path, name)`** — column management; delete drops that column's card references (notes untouched). Wrap the matching `core::boards::ops::*_column` verbs. [mcp-tool-board-add-column, mcp-tool-board-rename-column, mcp-tool-board-reorder-column, mcp-tool-board-delete-column]
+Column management wraps the matching `core::boards::ops::*_column` verbs; delete drops that column's card references (notes untouched).
+
+- **`board_add_column(board_rel_path, name)`** — append a column. [mcp-tool-board-add-column]
+status:: done
+note:: `mcp-server/src/handler/{router,dispatch}.rs` (`board_add_column` → `add_board_column`) drives `core::boards::ops::preview_edit(BoardEdit::AddColumn)`; idempotent on name collision (`status:"noop"`); review stages, direct commits; smoke `board_write_tools_round_trip_direct` + `board_create_commits_directly_even_in_review_mode`; toggle `mcp.tools.board_add_column_enabled`
+- **`board_rename_column(board_rel_path, old_name, new_name)`** — rename a column. [mcp-tool-board-rename-column]
+status:: done
+note:: `mcp-server/src/handler/{router,dispatch}.rs` (`board_rename_column` → `rename_board_column`) drives `core::boards::ops::preview_edit(BoardEdit::RenameColumn)`; review stages, direct commits; smoke `board_write_tools_round_trip_direct`; toggle `mcp.tools.board_rename_column_enabled`
+- **`board_reorder_column(board_rel_path, name, to_index)`** — reorder a column. [mcp-tool-board-reorder-column]
+status:: done
+note:: `mcp-server/src/handler/{router,dispatch}.rs` (`board_reorder_column` → `reorder_board_column`) drives `core::boards::ops::preview_edit(BoardEdit::ReorderColumn)`; clamps `to_index` to tail; review stages, direct commits; toggle `mcp.tools.board_reorder_column_enabled`
+- **`board_delete_column(board_rel_path, name)`** — delete a column; drops that column's card references (notes untouched). [mcp-tool-board-delete-column]
+status:: done
+note:: `mcp-server/src/handler/{router,dispatch}.rs` (`board_delete_column` → `delete_board_column`) drives `core::boards::ops::preview_edit(BoardEdit::DeleteColumn)`; drops the column's card refs (notes untouched); review stages, direct commits; toggle `mcp.tools.board_delete_column_enabled`
 
 `repoint_card` (path-conflict resolution) is intentionally **not** exposed — re-pointing a card whose note identity changed is a human-judgment call surfaced as the board's Keep/Repoint/Break modal, not an agent action.
 
@@ -237,6 +265,9 @@ Every accepted MCP-driven write produces two artifacts, plus a frontmatter stamp
 
 1. **An accepted write into `accepted` + the `.md`** (per `op-log.md`) — folded into the layered model and written atomically, with a plain-file snapshot for local history. When git is integrated, the save also commits with `Hiker-Author: agent:<client-id>` (`git.md`) — the durable, self-describing attribution record. (In review mode the proposed edit lives in `.pending` until the user accepts; the write lands on accept.) Local history rollback reads a snapshot (`op-log.md` "Local history").
 2. **An entry in `vault/.hiker/agent-log/<YYYY-MM-DD>.jsonl`** — the audit log, per `llm.md`. Records the MCP call itself (tool name, input, response status, timestamp) for telemetry/debugging — a durable provenance log, separate from the content-change record (snapshots + git). [mcp-audit-log-jsonl]
+
+`mcp-server/src/audit.rs::AuditLog` appends one JSONL row per call to `<vault>/.hiker/agent-log/<YYYY-MM-DD>.jsonl` with `surface="mcp-tool-call"`. When `[mcp.audit] log_full_input = false` (default), bulky fields (`content`, `query`, `fields`) are redacted to `{redacted: true, len: N}`. [mcp-audit-log-mcp-calls]
+status:: done
 
 **Frontmatter stamp on creation only.** When `write_note` brings a note into existence (the target path didn't exist), the resulting frontmatter carries `hiker.author: agent-authored` (and optionally `hiker.provenance: mcp-<client-id>`). Every other write tool — `write_note` against an existing path, `edit_note`, `set_frontmatter`, `apply_tag`, `remove_tag` — skips the stamp. The frontmatter field expresses *origin*; per-modification provenance lives on the write's `Author` class (the git `Hiker-Author` trailer when git is integrated). [mcp-author-stamp-on-create-only]
 status:: planned
@@ -402,33 +433,3 @@ Loader and validator land alongside the v3 milestone. Until then the section is 
 - `git.md` — the `Hiker-Author` commit trailer that carries agent authorship when git is integrated (the durable attribution record).
 - `llm.md` — `core::llm` background/fan-out (the other LLM surface). The MCP server here is the *sole* agent surface — no in-app chat, no ACP. External agents are the MCP clients connecting to this server.
 - Future MCP tools (post-v3): trails-related (`list_trails` / `get_trail`), landmark-related (`list_landmarks`), collection-related (`list_collections` / `get_collection`), bulk write tools (`move_note` / `delete_note`), chunk-context (`expand_chunk` / `get_note_context`), streaming notifications. Each lands when its backing feature does, advertised dynamically.
-
-## Registry imports (from status.md)
-
-Entries imported from the retired status registry that had no anchor in this doc —
-re-home them into the relevant sections as the doc evolves.
-
-- **mcp-server-crate** — `mcp-server/` is now a library crate; `hiker_mcp::start(McpDeps) -> McpServerHandle` spawns an axum task wrapping `rmcp::StreamableHttpService`. the host (`open_vault_at_inner` → `start_mcp`) brings it up on vault open; the handle drops on session swap, cancelling the task and removing the discovery file. `mcp-server/tests/smoke.rs` exercises the full HTTP path [mcp-server-crate]
-  status:: done
-- **mcp-audit-log-mcp-calls** — `mcp-server/src/audit.rs::AuditLog` appends one JSONL row per call to `<vault>/.hiker/agent-log/<YYYY-MM-DD>.jsonl` with `surface="mcp-tool-call"`. When `[mcp.audit] log_full_input = false` (default), bulky fields (`content`, `query`, `fields`) are redacted to `{redacted: true, len: N}` [mcp-audit-log-mcp-calls]
-  status:: done
-- **mcp-tool-get-note** — snippet | full`. Snippet uses chunk 0 from the store when available, fallback head-of-file otherwise. Missing files return `1002 note_not_found` [mcp-tool-get-note]
-  status:: done
-  note:: evidence: `HikerHandler::get_note`; `detail = digest
-- **mcp-tool-apply-tag-remove-tag** — `core::ops::agent_apply_tag` / `agent_remove_tag` thin wrappers over `agent_set_frontmatter` operating on the `tags` list. Idempotent (no-op when tag is already present / absent) [mcp-tool-apply-tag-remove-tag]
-  status:: done
-  implements:: [[code:hiker/ops/agent/apply_tag]], [[code:hiker/ops/agent/read_existing_tags]]
-- **mcp-staging-read-disk-only** — `HikerHandler::get_note` resolves `vault.abs_path(rel_path)` and returns `1002 note_not_found` when the file doesn't exist on disk; pending proposals are not transparently surfaced. Agents discover staged content via the introspection tools, keeping the disk-vs-staging boundary explicit [mcp-staging-read-disk-only]
-  status:: done
-- **mcp-tool-get-pending-proposal** — wraps the op-log pending lookup by id; returns full metadata + proposed body. `1002`-style error when id is unknown (accepted / rejected / never existed). Agents cannot accept or reject from MCP — that stays a human-in-the-loop action [mcp-tool-get-pending-proposal]
-  status:: planned
-- **mcp-pending-proposal-anchor-status** — extends `get_pending_proposal` response: for `edit_note`-shaped proposals, recompute anchor match state on the fly against buffer-if-open-else-disk and return an `anchors: [{ edit_index, anchor_status: "holds"|"drifted"|"ambiguous", old_str_preview }]` array plus `target: "buffer"|"disk"`. Per-edit, joint-batch (resolved via shared `batch_id`); omitted entirely for whole-file shapes. Racy by construction (true at read time only). Lets the agent detect doomed staged edits in a concurrent-edit workflow and amend before the user clicks Accept, instead of finding out via drift-at-apply [mcp-pending-proposal-anchor-status]
-  status:: planned
-- **mcp-tool-board-add-column** — `mcp-server/src/handler/{router,dispatch}.rs` (`board_add_column` → `add_board_column`) drives `core::boards::ops::preview_edit(BoardEdit::AddColumn)`; idempotent on name collision (`status:"noop"`); review stages, direct commits; smoke `board_write_tools_round_trip_direct` + `board_create_commits_directly_even_in_review_mode`; toggle `mcp.tools.board_add_column_enabled` [mcp-tool-board-add-column]
-  status:: done
-- **mcp-tool-board-rename-column** — `mcp-server/src/handler/{router,dispatch}.rs` (`board_rename_column` → `rename_board_column`) drives `core::boards::ops::preview_edit(BoardEdit::RenameColumn)`; review stages, direct commits; smoke `board_write_tools_round_trip_direct`; toggle `mcp.tools.board_rename_column_enabled` [mcp-tool-board-rename-column]
-  status:: done
-- **mcp-tool-board-reorder-column** — `mcp-server/src/handler/{router,dispatch}.rs` (`board_reorder_column` → `reorder_board_column`) drives `core::boards::ops::preview_edit(BoardEdit::ReorderColumn)`; clamps `to_index` to tail; review stages, direct commits; toggle `mcp.tools.board_reorder_column_enabled` [mcp-tool-board-reorder-column]
-  status:: done
-- **mcp-tool-board-delete-column** — `mcp-server/src/handler/{router,dispatch}.rs` (`board_delete_column` → `delete_board_column`) drives `core::boards::ops::preview_edit(BoardEdit::DeleteColumn)`; drops the column's card refs (notes untouched); review stages, direct commits; toggle `mcp.tools.board_delete_column_enabled` [mcp-tool-board-delete-column]
-  status:: done

@@ -5,6 +5,11 @@
 
 use hiker_theme as theme;
 
+/// A near-white, mostly-opaque label-background pill (premultiplied) for dense graphs — lifts a
+/// label off the busy field of edges/nodes behind it so it stays readable. Fades with the label's
+/// own alpha at paint time. status: graph-label-dim
+pub const LABEL_PILL: egui::Color32 = egui::Color32::from_rgba_premultiplied(0xd1, 0xd2, 0xd4, 0xd8);
+
 /// Configurable colors + sizes for a graph view. The [`Palette`] varies the
 /// per-node coloring controls (flat vault fill + active accent vs. the
 /// cluster color-by-policy set); every other control is common to both.
@@ -54,7 +59,7 @@ impl Style {
             background: None,
             node_scale: 1.0,
             edge_width: 1.0,
-            label_size: 11.0,
+            label_size: 14.0,
             palette: Palette::Flat {
                 node: egui::Color32::from_rgb(0x6b, 0x72, 0x80),
                 active: theme::accent(),
@@ -72,7 +77,7 @@ impl Style {
             background: None,
             node_scale: 1.0,
             edge_width: 1.0,
-            label_size: 11.0,
+            label_size: 14.0,
             palette: Palette::Policy {
                 cluster: theme::accent(),
                 move_policy: egui::Color32::from_rgb(0x2f, 0x6f, 0xb9),

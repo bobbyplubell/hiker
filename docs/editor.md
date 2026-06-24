@@ -94,6 +94,11 @@ status:: done
 touches:: [[code:hiker/workbench_host]]
 note:: nav-time fire path dropped; switching tabs / opening a new file no longer prompts (per [[spec:multi-buffer-no-switch-guard]]). The guard fires only on explicit tab close (× / middle-click / `tab.close` keybind) and is invoked again from the multi-buffer window-close path · evidence: `app/src/workbench_host.rs` (close-tab runs the confirm modal on dirty tabs only)
 
+The three-option dialog is a real modal — used by this dirty guard and elsewhere. [confirm3-real-modal]
+status:: done
+touches:: [[code:hiker/panels/buffer]]
+note:: evidence: `app/src/panels/buffer/mod.rs` (three-way confirm modal)
+
 External changes: a file edited on disk outside hiker reconciles into the `accepted` layer as an `external` op (per [[spec:op-log-external-edit-sync]]). Because the buffer materializes `accepted + working`, an external change and the user's uncommitted `working` edits merge by position: disjoint regions auto-merge with no prompt, and an overlapping region surfaces as a conflict hunk with **Keep mine / Keep theirs / Keep both** — the same model agent proposals use (per [[spec:op-log-merge-auto]], [[spec:op-log-merge-conflict]]).
 
 Save does **not** re-read disk or compare hashes — it commits `working` directly (per the Save action above). Disk drift is reconciled at **open-time** and via the **watcher** (per `op-log.md`), not at save time:
@@ -101,7 +106,14 @@ Save does **not** re-read disk or compare hashes — it commits `working` direct
 - Open-time reconcile folds any on-disk delta into `accepted` before the buffer shows.
 - Watcher integration: the notify-based watcher pushes file-change events for the open file. Buffer clean → silently reload, `loadedHash` updates. Buffer with `working` edits → the same conflict-hunk reconciliation, proactive on the event.
 
-A save-time drift check / `DiskDrift` modal is specced-but-dormant — tracked as bug `bug-editor-no-save-time-drift-check` in `bug_tracking.md`.
+A save-time drift check / `DiskDrift` modal is specced-but-dormant — tracked as bug `bug-editor-no-save-time-drift-check` in `bug_tracking.md`. Its two pieces:
+
+- The pre-write drift check re-reads + hashes the file before write. [pre-write-drift-check]
+status:: done
+touches:: [[code:hiker/vault]]
+- The drift-conflict modal offers keep / take / cancel (no diff option). [drift-conflict-modal]
+status:: done
+touches:: [[code:hiker/panels/buffer]]
 
 
 ## Keybind registry
@@ -112,6 +124,9 @@ touches:: [[code:hiker/keybinds]]
 note:: flat list, validate() on duplicates
 
 Shape: window-level chords are a static `(chord, label)` table from `Keybinds::known_keybindings()` (e.g. `("Mod-S", "Save the active buffer")`), which the F1 overlay enumerates. Validation: a startup test (`known_keybindings_has_no_duplicates`) rejects duplicate chords — no silent overrides.
+
+The F1 help panel enumerates `keybinds.list()`. [help-panel-keybinds]
+status:: planned
 
 v0 bindings:
 
@@ -294,7 +309,11 @@ status:: done
 touches:: [[code:hiker/actions]], [[code:hiker/icons]], [[code:hiker/keybinds]], [[code:hiker/workspace]]
 note:: Workbench-level focus mode: a single session flag (not per-buffer) hides all chrome except the global top bar — activity bar / both side bars / status bar / panel area gated at render time in `Workbench::ui` (the `visible` booleans are never mutated, so collapse choices + persistence survive), plus the editor's own gutter / minimap / status bar. The active tab fills the window. The top bar, tab strip, and per-view toolbars stay by default — see the three opt-in `view-reader-hide-*` toggles. Toggled by Ctrl+R, the book-icon top-strip button, the eye-icon View menu, and the editor toolbar menu. Esc exits. Not persisted. Supersedes the old per-buffer `editor-reader-view` · evidence: `egui-workbench/src/workspace.rs` (`Workbench::reader_mode` flag + `toggle_reader_mode`, render-time chrome gate), `app/src/actions.rs` (`view.reader_mode`, `editor.reader_view` delegates), `app/src/keybinds.rs` (Ctrl+R dispatches `view.reader_mode`), `app/src/state.rs` (`view.reader_mode` book button in default top toolbar), `app/src/icons.rs` (`Icon::Book`)
 
-- **Trigger.** Ctrl+R (Cmd+R) and a global book-icon button on the top strip. Also reachable from the global eye-icon View menu ([[spec:global-view-menu]]) and the editor toolbar menu as a regular toggle row. **Right-clicking the book icon** opens the reader-view-specific options (the hide toggles below) as a context menu, so they're reachable straight from the reader icon.
+- **Trigger.** Ctrl+R (Cmd+R) and a global book-icon button on the top strip. Also reachable from the global eye-icon View menu and the editor toolbar menu as a regular toggle row. **Right-clicking the book icon** opens the reader-view-specific options (the hide toggles below) as a context menu, so they're reachable straight from the reader icon.
+  - The global eye-icon "View options" menu on the top strip currently holds a "Reader mode" toggle (dispatches `view.reader_mode`) and a "Hide top bar in reader mode" mirror of `ui.reader_hide_top_bar` (read + toggle + commit to vault scope), with room left for future global view options. [global-view-menu]
+status:: done
+touches:: [[code:hiker/actions]], [[code:hiker/toolbar]]
+note:: evidence: `app/src/toolbar.rs` (`AppState::render_view_menu`, `commit_vault_bool`), `app/src/actions.rs` (`ID_VIEW_MENU` = `view.menu`, in `is_layout_id`), `app/src/state.rs` (`view.menu` in default top toolbar)
 - **Exit.** The same toggle, or Esc.
 - **What's hidden by default.** Every workbench chrome region — activity bar, both side bars, status bar, panel area — plus the editor's own status bar / gutter / minimap. The active tab fills the window. The global top bar, the tab strip, and each view's in-tab toolbar all stay by default; three opt-in toggles hide them.
 - **Optional hide toggles.** Independent reader-mode settings, all shown in the eye View menu, the book-icon right-click menu, and Settings; each takes effect next frame, vault-scoped:
@@ -321,6 +340,10 @@ touches:: [[code:hiker/panels/command_palette]]
 note:: fuzzy-search popover over the keybind registry's `known_keybindings()`. Opened by `Mod-Shift-P` / `Ctrl-K` or the `palette.open` action. Shows action title + area badge + bound chord; AI-touching actions hidden under [[spec:llm-features-disable-entirely]]. State lives on `UiState` (`palette_open` / `palette_query` / `palette_selected` / `palette_mru`); dispatch through the same path the keybind handler uses · evidence: `app/src/panels/command_palette.rs` (`AppState::command_palette`)
 
 - **Trigger.** Keybind `vault.commandPalette` = Mod-Shift-P (reserved in [[spec:keybind-registry]]'s "Reserved IDs" table; this spec lights it up), and a top-strip icon when wired.
+  - The top-strip trigger is a VSCode-style "command center": a centered, clickable search box that opens the command palette (`palette.open`). In the default **frameless** mode it is overlaid centered in the merged titlebar (see [[spec:frameless-merged-titlebar]]); with native chrome it is overlaid centered on the first top toolbar (`render_toolbars(.., overlay_command_center)`, dedicated `command-center` bar only as a fallback). Suppressed in reader view. Shows a search icon + "Search commands" + a platform-appropriate ASCII chord hint (`Cmd+Shift+P` / `Ctrl+Shift+P`). The palette (`command_palette.rs`) dismisses on Esc or a pointer press outside its window. [command-center-topbar]
+status:: done
+touches:: [[code:hiker/command_center]], [[code:hiker/titlebar]], [[code:hiker/toolbar]]
+note:: evidence: `app/src/command_center.rs` (`AppState::command_center`), `app/src/titlebar.rs`, `app/src/toolbar.rs`, `app/src/main.rs`
 - **Surface.** A centered overlay popover above the editor pane: a text input at the top, a scrollable result list below, footer hint listing accept / dismiss bindings.
 - **Action source.** The keybind registry is the source of truth — every entry in `Keybinds::known_keybindings()` is a palette row. Adding a registry entry adds a palette row for free.
 - **Row shape.** Action title (the registry's human label), source area as a small badge ("editor" / "tab" / "navigation" / "vault" / etc.) inferred from the action's id prefix, and the bound chord on the right (or `Unbound` when no chord is set). Greyed rows when the action isn't currently dispatchable (e.g. `editor.save` when no buffer is open).
@@ -355,6 +378,11 @@ triple_click_pattern = ".*\\n?"   # whole line incl. trailing newline
 - The double-click matcher runs against the line content (no trailing newline); the triple-click matcher runs against the line including its trailing `\n` when present — that's why the default `.*\n?` reproduces the previous whole-line-incl-newline behavior (`\n?` matches zero on the last line).
 - Defaults live as `pub const`s + `LazyLock<Arc<Regex>>` in the editor view layer; the `core::config` serde defaults inline the same strings and are documented to stay in sync.
 - Patterns compile once per buffer-open into `ViewState.{double,triple}_click_re: Arc<regex::Regex>` (non-`Option`). Changing the config and reopening the buffer picks up the new pattern.
+
+Drag-selection autoscroll is a related `editor-view` mechanic: drag-selecting to (or past) the top/bottom viewport edge autoscrolls so the selection extends off-screen; linear + rectangular (Alt) drags. Backend-neutral: a `distance^1.5` speed curve scaled in line-heights (≈½ line/frame at the edge, capped ≈1¼ lines/frame), driven per held frame so it continues while the pointer is still; stops at the band edge, at either document end, or on release. The egui adapter only adds the keep-painting repaint signal. Horizontal + text-drag autoscroll deferred (§9.24). [selection-autoscroll]
+status:: done
+touches:: [[code:hiker/command]], [[code:hiker/viewport]]
+note:: evidence: `editor/SPEC.md` §9.24, `editor/editor-view/src/command.rs` (`selection_autoscroll_velocity` + `apply_selection_autoscroll` + `AUTOSCROLL_*` consts; called from `mouse_drag` `MaybeSelecting` / `RectangleSelecting`, cleared in `mouse_up`), `editor/editor-view/src/viewport.rs` (`ViewState::autoscroll_active`), `editor/editor-egui/src/widget.rs` (repaint while `autoscroll_active`)
 
 
 ## View options menu
@@ -414,11 +442,30 @@ note:: toggles live preview; checkmark reflects the enabled flag; default on · 
 status:: done
 touches:: [[code:hiker/panels/buffer]]
 note:: flips both the language and live-preview behavior for the active buffer; persists via [[spec:settings-write-back]] to `editor.render_txt_as_markdown` · evidence: `app/src/panels/buffer/mod.rs` ("Render .txt as markdown" menu entry)
-- **`egui_editor` feature toggles** — these rows are session/vault-scope flips of the corresponding `egui_editor` features (see `editor/SPEC.md`): Word wrap (§3.8), Show whitespace (special-character rendering, §9.16), Highlight trailing whitespace (§9.17 — quiet enough to leave on for code, noisy on prose, so opt-in; default off, persisted per-vault), Show line numbers (gutter, §3.7). The menu rows are hiker chrome; the rendering is the widget's. [view-word-wrap-toggle, view-show-whitespace-toggle, view-highlight-trailing-whitespace-toggle, view-line-numbers-toggle]
+- **`egui_editor` feature toggles** — these rows are session/vault-scope flips of the corresponding `egui_editor` features (see `editor/SPEC.md`). The menu rows are hiker chrome; the rendering is the widget's.
+  - **Word wrap** (§3.8) — reconfigures line wrapping in the editor crates (`editor-view` `ViewState`); persists via [[spec:settings-write-back]] to `editor.word_wrap`. [view-word-wrap-toggle]
+status:: done
+touches:: [[code:hiker/panels/buffer]]
+note:: evidence: `app/src/panels/buffer/mod.rs` ("Word wrap" menu entry)
+  - **Show whitespace** (special-character rendering, §9.16) — whitespace highlighting in the editor crates; default off; toggled via View menu. Persistence still pending [[spec:settings-section-editor]]. [view-show-whitespace-toggle]
+status:: done
+touches:: [[code:hiker/panels/buffer]]
+note:: evidence: `app/src/panels/buffer/mod.rs` (whitespace highlight toggle)
+  - **Highlight trailing whitespace** (§9.17 — quiet enough to leave on for code, noisy on prose, so opt-in; default off, persisted per-vault) — gates the red-background trailing-whitespace decoration behind a dedicated View-menu flip; persists via [[spec:settings-write-back]] to `editor.highlight_trailing_whitespace`. [view-highlight-trailing-whitespace-toggle]
+status:: done
+touches:: [[code:hiker/buffer]], [[code:hiker/config/sections]], [[code:hiker/panels/buffer]]
+note:: evidence: `app/src/panels/buffer.rs` (view-options menu entry + gating around `trailing_whitespace_decorations`), `app/src/buffer.rs` (`highlight_trailing_whitespace`), `core/src/config/sections.rs` (`editor.highlight_trailing_whitespace`)
+  - **Show line numbers** (gutter, §3.7) — hides the line-number gutter; default visible. Persistence still pending [[spec:settings-section-editor]]. [view-line-numbers-toggle]
+status:: done
+touches:: [[code:hiker/panels/buffer]]
+note:: evidence: `app/src/panels/buffer/mod.rs` (line-number visibility toggle)
 - **Show heading breadcrumb** — overlays each chunk with its `heading_path` (already stored on chunks). Pairs with chunk boundaries; defer until both have a real user. [view-heading-breadcrumb-toggle]
 status:: done
 touches:: [[code:hiker/panels/buffer]]
 note:: the toggle's menu-row stub (disabled with tooltip "Pairs with view-show-chunk-boundaries") is what this slug owns; the overlay it'll eventually flip is [[spec:view-heading-breadcrumb-overlay]] · evidence: `app/src/panels/buffer/mod.rs` (View-menu items)
+  - The actual heading-breadcrumb-per-chunk overlay the toggle gates — the chunk's `heading_path` rendered above each chunk — is its own slug, paired with [[spec:view-show-chunk-boundaries]] and lit when both have a real user. [view-heading-breadcrumb-overlay]
+status:: planned
+note:: the actual heading-breadcrumb-per-chunk overlay (chunk's `heading_path` rendered above each chunk) that the toggle gates; pairs with [[spec:view-show-chunk-boundaries]] and lights up when both have a real user
 
 ### Out of scope (this menu)
 
@@ -433,6 +480,11 @@ A top-bar button on the editor pane hosting content-mutation actions on the acti
 status:: done
 touches:: [[code:hiker/panels/buffer]], [[code:hiker/toolbar]]
 note:: wand-icon top-bar button; popover lists mutations applicable to the active buffer; v1 entry is "Reformat as markdown". Result lands as an in-buffer edit ([[spec:note-mutation-applies-as-buffer-edit]]); RO during in-flight per [[spec:note-mutation-buffer-ro-while-in-flight]]. The earlier derived-file flow (`replace_note_with_derived` / `delete_derived` / `list_pending_derived`, `note_mutation_replace_original` / `note_mutation_discard_derived` commands, the `BufferMode "mutation"` variant, the `.hiker/derived/` directory, mutation-completed events / `-cleared` events) was removed in this refactor · evidence: `app/src/toolbar.rs` (mutations menu trigger); `app/src/panels/buffer/mod.rs` (apply path); `submit_note_mutation` command
+
+The wand glyph (diagonal stick + sparkle, [[spec:mutations-menu-icon]] in the toolbar icon palette) is the button's icon. [mutations-menu-icon]
+status:: done
+touches:: [[code:hiker/toolbar]]
+note:: wand glyph (diagonal stick + sparkle); icon-only toolbar button; no click handler — icon reservation, lands with [[spec:note-mutations-menu]] · evidence: `app/src/toolbar.rs` (Mutations button)
 
 Mutations are LLM-driven content rewrites of the active note. Single-note user-initiated mutations apply **as buffer edits** — there is no separate review surface, no derived file, no explicit Apply/Reject verbs. Save accepts, Ctrl-Z reverts, the existing dirty-buffer + changes-log machinery handles everything else. The shape is uniform across all current and future mutations:
 
@@ -468,7 +520,10 @@ Submits a task with `kind: NoteMutation { mutation: ReformatAsMarkdown, source_p
 
 - **Enabled** when the active buffer is an editable note (`mode.kind` is `File`) of an indexable extension (`.md` / `.markdown` / `.txt`) and has at least one byte of content.
 - **Disabled** during read-only preview modes (trash / snapshot / staging review) — mutating from inside a review surface would be confusing. Tooltip explains why.
-- **Disabled with "Mutation in progress…" tooltip** when there is an active or leased task whose `kind: NoteMutation { source_path }` matches the active buffer's path. The buffer is RO during this window for the same reason. Only one in-flight mutation per source path ([[spec:note-mutation-one-in-flight-per-path]]).
+- **Disabled with "Mutation in progress…" tooltip** when there is an active or leased task whose `kind: NoteMutation { source_path }` matches the active buffer's path. The buffer is RO during this window for the same reason. Only one in-flight mutation per source path. [note-mutation-one-in-flight-per-path]
+status:: done
+touches:: [[code:hiker/toolbar]]
+note:: evidence: `app/src/toolbar.rs` (in-flight set + disable-reason)
 
 - **Pending-background-mutation indicator.** When the active buffer has any pending background mutation job (a `NoteMutation`-kind task in non-terminal state whose `source_path` matches), the Mutations menu trigger renders a small pulsing accent-color dot on its icon (same `@keyframes` pulse as [[spec:tree-row-queued-marker]]). Distinct from the `#mode-controls` "Reformatting…" pill, which names the single in-flight in-buffer mutation; the dot signals presence-of-any-pending and stays lit across multiple queued or batch-flight jobs ([[spec:note-mutation-batch-via-staging]]). [note-mutations-menu-pending-indicator]
 status:: planned
@@ -482,8 +537,12 @@ When only one mutation entry is enabled (the v1 case), the popover still opens. 
 
 Batch entry points are deferred to v2; they slot into:
 
-- **A folder-context bulk action** invoked from the file tree ([[spec:note-mutation-batch-from-folder]], deferred).
-- **A search-result bulk action** alongside the already-reserved [[spec:search-bulk-action-tag]] / [[spec:search-bulk-action-move]] ([[spec:note-mutation-batch-from-search]], deferred).
+- **A folder-context bulk action** invoked from the file tree; submits one `NoteMutation` task per eligible note; results land in staging (deferred). [note-mutation-batch-from-folder]
+status:: planned
+note:: deferred — folder-context bulk action invoked from the file tree; submits one `NoteMutation` task per eligible note; results land in staging
+- **A search-result bulk action** alongside the already-reserved [[spec:search-bulk-action-tag]] / [[spec:search-bulk-action-move]]; submits one task per result; results land in staging (deferred). [note-mutation-batch-from-search]
+status:: planned
+note:: deferred — search-result bulk action sibling to [[spec:search-bulk-action-tag]] / [[spec:search-bulk-action-move]]; submits one task per result; results land in staging
 - **A CLI command** (`hiker mutate <kind> <glob>`, deferred).
 
 All three converge on the same staging-driven flow; no batch-specific review surface. [note-mutation-batch-via-staging]
@@ -580,7 +639,9 @@ note:: every snapshot in retention is an addressable Restore target; the action 
     - **Snapshot read-only preview.** Reuses the trash-preview machinery: `setReadOnly(true, "snapshot")` swaps in the snapshot banner, suppresses the save button + dirty marker, and the dirty-switch guard treats it like a trash preview (nothing to discard). The buffer carries `snapshotPreview: true` and `snapshotChangeId` so the banner's Restore can write back without a re-lookup. Banner is amber (not trash's red) — informational, not a recovery surface. [snapshot-preview-mode]
 status:: done
 note:: version review opens as `TabKind::Editor { buffer: HistoryVersion{...}, diff: Some(Disk{path}) }`. `ensure_readonly_buffer_loaded` reads `changes.content_at(id)` into a read-only `Buffer`; `render_readonly_source_toolbar` renders Restore + Show-diff buttons in the toolbar. Diff layer (owner `HistoryVersion`) emits per-hunk Restore widgets via `attach_history_version_hunk_widgets` ([[spec:diff-layer-hunk-widgets]]); whole-version Restore lives on the toolbar
-- **[[spec:vault-home-recents-detail]]** (lower priority) — full-list versions of Recently Modified / Recently Accessed; adds filtering / longer history. Each preview row already has click-to-open, so this isn't load-bearing.
+- **Recents detail** (lower priority) — full-list versions of Recently Modified / Recently Accessed; adds filtering / longer history. Each preview row already has click-to-open, so this isn't load-bearing. [vault-home-recents-detail]
+status:: planned
+note:: full-list versions of Recently Modified / Recently Accessed; lower priority since each preview row already opens on click
 
 The Stats subviews (Notes / Indexed / Chunks / Queued / Skipped) share the one [[spec:vault-home-stats-detail]] slug, parameterized by which tile launched them — new tiles add parameter values, not slugs. [vault-home-stats-detail]
 status:: planned
@@ -596,6 +657,11 @@ UI shape notes:
 ## Top strip
 
 A single horizontal strip across the very top of the window. Holds the vault-level icon-button cluster on the left, the vault path label, and the multi-buffer tab strip filling the rest of the row. Replaces the standalone vault bar — the four icon buttons that previously lived at the top of the sidebar (Home / Queue / Settings / Open vault) move out to this strip. [top-strip-layout]
+
+A frameless window (`with_decorations(false)`) is the default. A single 34px titlebar strip merges: the first top toolbar's actions (left, folded in via `toolbar::render_top_bar_inline`), the centered command center ([[spec:command-center-topbar]]), and OS-style window controls (minimize / maximize / close, far right). Dragging uses **discrete drag zones in the empty gaps** (lapce/VSCode no-drag model): the toolbar keeps its layout (head left, spacer-anchored tail like the sidebar toggles right-aligned next to the controls), the command center centers, and `render_bar_items` returns `(head_right, tail_left)` so the titlebar places `click_and_drag` zones in the gaps *between* head, command center, and tail. They fire `ViewportCommand::StartDrag` on pointer-*down* (exact 1:1 tracking); no drag region ever overlaps a button, so clicks are never swallowed. Double-click a gap toggles maximize. Child regions render via `scope_builder` so their clicks take priority. `titlebar::window_resize_handles` adds invisible grips on the left/right/bottom edges + bottom corners that fire `ViewportCommand::BeginResize(dir)` with the matching resize cursor, restoring border resize that frameless windows otherwise lose. **Each grip is its own tiny foreground `Area`** (lapce pattern) so it masks lower-layer panel input only on its own thin strip — a single area spanning all edges blocks the whole window body (sidebar/editor clicks). Each area sets `constrain(false)` so edge-pinned grips aren't clipped/shifted inward (otherwise only the left grip, already at x=0, works). Grips stay below the titlebar so they never overlap its buttons — trade-off: no resize from the top edge or top corners. `main.rs` renders only the secondary (bottom/left/right) toolbars as panels when frameless (`render_secondary_toolbars`). Toggle off via Settings (`Ui::custom_titlebar = false`) to restore native chrome + the on-toolbar command center. **Note:** window-control commands depend on the compositor (Wayland/Asahi may vary). [frameless-merged-titlebar]
+status:: done
+touches:: [[code:hiker/titlebar]]
+note:: evidence: `app/src/titlebar.rs`, `app/src/main.rs`, `core/src/config/mod.rs` (`Ui::custom_titlebar` defaults true)
 
 ### Top strip leading cluster
 
@@ -646,7 +712,20 @@ touches:: [[code:hiker/workbench_host]]
 note:: bulk-close paths abort if any individual close is cancelled (so a dirty-tab Cancel keeps the rest of the user's work intact). `Reveal in tree` delegates to the existing reveal-path path · evidence: `app/src/workbench_host.rs` (tab context menu: `Close` / `Close others` / `Close all to the right` / `Reveal in tree`)
 - **No `+` button.** New notes use the file tree's `+ New note` affordance.
 
-The active/inactive shading and dirty-marker rendering slugs map onto the workbench tab states. [editor-tab-active-state, editor-tab-dirty-marker, editor-tab-overflow]
+The active/inactive shading, dirty-marker rendering, and overflow slugs map onto the workbench tab states:
+
+- The active tab gets a distinct background + border; inactive tabs render muted. [editor-tab-active-state]
+status:: done
+touches:: [[code:hiker/workbench_host]]
+note:: evidence: `app/src/workbench_host.rs` (active-tab styling)
+- Dirty tabs render a small colored dot; on hover the dot is hidden and a close × is revealed in its place. [editor-tab-dirty-marker]
+status:: done
+touches:: [[code:hiker/workbench_host]]
+note:: evidence: `app/src/workbench_host.rs` (dirty-dot / close-× swap)
+- Tabs shrink to min before the strip becomes horizontally scrollable; the active tab auto-scrolls into view on activation. Chevron buttons at each edge + the "more (N)" dropdown are deferred polish — a native scrollbar surfaces in the meantime. [editor-tab-overflow]
+status:: partial
+touches:: [[code:hiker/workbench_host]]
+note:: evidence: `app/src/workbench_host.rs` (tab sizing + scroll-into-view on activation)
 
 ### Tab strip behavior with the rest of the app
 
@@ -700,6 +779,11 @@ note:: nav-time [[spec:file-switch-guard-dirty]] fire dropped; switching tabs / 
 status:: done
 touches:: [[code:hiker/autosave]], [[code:hiker/workbench_host]]
 note:: no dirty-buffer modal on app exit. Saved bytes are *not* written through to the user's files — the autosave sidecars persist and next launch's [[spec:autosave-tab-state-silent-restore]] + [[spec:autosave-recovery-auto-restore]] reopen the workspace with dirty tabs the user can save or revert via the existing affordances · evidence: `app/src/workbench_host.rs` (window-close flushes every dirty buffer then pushes the tab-state snapshot and destroys without prompting), `core/src/autosave.rs` (flush + snapshot-push)
+
+  The two prior window-close-guard surfaces are both retired by this — window close no longer prompts. The dirty-tab close confirm flushed through autosave and the open-tab snapshot is pushed; next launch auto-restores the workspace as dirty tabs. [window-close-guard-dirty]
+status:: removed
+  And the multi-buffer close modal is gone — on window close the autosave layer flushes every dirty buffer and pushes the current tab-state snapshot, then the window destroys; recovered tabs surface as dirty next launch. [multi-buffer-window-close-guard]
+status:: removed
 - **Navigation history stays unified** across all tabs (one stack per vault). Back/forward navigates between content surfaces regardless of which tab they were in; the corresponding tab activates as part of the back/forward action.
 
 
@@ -718,6 +802,12 @@ A tab is a `(kind, payload)` pair. The kind names *what* the tab renders; the pa
 - `settings` — settings pane (per [[spec:settings-pane-mode]]).
 - `properties` — payload is a vault-relative note path; renders the read-only properties inspector for that note (per [[spec:note-properties-tab]]). One properties tab per note path; opening Properties on a path that already has a tab open switches to it rather than spawning a duplicate.
 - `cluster-review` — payload is a `ClusterReviewState` (purpose `new-tree` | `recluster-subtree` | `rebuild`, plus the in-flight build config and any in-memory structural result). Renders the clustering review surface ([[spec:cluster-review-tab]] in `cluster-editor.md`) — configure → run → review → confirm. On Confirm it transitions in place to `cluster-batch-review` for the newly-persisted tree.
+- `code-graph-lens` — payload is a `CodeSource` (`Project(note)` | `Index(scip)`); renders one filtered lens (a single force layout) over that source's shared code-graph doc, through the shared graph engine. Renders standalone (no minimap) AND is the child kind a `container` composes two of (primary pane + corner-minimap secondary). The spec graph this surface draws is `code.md`'s [[spec:code-graph-view-source]].
+- `container` — a two-view composition: a `primary` child tab kind plus a `secondary` (`ContainerSecondary`: a swappable `Peer(kind)` rendered as a corner inset, or a non-swappable `SelfOverview`). Clicking a peer secondary flips `swapped`, exchanging which child shows as the large primary; `label`/`icon`/`buffer_path` delegate to the *visible* primary. The code-graph tab is `Container { CodeGraphLens, Peer(CodeGraphLens) }`; the canvas is modelled as `Container { Canvas, SelfOverview }`. Persisted recursively (`container:<primaryKey>|<secondaryKey>|<swapped>`, `SelfOverview` encoding as the `@selfoverview` sentinel); a child whose kind doesn't persist makes the whole container non-persistable. [container-tab]
+status:: done
+implements:: [[code:hiker/tab/impl#[TabKind]visible_primary]], [[code:hiker/tab/child_state_key]]
+verifies:: [[code:hiker/tab/tests/container_persist_key_composes_children]], [[code:hiker/tab/tests/child_state_key_avoids_collision_and_is_swap_stable]]
+note:: `TabKind::Container { primary: Box<TabKind>, secondary: ContainerSecondary, swapped }` + `ContainerSecondary::{ Peer(Box<TabKind>), SelfOverview }`; `ChildSlot::{Primary, Secondary}` keys the two children's per-child state (`child_state_key` — a source-keyed child like `CodeGraphLens` keys on its source so it warm-reuses across slot/tab, every other kind on `(tab_id, slot)`). The corner secondary renders through the engine borrowed-minimap seam ([[spec:graph-minimap-chrome]]) · evidence: `app/src/tab.rs` (`TabKind::Container`, `ContainerSecondary`, `visible_primary`, `child_state_key`, `persist_key`)
 
 Tab-strip rendering is kind-aware: a small leading icon distinguishes the kind (per the toolbar icon palette), and the label is whatever the kind chooses (basename for `buffer`, session preview for `agent`, "Graph" / "Home" / "Queue" / "Settings" etc. for app pages).
 
@@ -788,7 +878,8 @@ note:: right-click on a trash row → Properties opens the same tab kind for the
 
 #### Out of scope (deferred)
 
-- **In-place frontmatter editing.** Tracked under [[spec:tree-context-properties-frontmatter-editing]].
+- **In-place frontmatter editing.** A future addition that layers in-place frontmatter editing as a section inside [[spec:note-properties-tab]]. Depends on a frontmatter-editing primitive that doesn't exist in v1; the read-only inspector lands first and frontmatter editing slots in once the primitive exists. [tree-context-properties-frontmatter-editing]
+status:: planned
 - **Force-reindex this note.** A button submitting a single-note `IndexJob::Reindex`. [note-properties-force-reindex]
 status:: planned
 note:: deferred — single-note force-reindex button inside the properties tab; submits `IndexJob::Reindex` for that path. Lights up when there's a real debugging use case
@@ -811,7 +902,14 @@ note:: uniform shape: every click-driven open reads the Mod modifier and inverts
 status:: done
 note:: covers tree, search, related, and recents. Spec note: drag-from-tree is also implicitly sticky once it grows into a tab-spawning action; today drag fires `move_note`, so no preview wiring needed · evidence: same evidence as [[spec:editor-preview-tab-from-open-callsites]] — every click handler reads the Mod modifier and opens sticky when held
 - **Programmatic opens skip preview.** Restore-from-trash, new-note creation, the right-click "Open" tree verb, mutation-apply, and any other non-user-click path open sticky — these are directed actions, not browsing. `openFile` is `{ preview: false }` (or omitted) at those callsites.
-- **Edit-as-promotion keeps preview tabs never dirty** — the moment the user types, the tab is sticky, so the dirty-buffer machinery ([[spec:file-switch-guard-dirty]], [[spec:autosave-close-no-modal]]) never has to know about preview tabs. [editor-preview-tab, editor-preview-tab-promotion]
+- **Preview tabs are never dirty by construction.** Replace-in-place preserves the strip's render order (the new entry sits at the *end* of insertion order, matching how the user observes "the same tab kept moving"); and the first user-initiated edit promotes the tab, clearing the slot before any dirty check sees it. [editor-preview-tab]
+status:: done
+touches:: [[code:hiker/workbench_host]]
+note:: evidence: `app/src/workbench_host.rs` (preview-tab state, replace-in-place swap, preview styling)
+- **Edit-as-promotion** — the moment the user types, the tab is sticky, so the dirty-buffer machinery ([[spec:file-switch-guard-dirty]], [[spec:autosave-close-no-modal]]) never has to know about preview tabs. The promotion gate distinguishes user typing/paste/delete from programmatic doc swaps (file open, mutation apply); without that gate the tab would promote on the very first edit from opening the file. Drag-to-reorder isn't a promotion path today because tabs don't reorder yet — the spec lists drag, the implementation slots it in when reorder lands. [editor-preview-tab-promotion]
+status:: done
+touches:: [[code:hiker/panels/buffer]], [[code:hiker/workbench_host]]
+note:: evidence: `app/src/panels/buffer/mod.rs` (first-user-edit promotion), `app/src/workbench_host.rs` (tab-targeted promotion; double-click on the tab promotes; right-click menu prepends "Keep open" when the tab is preview)
 - **Tree double-click stays bound to inline rename** per [[spec:tree-double-click-rename]] — promotion via double-click on a *tree row* would conflict; tab double-click covers the canonical promote gesture.
 - **Pending agent proposals route the open into review mode.** When `openFile(rel)` resolves a path with one or more pending staging proposals, the buffer lands in patch-review or write-note review per [[spec:note-open-routes-to-pending-review]] (in `patch-review.md`). The preview-vs-sticky distinction is preserved; the review state rides on `buffer.mode`, not the tab kind.
 
@@ -829,6 +927,15 @@ note:: per-vault in-memory `back` / `forward` stacks driven by an inferred-vs-tr
 status:: done
 touches:: [[code:hiker/widgets/swipe_nav]]
 note:: per-frame accumulator over `ctx.input(|i| i.smooth_scroll_delta.x)`; fires `editor_pane::nav_go(±1)` **the instant `|acc| ≥ 120px`** (2026-06-03: commit-on-threshold replaced the old arm-then-commit-on-release, which waited on the touchpad's momentum-scroll tail and felt laggy / hung), then locks 350ms so one gesture isn't double-counted. Skipped when any widget has focus or the pointer is over a registered `swipe_skip_rects` region — the editor body (`buffer/mod.rs`) and the **canvas viewport in scroll-to-pan mode** ([[spec:canvas-scroll-mode]], so two-finger pan isn't also nav). Horizontal-dominant gate (`|dx| > 1.5·|dy|`). Positive `dx` (swipe right) → back. Opt-out via `[ui].swipe_nav_enabled` ([[spec:navigation-swipe-disable]]). Browser-style mapping · evidence: `app/src/widgets/swipe_nav.rs` (`handle_swipe_nav`), `app/src/state.rs` (`swipe_accum_x`, `swipe_cooldown_until`, `swipe_skip_rects`)
+  - A `[ui].swipe_nav_enabled` toggle turns off two-finger swipe→Back/Forward (for users who hit false-triggers during ordinary horizontal scroll, e.g. over the tab strip). Default on. [navigation-swipe-disable]
+status:: done
+touches:: [[code:hiker/panels/settings]], [[code:hiker/widgets/swipe_nav]]
+note:: evidence: `core/src/config/mod.rs` (`Ui::swipe_nav_enabled`, default true) + `patch.rs` (eligible bool, both scopes); gate in `app/src/widgets/swipe_nav.rs::handle_swipe_nav`; settings row `app/src/panels/settings/mod.rs::window_section`
+  - The canvas swipe-skip pairs with the canvas scroll-mode setting: `[ui].canvas_scroll_mode` decides whether a plain scroll over empty canvas pans or zooms — **auto** (default) detects the device (mouse wheel zooms, touchpad pans), **pan** / **zoom** force one; Ctrl/Cmd+scroll and pinch always zoom (pinch now on Linux/Wayland too via the winit fork), and scroll over a note card still scrolls the card. When the mode is not Zoom the canvas registers a swipe-skip region so two-finger pan isn't also nav. [canvas-scroll-mode]
+status:: done
+implements:: [[code:hiker/panels/canvas/render/canvas_body]]
+verifies:: [[code:hiker/config/tests/write_back_canvas_scroll_mode_validates_allowed_values]]
+note:: evidence: `core/src/config/mod.rs` (`Ui::canvas_scroll_mode`: `CanvasScrollMode` enum Auto/Pan/Zoom, default Auto) + `patch.rs` (`ValueType::CanvasScrollMode`); `hiker-canvas/view-core/src/state.rs` (`ScrollMode` enum) + `hiker-canvas/view/src/widget.rs` (`set_scroll_mode` + `handle_zoom`: reads the scroll's `MouseWheelUnit` — `Line`=wheel, `Point`=touchpad — remembers it across egui's smoothing tail, pan-vs-zoom branch, `camera.pan_by_screen`); host maps config→view enum + registers the canvas swipe-skip when mode ≠ Zoom (`app/src/panels/canvas/render.rs::canvas_body`); shared `canvas_scroll_mode_selector` in the gear menu + `window_section`
 - **Keybind registry entries** reserve `navigation.back` and `navigation.forward`: Cmd/Ctrl-[ back, Cmd/Ctrl-] forward; Alt-Left/Right as additional bindings on Linux/Windows. [navigation-keybind]
 status:: done
 touches:: [[code:hiker/keybinds]]
@@ -923,104 +1030,3 @@ note:: doc replaced in place on buffer switch
 - Vim/Emacs keymaps
 - User keybind overrides (the registry supports it; the loader is later)
 - External-change watcher integration (v1)
-
-## Registry imports (from status.md)
-
-Entries imported from the retired status registry that had no anchor in this doc —
-re-home them into the relevant sections as the doc evolves.
-
-- **window-close-guard-dirty** — superseded by [[spec:autosave-close-no-modal]]: window close no longer prompts. Dirty buffers flush through autosave and the open-tab snapshot is pushed; next launch auto-restores the workspace as dirty tabs [window-close-guard-dirty]
-  status:: removed
-- **pre-write-drift-check** — re-reads + hashes before write [pre-write-drift-check]
-  status:: done
-  touches:: [[code:hiker/vault]]
-- **drift-conflict-modal** — keep/take/cancel; no diff option [drift-conflict-modal]
-  status:: done
-  touches:: [[code:hiker/panels/buffer]]
-- **tree-context-properties-frontmatter-editing** — future addition that layers in-place frontmatter editing as a section inside [[spec:note-properties-tab]]. Depends on a frontmatter-editing primitive that doesn't exist in v1; the read-only inspector lands first and frontmatter editing slots in once the primitive exists [tree-context-properties-frontmatter-editing]
-  status:: planned
-- **confirm3-real-modal** — modal dialog; used by the dirty guard and elsewhere [confirm3-real-modal]
-  status:: done
-  touches:: [[code:hiker/panels/buffer]]
-  note:: evidence: `app/src/panels/buffer/mod.rs` (three-way confirm modal)
-- **help-panel-keybinds** — enumerate keybinds.list() [help-panel-keybinds]
-  status:: planned
-- **note-mutation-one-in-flight-per-path** — menu entry shows "Mutation in progress…" tooltip + disabled when queue events shows an active `NoteMutation` task whose `source_path` matches the active buffer [note-mutation-one-in-flight-per-path]
-  status:: done
-  touches:: [[code:hiker/toolbar]]
-  note:: evidence: `app/src/toolbar.rs` (in-flight set + disable-reason)
-- **note-mutation-batch-from-folder** — deferred — folder-context bulk action invoked from the file tree; submits one `NoteMutation` task per eligible note; results land in staging [note-mutation-batch-from-folder]
-  status:: planned
-- **note-mutation-batch-from-search** — deferred — search-result bulk action sibling to [[spec:search-bulk-action-tag]] / [[spec:search-bulk-action-move]]; submits one task per result; results land in staging [note-mutation-batch-from-search]
-  status:: planned
-- **view-word-wrap-toggle** — reconfigures line wrapping in the editor crates (`editor-view` `ViewState`); persists via [[spec:settings-write-back]] to `editor.word_wrap` [view-word-wrap-toggle]
-  status:: done
-  touches:: [[code:hiker/panels/buffer]]
-  note:: evidence: `app/src/panels/buffer/mod.rs` ("Word wrap" menu entry)
-- **view-show-whitespace-toggle** — whitespace highlighting in the editor crates; default off; toggled via View menu. Persistence still pending [[spec:settings-section-editor]] [view-show-whitespace-toggle]
-  status:: done
-  touches:: [[code:hiker/panels/buffer]]
-  note:: evidence: `app/src/panels/buffer/mod.rs` (whitespace highlight toggle)
-- **view-highlight-trailing-whitespace-toggle** — Gates the red-background trailing-whitespace decoration behind a dedicated View-menu flip; default off; persists via [[spec:settings-write-back]] to `editor.highlight_trailing_whitespace` [view-highlight-trailing-whitespace-toggle]
-  status:: done
-  touches:: [[code:hiker/buffer]], [[code:hiker/config/sections]], [[code:hiker/panels/buffer]]
-  note:: evidence: `app/src/panels/buffer.rs` (view-options menu entry + gating around `trailing_whitespace_decorations`), `app/src/buffer.rs` (`highlight_trailing_whitespace`), `core/src/config/sections.rs` (`editor.highlight_trailing_whitespace`)
-- **view-line-numbers-toggle** — hides the line-number gutter; default visible. Persistence still pending [[spec:settings-section-editor]] [view-line-numbers-toggle]
-  status:: done
-  touches:: [[code:hiker/panels/buffer]]
-  note:: evidence: `app/src/panels/buffer/mod.rs` (line-number visibility toggle)
-- **view-heading-breadcrumb-overlay** — the actual heading-breadcrumb-per-chunk overlay (chunk's `heading_path` rendered above each chunk) that the toggle gates; pairs with [[spec:view-show-chunk-boundaries]] and lights up when both have a real user [view-heading-breadcrumb-overlay]
-  status:: planned
-- **mutations-menu-icon** — wand glyph (diagonal stick + sparkle); icon-only toolbar button; no click handler — icon reservation, lands with [[spec:note-mutations-menu]] [mutations-menu-icon]
-  status:: done
-  touches:: [[code:hiker/toolbar]]
-  note:: evidence: `app/src/toolbar.rs` (Mutations button)
-- **vault-home-recents-detail** — full-list versions of Recently Modified / Recently Accessed; lower priority since each preview row already opens on click [vault-home-recents-detail]
-  status:: planned
-- **editor-tab-active-state** — active tab gets distinct background + border; inactive tabs render muted [editor-tab-active-state]
-  status:: done
-  touches:: [[code:hiker/workbench_host]]
-  note:: evidence: `app/src/workbench_host.rs` (active-tab styling)
-- **editor-tab-dirty-marker** — dirty tabs render a small colored dot; on hover the dot is hidden and a close × is revealed in its place [editor-tab-dirty-marker]
-  status:: done
-  touches:: [[code:hiker/workbench_host]]
-  note:: evidence: `app/src/workbench_host.rs` (dirty-dot / close-× swap)
-- **editor-tab-overflow** — tabs shrink to min before the strip becomes horizontally scrollable; active tab auto-scrolls into view on activation. Chevron buttons at each edge + the "more (N)" dropdown are deferred polish — a native scrollbar surfaces in the meantime [editor-tab-overflow]
-  status:: partial
-  touches:: [[code:hiker/workbench_host]]
-  note:: evidence: `app/src/workbench_host.rs` (tab sizing + scroll-into-view on activation)
-- **multi-buffer-window-close-guard** — superseded by [[spec:autosave-close-no-modal]]: the multi-buffer close modal is gone. On window close the autosave layer flushes every dirty buffer and pushes the current tab-state snapshot, then the window destroys. Recovered tabs surface as dirty next launch [multi-buffer-window-close-guard]
-  status:: removed
-- **editor-preview-tab** — replace-in-place preserves the strip's render order (the new entry sits at the *end* of insertion order, matching how the user observes "the same tab kept moving"). Preview tabs are never dirty by construction — the first user-initiated edit promotes the tab, clearing the slot before any dirty check sees it [editor-preview-tab]
-  status:: done
-  touches:: [[code:hiker/workbench_host]]
-  note:: evidence: `app/src/workbench_host.rs` (preview-tab state, replace-in-place swap, preview styling)
-- **editor-preview-tab-promotion** — promotion gate distinguishes user typing/paste/delete from programmatic doc swaps (file open, mutation apply); without that gate the tab would promote on the very first edit from opening the file. Drag-to-reorder isn't a promotion path today because tabs don't reorder yet — the spec lists drag, the implementation slots it in when reorder lands. Tree double-click stays bound to inline rename per [[spec:tree-double-click-rename]] (called out in the spec) [editor-preview-tab-promotion]
-  status:: done
-  touches:: [[code:hiker/panels/buffer]], [[code:hiker/workbench_host]]
-  note:: evidence: `app/src/panels/buffer/mod.rs` (first-user-edit promotion), `app/src/workbench_host.rs` (tab-targeted promotion; double-click on the tab promotes; right-click menu prepends "Keep open" when the tab is preview)
-- **navigation-swipe-disable** — `[ui].swipe_nav_enabled` toggle to turn off two-finger swipe→Back/Forward (for users who hit false-triggers during ordinary horizontal scroll, e.g. over the tab strip). Default on [navigation-swipe-disable]
-  status:: done
-  touches:: [[code:hiker/panels/settings]], [[code:hiker/widgets/swipe_nav]]
-  note:: evidence: `core/src/config/mod.rs` (`Ui::swipe_nav_enabled`, default true) + `patch.rs` (eligible bool, both scopes); gate in `app/src/widgets/swipe_nav.rs::handle_swipe_nav`; settings row `app/src/panels/settings/mod.rs::window_section`
-- **canvas-scroll-mode** — `[ui].canvas_scroll_mode`: a plain scroll over empty canvas resolves to pan or zoom — **auto** (default) detects the device (mouse wheel zooms, touchpad pans), **pan** / **zoom** force one. Ctrl/Cmd+scroll and pinch always zoom regardless (pinch now on Linux/Wayland too via the winit fork). Scroll over a note card still scrolls the card [canvas-scroll-mode]
-  status:: done
-  implements:: [[code:hiker/panels/canvas/render/canvas_body]]
-  verifies:: [[code:hiker/config/tests/write_back_canvas_scroll_mode_validates_allowed_values]]
-  note:: evidence: `core/src/config/mod.rs` (`Ui::canvas_scroll_mode`: `CanvasScrollMode` enum Auto/Pan/Zoom, default Auto) + `patch.rs` (`ValueType::CanvasScrollMode`); `hiker-canvas/view-core/src/state.rs` (`ScrollMode` enum) + `hiker-canvas/view/src/widget.rs` (`set_scroll_mode` + `handle_zoom`: reads the scroll's `MouseWheelUnit` — `Line`=wheel, `Point`=touchpad — remembers it across egui's smoothing tail, pan-vs-zoom branch, `camera.pan_by_screen`); host maps config→view enum + registers the canvas swipe-skip when mode ≠ Zoom (`app/src/panels/canvas/render.rs::canvas_body`); shared `canvas_scroll_mode_selector` in the gear menu + `window_section`
-- **global-view-menu** — Global eye-icon "View options" menu on the top strip. Popup currently holds a "Reader mode" toggle (dispatches `view.reader_mode`) and a "Hide top bar in reader mode" mirror of `ui.reader_hide_top_bar` (read + toggle + commit to vault scope). Room left for future global view options [global-view-menu]
-  status:: done
-  touches:: [[code:hiker/actions]], [[code:hiker/toolbar]]
-  note:: evidence: `app/src/toolbar.rs` (`AppState::render_view_menu`, `commit_vault_bool`), `app/src/actions.rs` (`ID_VIEW_MENU` = `view.menu`, in `is_layout_id`), `app/src/state.rs` (`view.menu` in default top toolbar)
-- **command-center-topbar** — VSCode-style "command center": a centered, clickable search box that opens the command palette (`palette.open`). In the default **frameless** mode it is overlaid centered in the merged titlebar (see [[spec:frameless-merged-titlebar]]); with native chrome it is overlaid centered on the first top toolbar (`render_toolbars(.., overlay_command_center)`, dedicated `command-center` bar only as a fallback). Suppressed in reader view. Shows a search icon + "Search commands" + a platform-appropriate ASCII chord hint (`Cmd+Shift+P` / `Ctrl+Shift+P`). The palette (`command_palette.rs`) dismisses on Esc or a pointer press outside its window. [[spec:command-center-topbar]] [command-center-topbar]
-  status:: done
-  touches:: [[code:hiker/command_center]], [[code:hiker/titlebar]], [[code:hiker/toolbar]]
-  note:: evidence: `app/src/command_center.rs` (`AppState::command_center`), `app/src/titlebar.rs`, `app/src/toolbar.rs`, `app/src/main.rs`
-- **frameless-merged-titlebar** — Frameless window (`with_decorations(false)`) is the default. A single 34px titlebar strip merges: the first top toolbar's actions (left, folded in via `toolbar::render_top_bar_inline`), the centered command center, and OS-style window controls (minimize / maximize / close, far right). Dragging uses **discrete drag zones in the empty gaps** (lapce/VSCode no-drag model): the toolbar keeps its layout (head left, spacer-anchored tail like the sidebar toggles right-aligned next to the controls), the command center centers, and `render_bar_items` returns `(head_right, tail_left)` so the titlebar places `click_and_drag` zones in the gaps *between* head, command center, and tail. They fire `ViewportCommand::StartDrag` on pointer-*down* (exact 1:1 tracking); no drag region ever overlaps a button, so clicks are never swallowed. Double-click a gap toggles maximize. Child regions render via `scope_builder` so their clicks take priority. `titlebar::window_resize_handles` adds invisible grips on the left/right/bottom edges + bottom corners that fire `ViewportCommand::BeginResize(dir)` with the matching resize cursor, restoring border resize that frameless windows otherwise lose. **Each grip is its own tiny foreground `Area`** (lapce pattern) so it masks lower-layer panel input only on its own thin strip — a single area spanning all edges blocks the whole window body (sidebar/editor clicks). Each area sets `constrain(false)` so edge-pinned grips aren't clipped/shifted inward (otherwise only the left grip, already at x=0, works). Grips stay below the titlebar so they never overlap its buttons — trade-off: no resize from the top edge or top corners. `main.rs` renders only the secondary (bottom/left/right) toolbars as panels when frameless (`render_secondary_toolbars`). Toggle off via Settings (`Ui::custom_titlebar = false`) to restore native chrome + the on-toolbar command center. **Note:** window-control commands depend on the compositor (Wayland/Asahi may vary) [frameless-merged-titlebar]
-  status:: done
-  touches:: [[code:hiker/titlebar]]
-  note:: evidence: `app/src/titlebar.rs`, `app/src/main.rs`, `core/src/config/mod.rs` (`Ui::custom_titlebar` defaults true)
-- **selection-autoscroll** — drag-selecting to (or past) the top/bottom viewport edge autoscrolls so the selection extends off-screen; linear + rectangular (Alt) drags. Backend-neutral mechanic in `editor-view`: a `distance^1.5` speed curve scaled in line-heights (≈½ line/frame at the edge, capped ≈1¼ lines/frame), driven per held frame so it continues while the pointer is still; stops at the band edge, at either document end, or on release. egui adapter only adds the keep-painting repaint signal. Horizontal + text-drag autoscroll deferred (§9.24). Tests: `editor/editor-view/tests/autoscroll.rs` (velocity curve + bottom/top/dead-zone/clamp/mouse-up drag integration) [selection-autoscroll]
-  status:: done
-  touches:: [[code:hiker/command]], [[code:hiker/viewport]]
-  note:: evidence: `editor/SPEC.md` §9.24, `editor/editor-view/src/command.rs` (`selection_autoscroll_velocity` + `apply_selection_autoscroll` + `AUTOSCROLL_*` consts; called from `mouse_drag` `MaybeSelecting` / `RectangleSelecting`, cleared in `mouse_up`), `editor/editor-view/src/viewport.rs` (`ViewState::autoscroll_active`), `editor/editor-egui/src/widget.rs` (repaint while `autoscroll_active`)
